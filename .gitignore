@@ -1,0 +1,22 @@
+# Data Console weekly snapshots — dumps stay inside the project, out of git
+backups/
+
+# Per-day successful-send counters for the Credentials usage bars (hashed
+# key ids only, but it is machine-local telemetry — never worth committing)
+.gemini-usage.json
+
+# Pipeline write-cache: extracted results that Postgres could not accept yet,
+# re-imported automatically at the end of the next run
+.pending-deferrals.json
+.pending-deferrals.json.corrupt
+
+# scratch log kept open by the detached test server
+tools/_srv.log
+
+# Local secrets (start.bat recreates .env from the tracked .env.example)
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/

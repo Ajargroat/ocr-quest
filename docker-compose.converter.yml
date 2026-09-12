@@ -1,0 +1,18 @@
+services:
+  converter:
+    build:
+      context: ./converter
+    container_name: konkour-ocr-converter
+    restart: unless-stopped
+    environment:
+      INPUT_ROOT: /data/input
+      CONVERTER_DPI: ${CONVERTER_DPI:-170}
+      CONVERTER_RASTER_QUALITY: ${CONVERTER_RASTER_QUALITY:-78}
+      CONVERTER_JPEG_QUALITY: ${CONVERTER_JPEG_QUALITY:-70}
+      CONVERTER_MIN_AGE_MINUTES: ${CONVERTER_MIN_AGE_MINUTES:-1}
+      CONVERTER_SCAN_INTERVAL_SECONDS: ${CONVERTER_SCAN_INTERVAL_SECONDS:-15}
+    volumes:
+      - type: bind
+        # Defaults to the sample tree inside the repo, never to the whole project.
+        source: ${INPUT_ROOT:-./konkour-ocr}
+        target: /data/input
