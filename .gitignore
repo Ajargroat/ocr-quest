@@ -20,3 +20,9 @@ tools/_srv.log
 __pycache__/
 *.pyc
 .venv/
+
+# Agent workflow state (local-only per checkout, same convention as Sapienstech)
+/.agent
+/prompts
+/AGENTS.md
+/.claude

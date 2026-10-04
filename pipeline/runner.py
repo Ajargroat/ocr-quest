@@ -13,10 +13,30 @@ from . import deferrals, faults
 from .answers import build_answer_prompt, finalize_answer_rows, prepare_answer_rows
 from .config import Config
 from .db import Database
+from .gemini import set_proxy
 from .gemini_router import router
 from .questions import QUESTION_PROMPT, build_question_rows
 from .scanner import scan
 from .storage import upload_file
+from .vision import call_ocr_openai
+
+
+def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
+    """Dispatch one OCR request to the configured engine.
+
+    Lives in the runner (not vision.py) on purpose: the Gemini lane is the
+    module-level `router` singleton here, which tests patch, and the
+    dispatch honours cfg.ocr_provider ('gemini' default | 'custom').
+    'custom' is the one OpenAI-compatible provider kind — its endpoint
+    never rides the proxy lane (gemini.proxy_proxies only scopes
+    Google-bound calls)."""
+    if cfg is not None and (cfg.ocr_provider or "gemini").lower() != "gemini":
+        return call_ocr_openai(cfg, prompt, data_b64, mime_type,
+                               on_problem=on_problem, on_route=on_route)
+    parsed, _raw, _route = router.call(
+        cfg, prompt, data_b64, mime_type,
+        on_problem=on_problem, on_route=on_route)
+    return parsed
 
 
 class Hub:
@@ -126,11 +146,14 @@ def _run(hub: Hub, cfg: Config, db: Database):
         hub.emit({"type": "run_started"})
 
         # --- pre-flight checks -------------------------------------
+        set_proxy(cfg)                # profile lane for Google-bound calls
         missing = []
         if not cfg.supabase_key:
             missing.append("SUPABASE_SERVICE_KEY")
-        if not cfg.gemini_key_pool:
+        if (cfg.ocr_provider or "gemini").lower() == "gemini" and not cfg.gemini_key_pool:
             missing.append("GEMINI_API_KEYS (Credentials tab)")
+        elif (cfg.ocr_provider or "").lower() != "gemini" and not cfg.ocr_base_url:
+            missing.append("OCR_BASE_URL (Credentials tab)")
         if missing:
             log("error", "Missing credentials in .env: " + ", ".join(missing), "bad_key")
             return
@@ -146,9 +169,15 @@ def _run(hub: Hub, cfg: Config, db: Database):
         # One free metadata call per key (no generation tokens) gives the
         # router a fresh map of dead keys / dead models, so the first real
         # request lands on a working pair instead of probing blind. Skipped
-        # when this process already checked, unless the pool changed.
+        # when this process already checked, unless the pool changed — or
+        # when the OCR provider is not Gemini, in which case the key×model
+        # router is simply not on duty.
         fingerprint = (tuple(cfg.gemini_key_pool), tuple(cfg.gemini_model_ladder))
-        if router.preflight_for != fingerprint:
+        if (cfg.ocr_provider or "gemini").lower() != "gemini":
+            log("info", f"Preflight: OCR provider is '{cfg.ocr_provider}' "
+                        f"({cfg.ocr_model or 'default model'}); the Gemini key "
+                        "pool stays untouched this run.")
+        elif router.preflight_for != fingerprint:
             log("info", f"Preflight: checking {len(cfg.gemini_key_pool)} Gemini key(s) "
                          "one by one — googleapis probe + free listings, no model used…")
             report = router.check_all(cfg)
@@ -273,6 +302,10 @@ def _flush_parked(hub: Hub, db: Database, log):
 def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
     """Runs one file end to end and returns an outcome for the circuit
     breaker: 'clean', 'deferred' (parked writes), 'store_failed' or 'failed'."""
+    provider = (getattr(cfg, "ocr_provider", "gemini") if cfg else None) or "gemini"
+    ocr_label = "Gemini" if provider.lower() == "gemini" \
+        else (getattr(cfg, "ocr_model", "") or "OCR model")
+
     def file_event(status, detail=""):
         hub.emit({"type": "file", "id": item.source_id,
                   "status": status, "detail": detail})
@@ -362,11 +395,10 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
 
         if item.type == "سوال":
             # ---------- QUESTION BRANCH ----------
-            phase = "Gemini OCR"
-            file_event("ocr", "Gemini is extracting questions")
-            parsed, _, _ = router.call(
-                cfg, QUESTION_PROMPT, data_b64, item.mime_type,
-                on_problem=on_problem, on_route=on_route)
+            phase = "OCR"
+            file_event("ocr", f"{ocr_label} is extracting questions")
+            parsed = _call_ocr(cfg, QUESTION_PROMPT, data_b64, item.mime_type,
+                               on_problem=on_problem, on_route=on_route)
             rows = build_question_rows(item, parsed, storage_url)
             if rows:
                 phase = "Postgres save"
@@ -384,11 +416,10 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
             candidates = db.fetch_context_questions(item.subject, item.topic, item.grade)
             prompt = build_answer_prompt(candidates)
 
-            phase = "Gemini OCR"
-            file_event("ocr", "Gemini is extracting answers")
-            parsed, _, _ = router.call(
-                cfg, prompt, data_b64, item.mime_type,
-                on_problem=on_problem, on_route=on_route)
+            phase = "OCR"
+            file_event("ocr", f"{ocr_label} is extracting answers")
+            parsed = _call_ocr(cfg, prompt, data_b64, item.mime_type,
+                               on_problem=on_problem, on_route=on_route)
 
             prepared = prepare_answer_rows(parsed)
             rows = finalize_answer_rows(item, prepared, candidates)

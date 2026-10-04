@@ -36,7 +36,8 @@ request would have answered the same question. So:
   the router steps over models that have spent their day — Google has no
   public "quota remaining" endpoint for free-tier keys, so counting the
   sends that actually succeeded is the honest source of truth. A real
-  RESOURCE_EXHAUSTED answer fills that model's bar to the cap at once.
+  RESOURCE_EXHAUSTED answer parks that pair for the cooldown instead —
+  failures never inflate the gauge.
 * **Last-known-good is sticky.** Once a pair works, that model is tried
   first for that key from then on, which keeps the ladder walk at one hop.
 """
@@ -62,6 +63,29 @@ MODEL_COOLDOWN = 6 * 3600
 # better (it never does — there is no such endpoint for plain API keys).
 # GEMINI_MODEL_DAY_LIMIT in .env tunes it.
 DAY_LIMIT_DEFAULT = 20
+# Soft penalty window for key-level faults (bad key, rate limit,
+# geo block). Deliberately separate from the hard cooldown: once
+# that expires the key is eligible again, but a fresh blip must
+# not put it straight back at the front of the rotation — every
+# unpenalized healthy key is tried before it is.
+PENALTY_WINDOW = 10 * 60
+# Exponential-moving-average weight for the per-key latency
+# gauge (0..1; higher tracks recent latency more closely).
+LATENCY_ALPHA = 0.3
+# A latency edge only counts when a key is at least this many
+# times slower than the fastest healthy key — sub-millisecond
+# measurement noise must never move the rotation.
+LATENCY_RATIO = 2.0
+# …AND slower by at least this many milliseconds. The ratio alone
+# fires on jitter (0.1 ms vs 0.04 ms is 2.5×), which would let
+# clock noise steal the rotation order from the round-robin.
+LATENCY_MIN_GAP = 100.0
+# How far a real latency edge may push a key back in the
+# rotation order (in pool slots, fractional). Bounded well
+# under one-and-a-half slots so a slow key can fall behind its
+# rotation neighbours but a fast one can never take every file:
+# the round-robin stays the backbone, latency only refines it.
+LATENCY_WINDOW = 1.2
 # Survives restarts so the bars do not reset every time the server does.
 USAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -116,6 +140,13 @@ class GeminiRouter:
         self._usage_loaded = False
         self._usage = {}                # key-hash → {model: sends today}
         self._usage_day = ""
+        # Wise-rotation pointer: the pool position the next plan
+        # starts from. Advances one step on every SUCCESS, so
+        # healthy keys share the load instead of key #1 taking
+        # everything until it dies. Ephemeral by design (a restart
+        # or a credentials save starts back at pool order); the
+        # persisted daily-send counters are facts and survive it.
+        self._rotate = 0
 
     # ------------------------------------------------------------------ state
     def _entry(self, key):
@@ -124,6 +155,9 @@ class GeminiRouter:
                 "dead": False, "unavailable_until": 0.0, "last_kind": "",
                 "ok_model": "", "blocked": {}, "probes": 0, "calls": 0,
                 "fails": 0, "last_fault": "", "checked_at": 0.0,
+                # Wise-rotation state: EWMA latency (ms) and a soft
+                # penalty expiry — see PENALTY_WINDOW above.
+                "latency": 0.0, "penalty_until": 0.0,
             })
 
     def names_for(self, cfg):
@@ -186,18 +220,19 @@ class GeminiRouter:
         except OSError:
             pass          # counters are a gauge, never worth breaking a run
 
-    def _count_send(self, key, model, quota_hit=False):
-        """Record one SUCCESSFUL send for today. A real quota refusal from
-        Google fills that model's bar to the cap immediately."""
+    def _count_send(self, key, model):
+        """Record one COMPLETED (successful) send for today.
+
+        Failures never touch this gauge — it counts calls that actually
+        finished, so it can never read N/N for a key that did not
+        complete N."""
         self._usage_load()
-        limit = self.day_limit()
         with self._lock:
             today = self._today()
             if today != self._usage_day:
                 self._usage, self._usage_day = {}, today
             per = self._usage.setdefault(self._key_hash(key), {})
-            used = per.get(model, 0) + (0 if quota_hit else 1)
-            per[model] = max(used, limit) if quota_hit else used
+            per[model] = per.get(model, 0) + 1
             self._usage_save()
 
     def _usage_of(self, key):
@@ -219,8 +254,17 @@ class GeminiRouter:
         """Ordered [(index, key, [models…])] of what is worth trying.
 
         Skips keys in cooldown and models already known-unavailable (or
-        with today's sends spent) for a key, so nothing is paid for twice."""
-        plan = []
+        with today's sends spent) for a key, so nothing is paid for twice.
+
+        The ORDER is the wise part: eligible keys are split into
+        unpenalized and softly-penalized tiers, and each tier starts
+        from the rotation pointer (which advances on success), with
+        the latency EWMA as a tiebreak. A key that just recovered
+        from a fault is therefore tried after every clean key, and
+        healthy keys share the load instead of key #1 taking every
+        file until it dies. Everything is still attempted — the
+        rotation only decides WHO is tried first."""
+        eligible = []
         with self._lock:
             for i, key in enumerate(cfg.gemini_key_pool):
                 st = self._state.get(key) or {}
@@ -238,44 +282,81 @@ class GeminiRouter:
                 if last in ladder:
                     ladder.remove(last)
                     ladder.insert(0, last)
-                plan.append((i, key, ladder))
-        return plan
+                eligible.append((i, key, ladder, st.get("latency") or 0.0,
+                                 st.get("penalty_until") or 0.0))
+            rotate = self._rotate % len(cfg.gemini_key_pool) \
+                if cfg.gemini_key_pool else 0
+
+        def order(tier):
+            def rank(entry):
+                # Position relative to the rotation pointer, wrapping
+                # around the pool, minus a bounded latency bonus:
+                # a key at least LATENCY_RATIO× slower than the
+                # fastest in its tier is pushed back up to
+                # LATENCY_WINDOW slots — enough to be demoted within
+                # the rotation, never enough to dominate it.
+                pos = float((entry[0] - rotate) % len(cfg.gemini_key_pool))
+                lat = entry[3]
+                if lat and len(tier) > 1:
+                    fastest = min(
+                        (o[3] for o in tier if o[3]), default=None)
+                    # Ratio AND an absolute floor: only a genuinely
+                    # slower key (not clock jitter) is demoted.
+                    if (fastest and fastest > 0
+                            and lat >= fastest * LATENCY_RATIO
+                            and lat - fastest >= LATENCY_MIN_GAP):
+                        pos += LATENCY_WINDOW
+                return (pos,)
+            return sorted(tier, key=rank)
+
+        clean = [e for e in eligible if now >= e[4]]
+        pen = [e for e in eligible if now < e[4]]
+        return order(clean) + order(pen)
 
     def _mark(self, key, kind, model=None, now=None):
-        """Record what a failure taught us, with the right cooldown."""
+        """Record what a failure taught us, with the right cooldown.
+
+        With a model in hand the fault is recorded against that key+model
+        PAIR only (`blocked`), so one bad rung never parks the key — with a
+        single-key pool a key-level park is a whole-pool freeze. Without a
+        model (the free health check) the verdict is about the key itself,
+        so key-level cooldown is correct there."""
         now = now if now is not None else time.time()
         st = self._entry(key)
         with self._lock:
             st["last_fault"] = kind
             st["probes"] += 1
-            if kind == "model_unavailable" and model:
-                st["blocked"][model] = now + MODEL_COOLDOWN
-            elif kind == "quota" and model:
-                # Free-tier day quota is per model — the bar (below) spends
-                # this rung, but the key keeps serving the rest of the ladder.
-                pass
+            if model:
+                st["blocked"][model] = now + KEY_COOLDOWN.get(
+                    kind, MODEL_COOLDOWN if kind == "model_unavailable"
+                    else RATE_LIMIT_COOLDOWN)
+                st["penalty_until"] = now + PENALTY_WINDOW
             elif kind == "rate_limit":
                 st["dead"] = True
                 st["unavailable_until"] = now + RATE_LIMIT_COOLDOWN
+                st["penalty_until"] = now + PENALTY_WINDOW
             elif kind in ("bad_key", "quota", "geo_block"):
                 st["dead"] = True
                 st["unavailable_until"] = now + KEY_COOLDOWN.get(kind, 900)
-        if kind == "quota" and model:
-            # Google itself said this model is spent for this key — fill
-            # its bar so the Credentials tab shows the truth, not a guess.
-            self._count_send(key, model, quota_hit=True)
+                st["penalty_until"] = now + PENALTY_WINDOW
 
-    def _mark_ok(self, key, model, now=None):
+    def _mark_ok(self, key, model, now=None, elapsed_ms=None):
         now = now if now is not None else time.time()
         st = self._entry(key)
         with self._lock:
             st["dead"] = False
             st["unavailable_until"] = 0.0
+            st["penalty_until"] = 0.0     # a success clears the soft penalty
             st["last_fault"] = ""
             st["ok_model"] = model
             st["calls"] += 1
             st["checked_at"] = now
             st["blocked"].pop(model, None)
+            if elapsed_ms is not None:
+                old = st.get("latency") or 0.0
+                st["latency"] = (LATENCY_ALPHA * elapsed_ms
+                                 + (1.0 - LATENCY_ALPHA) * old) \
+                    if old else elapsed_ms
         self._count_send(key, model)
 
     # ---------------------------------------------------------- main call
@@ -319,7 +400,7 @@ class GeminiRouter:
 
         last_flt = faults.fault("unknown")
         tried = 0
-        for index, key, models in plan:
+        for index, key, models, _latency, _penalty in plan:
             label = self._label(cfg, index, key)
             quality_retried = set()
             for model in models:
@@ -327,11 +408,13 @@ class GeminiRouter:
                 if on_route:
                     on_route(label, mask(key), model, tried)
                 try:
+                    started = time.monotonic()
                     parsed, text = call_gemini(
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries,
                         on_problem=self._problem_cb(on_problem, label, model))
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
                 except faults.FaultError as exc:
                     flt = exc.fault
                     kind = flt["kind"]
@@ -354,7 +437,12 @@ class GeminiRouter:
                                   f"({flt['label']}); trying the next model")
                         continue
                     raise               # nothing rotation can fix
-                self._mark_ok(key, model)
+                self._mark_ok(key, model, elapsed_ms=elapsed_ms)
+                # This key just succeeded: start the NEXT call from
+                # the following pool position, so healthy keys share
+                # the files instead of key #1 taking them all.
+                with self._lock:
+                    self._rotate = (index + 1) % len(pool)
                 self._log(f"✔ {label} · {model} serving")
                 return parsed, text, {"key": mask(key), "label": label,
                                       "model": model, "attempts": tried}
@@ -408,10 +496,15 @@ class GeminiRouter:
 
     def _base_row(self, cfg, index):
         key = cfg.gemini_key_pool[index]
+        st = self._state.get(key) or {}
+        now = time.time()
         return {"index": index, "label": self._label(cfg, index, key),
                 "masked": mask(key), "status": "unknown", "fault": None,
                 "models": {}, "ok_model": "", "calls": 0, "last_fault": "",
-                "usage": self._usage_of(key)}
+                "usage": self._usage_of(key),
+                # Wise-rotation readouts (same shape as status()).
+                "latency_ms": round(st.get("latency") or 0.0, 1),
+                "penalized": bool(st.get("penalty_until", 0.0) > now)}
 
     def check_key(self, cfg, index):
         """Health check ONE stored key — the Credentials tab walks the pool
@@ -545,9 +638,14 @@ class GeminiRouter:
                 "calls": st.get("calls", 0),
                 "usage": self._usage_of(key),
                 "checked_at": st.get("checked_at", 0.0),
+                # Wise-rotation readouts (UI shows why this order).
+                "latency_ms": round(st.get("latency") or 0.0, 1),
+                "penalized": bool(st.get("penalty_until", 0.0) > now),
             })
         return {"keys": rows, "models": list(cfg.gemini_model_ladder),
                 "gateway": self.gateway_cached(),
+                "rotate": self._rotate % len(cfg.gemini_key_pool)
+                          if cfg.gemini_key_pool else 0,
                 "recent": list(self.events[-40:]), "now": now}
 
     def reset(self, key=None):
@@ -558,6 +656,7 @@ class GeminiRouter:
                 self._state = {}
                 self.preflight_for = None
                 self._gateway = (0.0, None)
+                self._rotate = 0
             else:
                 self._state.pop(key, None)
 

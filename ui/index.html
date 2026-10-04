@@ -6,6 +6,7 @@
 <title>Konkour Studio</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css">
 <link rel="stylesheet" href="static/styles.css">
 
 <!-- MathJax configuration MUST come before the library loads -->
@@ -42,9 +43,6 @@ window.MathJax = {
   </div>
   <div class="actions">
     <div class="conn" id="conn"><i></i><em id="connText">connecting…</em></div>
-    <button id="runBtn" class="icon-btn run" type="button" title="Start scan — click again to stop it mid-run">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l14 9-14 9V3Z"/></svg>
-    </button>
   </div>
 </header>
 
@@ -67,27 +65,27 @@ window.MathJax = {
   <section class="stages" id="stages">
     <div class="rail">
       <div class="stage" data-stage="scan" data-desc="Preflight checks &amp; folder scan">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/><path d="M11 8v6"/><path d="M8 11h6"/></svg><em class="bubble"></em></div>
+        <div class="hub"><i class="fa fa-magnifying-glass" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Scan</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="upload" data-desc="Uploading to Supabase Storage">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.2"/><path d="M12 12v9"/><path d="m8 17 4-4 4 4"/></svg><em class="bubble"></em></div>
+        <div class="hub"><i class="fa fa-cloud-arrow-up" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Upload</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="ocr" data-desc="Gemini is reading the page">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/><path d="M7 16h6"/></svg><em class="bubble"></em></div>
+        <div class="hub"><i class="fa fa-eye" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Gemini&nbsp;OCR</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="save" data-desc="Writing rows to Postgres">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg><em class="bubble"></em></div>
+        <div class="hub"><i class="fa fa-database" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Save</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="archive" data-desc="Archiving originals to done/">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="5" rx="2"/><path d="M4 9v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9"/><path d="M10 13h4"/></svg><em class="bubble"></em></div>
+        <div class="hub"><i class="fa fa-box-archive" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Archive</label>
       </div>
     </div>
@@ -99,6 +97,18 @@ window.MathJax = {
     </div>
   </section>
 
+  <!-- start + proxy profile belong to THIS tab only -->
+  <div class="toolbar">
+    <button id="runBtn" class="icon-btn run" type="button" title="Start scan — click again to stop it mid-run">
+      <i class="fa fa-power-off" aria-hidden="true"></i>
+    </button>
+    <label class="cred-label" for="pipeProxySel">Proxy</label>
+    <select id="pipeProxySel" class="cred-in"></select>
+    <button class="ghost-btn neutral sm" id="pipeProxyNew" type="button">New profile</button>
+    <button class="ghost-btn neutral sm" id="pipeProxyDel" type="button">Delete</button>
+    <span class="hint" id="pipeProxyHint"></span>
+  </div>
+
   <main class="grid2">
     <section class="panel">
       <div class="panel-head">
@@ -108,7 +118,7 @@ window.MathJax = {
           <span class="diag-count" id="diagCount" hidden></span>
           <button class="ghost-btn icon-only" id="logClearBtn" type="button"
                   title="Wipe the log view — the server keeps its history">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+            <i class="fa fa-trash" aria-hidden="true"></i>
           </button>
         </div>
       </div>
@@ -131,14 +141,14 @@ window.MathJax = {
   <div class="toolbar">
     <div class="tb-actions">
       <button class="icon-btn" id="rvFilterBtn" type="button" title="فیلترها" aria-expanded="false">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 3H2l8 9.46V19l4 2v-8.54L22 3Z"/></svg>
+        <i class="fa fa-filter" aria-hidden="true"></i>
         <span class="badge" id="rvFilterBadge" hidden></span>
       </button>
       <button class="icon-btn" id="rvRefresh" type="button" title="بروزرسانی">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+        <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
       </button>
       <button class="icon-btn" id="rvStatsBtn" type="button" title="آمار بانک سؤال" aria-expanded="false">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>
+        <i class="fa fa-chart-pie" aria-hidden="true"></i>
       </button>
 
       <div class="filter-panel" id="rvFilters">
@@ -162,7 +172,7 @@ window.MathJax = {
             <label class="fp-date">تا تاریخ<input type="date" id="rvTo" class="date-in"></label>
           </div>
           <button class="icon-btn sm fp-clear" id="rvClearFilters" type="button" title="پاک‌سازی فیلترها">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+            <i class="fa fa-trash" aria-hidden="true"></i>
           </button>
         </div>
       </div>
@@ -188,17 +198,17 @@ window.MathJax = {
   <section class="stages" id="revStages" dir="ltr">
     <div class="rail">
       <div class="stage" data-stage="completeness" data-desc="Empty-column report for questions &amp; answers">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/></svg><em class="bubble" id="revStageNull"></em></div>
+        <div class="hub"><i class="fa fa-list-check" aria-hidden="true"></i><em class="bubble" id="revStageNull"></em></div>
         <label>Completeness</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="pairing" data-desc="Link answers to questions + definitive data fill">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 17H7A5 5 0 0 1 7 7h2"/><path d="M13 7h2a5 5 0 0 1 0 10h-2"/><path d="M8 12h8"/></svg><em class="bubble" id="revStagePair"></em></div>
+        <div class="hub"><i class="fa fa-link" aria-hidden="true"></i><em class="bubble" id="revStagePair"></em></div>
         <label>Pairing</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="ai" data-desc="Only typos, math numerals &amp; option labels">
-        <div class="hub"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg><em class="bubble" id="revStageAi"></em></div>
+        <div class="hub"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><em class="bubble" id="revStageAi"></em></div>
         <label>AI Audit</label>
       </div>
     </div>
@@ -214,7 +224,7 @@ window.MathJax = {
 
   <div class="toolbar">
     <button class="icon-btn run" id="revRunBtn" type="button" title="شروع اسکن — هنگام اجرا، برای توقف بزنید">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l14 9-14 9V3Z"/></svg>
+      <i class="fa fa-play" aria-hidden="true"></i>
     </button>
     <div class="seg" id="revEntity">
       <button data-rentity="question" class="active">سؤال‌ها</button>
@@ -227,7 +237,7 @@ window.MathJax = {
       <button data-rview="all">همه</button>
     </div>
     <button class="icon-btn" id="revRefresh" type="button" title="بروزرسانی فهرست و آمار">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+      <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
     </button>
     <span class="count-line" id="revCounts"></span>
   </div>
@@ -244,7 +254,7 @@ window.MathJax = {
         <span class="hint" id="revLogCount"></span>
         <button class="ghost-btn icon-only" id="revLogClearBtn" type="button"
                 title="Wipe the revision log view — the server keeps its history">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg>
+          <i class="fa fa-trash" aria-hidden="true"></i>
         </button>
       </div>
     </div>
@@ -261,8 +271,8 @@ window.MathJax = {
 <!-- ════════════ VIEW 4 · CREDENTIALS (key pool + routing health) ════════════ -->
 <section id="viewCredentials" class="view">
   <div class="rv-head" dir="ltr">
-    <h2>Credentials — Gemini key pool, AI router &amp; Supabase</h2>
-    <p>Secrets live in <code>.env</code> only · shown masked · every key tries all models 3.5 → 3.8, stepping up only on real failures · drag a key to reorder the pool</p>
+    <h2>Credentials — Gemini key pool, OCR &amp; revision engines, Supabase</h2>
+    <p>Secrets live in <code>.env</code> only · shown masked · every key walks the whole model ladder, stepping up only on real failures · healthy keys share the files round-robin, a slow or flaky key falls behind · drag a key to reorder the pool · the main OCR engine (Gemini pool or a custom provider) is chosen below · the Revision AI keeps its own separate endpoint</p>
   </div>
 
   <div class="cred-grid">
@@ -272,18 +282,25 @@ window.MathJax = {
         <div class="head-tools">
           <span class="hint" id="credKeyHint"></span>
           <button class="ghost-btn neutral" id="credCheckBtn" type="button" title="Checks every key one by one — a keyless googleapis probe plus a free model listing per key. No model is ever called, no generation tokens billed.">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+            <i class="fa fa-heart-pulse" aria-hidden="true"></i>
             <span>Check all keys</span>
           </button>
         </div>
       </div>
       <div class="cred-body">
         <div class="cred-models-hint" id="credModelsHint"></div>
+        <label class="cred-label" for="credLadder">Model ladder <span class="cred-sub">oldest first · every key walks the whole ladder, stepping up only on failure</span></label>
+        <textarea id="credLadder" class="cred-in mono" rows="2" spellcheck="false"
+                  placeholder="gemini-3.5-flash, gemini-3.6-flash, …" dir="ltr"></textarea>
         <div id="credGateway" class="cred-gw" hidden></div>
-        <label class="cred-label">API keys <span class="cred-sub">label · key · daily sends per model (⋮⋮ to reorder)</span></label>
+        <p class="cred-note" id="credIdleNote" hidden>
+          ⏸ The Gemini pool is idle — extraction currently runs via a
+          custom provider. Keys and ladder are kept, just unused.
+        </p>
+        <label class="cred-label">API keys <span class="cred-sub">label · key · completed sends per model (⋮⋮ to reorder) · healthy keys share the load round-robin</span></label>
         <div id="credKeys" class="cred-keys"></div>
         <button class="icon-btn sm cred-add" id="credAddKey" type="button" dir="ltr" title="Add another API key to the pool">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+          <i class="fa fa-plus" aria-hidden="true"></i>
         </button>
         <p class="cred-note" id="credLegacyNote" hidden>
           ⚠ Your pool came from the legacy <code>GEMINI_API_KEY</code> variables — saving here
@@ -294,25 +311,60 @@ window.MathJax = {
 
     <aside class="cred-side">
       <section class="panel cred-panel">
-        <div class="panel-head"><h2>AI router · provider</h2></div>
+        <div class="panel-head"><h2>Main OCR provider</h2></div>
         <div class="cred-body">
-          <label class="cred-label">Provider type</label>
-          <div class="seg cred-prov" id="credProvider">
-            <button data-provider="local" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="16" x="4" y="4" rx="2"/><rect width="6" height="6" x="9" y="9" rx="1"/><path d="M15 2v2"/><path d="M15 20v2"/><path d="M9 2v2"/><path d="M9 20v2"/><path d="M2 15h2"/><path d="M2 9h2"/><path d="M20 15h2"/><path d="M20 9h2"/></svg>
-              Local</button>
-            <button data-provider="openai" type="button">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>
-              OpenAI-compatible</button>
+          <label class="cred-label">Extraction engine</label>
+          <div class="seg cred-prov" id="ocrProvider">
+            <button data-ocr="gemini" type="button">
+              <i class="fa fa-sun" aria-hidden="true"></i>
+              Gemini pool</button>
+            <button data-ocr="custom" type="button">
+              <i class="fa fa-server" aria-hidden="true"></i>
+              Custom provider</button>
           </div>
+          <label class="cred-label" for="ocrSel">Saved provider <span class="cred-sub">per-section list · switching never touches Revision</span></label>
+          <select id="ocrSel" class="cred-in"></select>
+          <div class="cred-prov-status" id="ocrProviderStatus" hidden></div>
+          <label class="cred-label" for="ocrLabel">Label <span class="cred-sub">name shown in the selector</span></label>
+          <input id="ocrLabel" class="cred-in" spellcheck="false" autocomplete="off" placeholder="9router">
+          <label class="cred-label" for="ocrRouterUrl">Base URL</label>
+          <input id="ocrRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off"
+                 placeholder="http://localhost:20128/v1">
+          <label class="cred-label" for="ocrRouterKey">API key <span class="cred-sub">optional for local servers</span></label>
+          <input id="ocrRouterKey" class="cred-in mono" type="password" spellcheck="false"
+                 autocomplete="new-password" placeholder="— not set —">
+          <label class="secret-clear"><input id="ocrRouterKeyClear" type="checkbox"> Clear stored OCR key on save</label>
+          <label class="cred-label" for="ocrRouterModel">Model name</label>
+          <input id="ocrRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off"
+                 placeholder="e.g. qwen2.5-vl · gpt-4o-mini · gemma-3-12b">
+          <button class="ghost-btn neutral sm" id="ocrAddProvider" type="button">Add provider</button>
+          <button class="ghost-btn neutral sm" id="ocrProviderTest" type="button"
+                  title="One real model call — reply snippet and latency. Spends a few tokens.">
+            <i class="fa fa-flask" aria-hidden="true"></i><span>Test</span>
+          </button>
+          <p class="cred-note">Independent of Revision AI. One custom provider kind: label · base URL · API key · model. Gemini pool uses the key pool above and disables these fields; hosted engines (e.g. 9router) and local servers receive page images via <code>/chat/completions</code>. Local always connects directly — never through the proxy lane. Blank secret inputs keep stored values unless Clear is checked.</p>
+        </div>
+      </section>
+      <section class="panel cred-panel">
+        <div class="panel-head"><h2>Revision AI · provider</h2></div>
+        <div class="cred-body">
+          <label class="cred-label" for="credSel">Saved provider <span class="cred-sub">per-section list · switching never touches Extraction</span></label>
+          <select id="credSel" class="cred-in"></select>
+          <label class="cred-label" for="credLabel">Label <span class="cred-sub">name shown in the selector</span></label>
+          <input id="credLabel" class="cred-in" spellcheck="false" autocomplete="off" placeholder="9router">
           <label class="cred-label" for="credRouterUrl">Base URL</label>
           <input id="credRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="http://localhost:20128/v1">
           <label class="cred-label" for="credRouterKey">API key <span class="cred-sub">optional for local servers</span></label>
-          <input id="credRouterKey" class="cred-in mono" type="password" spellcheck="false"
-                 autocomplete="new-password" placeholder="— not set —">
+          <input id="credRouterKey" class="cred-in mono" type="password" spellcheck="false" autocomplete="new-password" placeholder="— not set —">
+          <label class="secret-clear"><input id="credRouterKeyClear" type="checkbox"> Clear stored revision key on save</label>
           <label class="cred-label" for="credRouterModel">Model name</label>
           <input id="credRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="OCR-Quest">
-          <p class="cred-note">The Revision AI posts to <code>/chat/completions</code> on this endpoint — pick <code>Local</code> for on-machine servers, <code>OpenAI-compatible</code> for hosted ones (llama.cpp, Ollama, vLLM, OpenRouter… all speak this dialect).</p>
+          <button class="ghost-btn neutral sm" id="credAddProvider" type="button">Add provider</button>
+          <button class="ghost-btn neutral sm" id="credProviderTest" type="button"
+                  title="One real model call — reply snippet and latency. Spends a few tokens.">
+            <i class="fa fa-flask" aria-hidden="true"></i><span>Test</span>
+          </button>
+          <p class="cred-note">Revision AI uses this separate <code>/chat/completions</code> endpoint. These settings do not select the main OCR engine. Blank key input keeps the stored key unless Clear is checked.</p>
         </div>
       </section>
       <section class="panel cred-panel">
@@ -324,7 +376,30 @@ window.MathJax = {
           <input id="credSupaBucket" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="konkour-pages">
           <label class="cred-label" for="credSupaKey">Service key</label>
           <input id="credSupaKey" class="cred-in mono" type="password" spellcheck="false"
+                  autocomplete="new-password" placeholder="— not set —">
+          <label class="secret-clear"><input id="credSupaKeyClear" type="checkbox"> Clear stored service key on save</label>
+        </div>
+      </section>
+      <section class="panel cred-panel">
+        <div class="panel-head"><h2>Local / other database</h2></div>
+        <div class="cred-body">
+          <p class="cred-note">All six fields are needed to connect. Leave
+            <b>SSL mode</b> blank to use the driver default; set
+            <code>require</code> for a managed Postgres.</p>
+          <label class="cred-label" for="credPgHost">Host</label>
+          <input id="credPgHost" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="localhost">
+          <label class="cred-label" for="credPgPort">Port</label>
+          <input id="credPgPort" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="5432">
+          <label class="cred-label" for="credPgDb">Database</label>
+          <input id="credPgDb" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="postgres">
+          <label class="cred-label" for="credPgUser">User</label>
+          <input id="credPgUser" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="postgres">
+          <label class="cred-label" for="credPgPass">Password</label>
+          <input id="credPgPass" class="cred-in mono" type="password" spellcheck="false"
                  autocomplete="new-password" placeholder="— not set —">
+          <label class="cred-label" for="credPgSsl">SSL mode</label>
+          <input id="credPgSsl" class="cred-in mono" spellcheck="false" autocomplete="off"
+                 placeholder="disable · allow · prefer · require">
         </div>
       </section>
       <section class="panel cred-panel">
@@ -339,8 +414,10 @@ window.MathJax = {
 
   <div class="cred-savebar">
     <span class="hint">Saving rewrites only these keys in <code>.env</code> — comments and unrelated settings stay untouched.</span>
-    <button class="icon-btn" id="credSaveBtn" type="button" title="Save everything to .env">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>
+    <span class="hint" id="credState" role="status"></span>
+    <button class="ghost-btn neutral" id="credReloadBtn" type="button">Reload saved credentials</button>
+    <button class="icon-btn" id="credSaveBtn" type="button" title="Save everything to .env" disabled>
+      <i class="fa fa-floppy-disk" aria-hidden="true"></i>
     </button>
   </div>
 </section>
@@ -374,13 +451,13 @@ window.MathJax = {
         <option value="500">latest 500</option>
       </select>
       <button class="icon-btn sm" id="dbRefresh" type="button" title="Reload rows">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg>
+        <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
       </button>
       <button class="icon-btn sm" id="dbExportBtn" type="button" title="Download current view as CSV">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+        <i class="fa fa-file-arrow-down" aria-hidden="true"></i>
       </button>
       <button class="icon-btn sm" id="dbAddBtn" type="button" title="Insert a new row">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+        <i class="fa fa-plus" aria-hidden="true"></i>
       </button>
     </div>
     <div class="db-grid-wrap" id="dbGrid"><div class="db-empty">Pick a table above.</div></div>
@@ -394,13 +471,13 @@ window.MathJax = {
                 placeholder="SELECT * FROM questions ORDER BY created_at DESC LIMIT 20;"></textarea>
       <div class="db-sql-actions">
         <button class="icon-btn sm db-run" id="sqlRunBtn" type="button" title="Run query (Ctrl + Enter)">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3l14 9-14 9V3Z"/></svg>
+          <i class="fa fa-play" aria-hidden="true"></i>
         </button>
         <select id="sqlSnippets" class="db-limit" title="Example queries">
           <option value="">⚡ examples…</option>
         </select>
         <button class="icon-btn sm" id="sqlCopyLast" type="button" hidden title="Download the last result as CSV">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>
+          <i class="fa fa-file-arrow-down" aria-hidden="true"></i>
         </button>
         <span class="db-guard-note">
           🛡 one statement · SELECT / WITH / INSERT / UPDATE / DELETE only · UPDATE &amp; DELETE need WHERE ·
@@ -419,7 +496,7 @@ window.MathJax = {
         <p id="dbBkStatus" class="db-bk-sub">…</p>
       </div>
       <button class="icon-btn" id="dbBackupNow" type="button" title="Create a snapshot right now">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><path d="M6 16h.01"/><path d="M10 16h.01"/></svg>
+        <i class="fa fa-server" aria-hidden="true"></i>
       </button>
     </div>
     <div class="db-bk-list" id="dbBackupList"></div>
@@ -432,14 +509,14 @@ window.MathJax = {
     <div class="db-modal-head">
       <h3 id="dbModalTitle">Row</h3>
       <button class="ghost-btn neutral icon-only" id="dbModalClose" type="button" title="Close">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        <i class="fa fa-xmark" aria-hidden="true"></i>
       </button>
     </div>
     <div class="db-modal-body" id="dbModalBody"></div>
     <div class="db-modal-foot">
       <span class="hint" id="dbModalHint"></span>
       <button class="icon-btn sm" id="dbModalSave" type="button" title="Save row">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15.2 3a2 2 0 0 1 1.4.6l3.8 3.8a2 2 0 0 1 .6 1.4V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M17 21v-7a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v7"/><path d="M7 3v4a1 1 0 0 0 1 1h7"/></svg>
+        <i class="fa fa-floppy-disk" aria-hidden="true"></i>
       </button>
     </div>
   </div>

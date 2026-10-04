@@ -3,6 +3,7 @@ import logging
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 
 import requests as http_requests
@@ -13,10 +14,12 @@ from pydantic import BaseModel
 
 import json
 from pipeline import envfile
+from pipeline import vision
 from pipeline import backups
+from pipeline import gemini as gemini_mod
 from pipeline.dataconsole import DataConsole, GuardError
 from pipeline.revision import runner as revision_runner
-from pipeline.config import load_config, ENV_PATH
+from pipeline.config import load_config, ENV_PATH, seed_proxy_profile
 from pipeline.db import Database
 from pipeline.gemini_router import router
 from pipeline.gemini_router import mask as mask_key
@@ -47,6 +50,13 @@ async def _backup_loop():
 @asynccontextmanager
 async def lifespan(_app):
     hub.attach_loop(asyncio.get_running_loop())
+    # Q5 one-time upgrade: a legacy single proxy URL becomes one profile
+    # before the old lane is dropped — never overwrites an existing list.
+    seeded = seed_proxy_profile()
+    if seeded:
+        envfile.update_env_file(ENV_PATH, {
+            "PROXY_PROFILES": json.dumps(list(seeded), ensure_ascii=False)})
+        load_dotenv(ENV_PATH, override=True)
     backup_task = asyncio.create_task(_backup_loop())
     try:
         yield
@@ -360,13 +370,6 @@ async def db_backup_download(set: str, table: str, fmt: str = "sql"):
 # the dashboard (and its network traffic) never carries a usable key.
 KEEP = "__KEEP__"   # UI sentinel: 'leave stored value alone'
 
-def _router_provider_guess(base_url: str) -> str:
-    """Loopback URLs mean a local server; anything else is a hosted
-    OpenAI-compatible endpoint (same rule pipeline.config.load_config uses)."""
-    u = (base_url or "").lower()
-    return "local" if ("localhost" in u or "127.0.0.1" in u or "::1" in u) else "openai"
-
-
 class CredentialSave(BaseModel):
     gemini_keys: list[str] = []      # real key text, or "__KEEP__"/"__KEEP__:<i>"
     gemini_names: list[str] = []     # optional labels, same order
@@ -374,10 +377,99 @@ class CredentialSave(BaseModel):
     supabase_url: str = KEEP
     supabase_key: str = KEEP         # service key
     supabase_bucket: str = KEEP
-    router_provider: str = KEEP      # 'local' | 'openai'
-    router_url: str = KEEP
-    router_key: str = KEEP
-    router_model: str = KEEP
+    # Local/other Postgres, beside Supabase (TASK 6).
+    postgres_host: str = KEEP
+    postgres_port: str = KEEP
+    postgres_db: str = KEEP
+    postgres_user: str = KEEP
+    postgres_password: str = KEEP
+    postgres_sslmode: str = KEEP
+    # One custom provider kind, per section (TASK 2/3): label, base URL,
+    # api_key, model. api_key is KEEP, "KEEP:<i>" or a new literal — the
+    # same sentinel rule the Gemini key rows follow below.
+    extraction_providers: list[dict] | None = None
+    extraction_active: str = KEEP   # "" → the Gemini pool
+    revision_providers: list[dict] | None = None
+    revision_active: str = KEEP
+
+
+def _merge_providers(stored, incoming):
+    """Fold the submitted provider rows over the stored ones.
+
+    Labels/URLs/models are plain fields and always take the submitted
+    value; `api_key` is KEEP (keep the stored secret at the same position),
+    "KEEP:<i>" (keep the stored secret at i — survives a reorder/rename)
+    or a new literal. Same sentinel rule as the Gemini key rows above."""
+    out = []
+    for i, raw in enumerate(incoming or []):
+        label = str(raw.get("label", "")).strip().replace(",", " ")
+        if not label:
+            continue
+        key = str(raw.get("api_key", KEEP) or KEEP)
+        if key == "__CLEAR__":
+            key = ""
+        elif key == KEEP:
+            prev = stored[i] if i < len(stored) else {}
+            key = prev.get("api_key", "")
+        elif key.startswith(KEEP + ":"):
+            try:
+                j = int(key.split(":", 1)[1])
+            except ValueError:
+                key = ""
+            else:
+                key = stored[j].get("api_key", "") if 0 <= j < len(stored) else ""
+        out.append({"label": label,
+                    "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
+                    "api_key": key,
+                    "model": str(raw.get("model", "")).strip()})
+    seen, dedup = set(), []
+    for p in out:
+        if p["label"] not in seen:
+            seen.add(p["label"])
+            dedup.append(p)
+    return tuple(dedup)
+
+
+def _provider_view(p: dict) -> dict:
+    """Masked provider row for the dashboard — never the raw api_key."""
+    return {"label": p.get("label", ""),
+            "base_url": p.get("base_url", ""),
+            "model": p.get("model", ""),
+            "api_key_set": bool(p.get("api_key")),
+            "api_key_masked": mask_key(p.get("api_key", ""))}
+
+
+def _profiles_view():
+    """Masked profile list for the pipeline-tab selector."""
+    return {"profiles": [{"name": p.get("name", ""),
+                          "host": p.get("host", ""),
+                          "port": p.get("port", ""),
+                          "scheme": p.get("scheme", "http"),
+                          "user": p.get("user", ""),
+                          "pass_set": bool(p.get("password")),
+                          "pass_masked": mask_key(p.get("password", ""))}
+                         for p in cfg.proxy_profiles],
+            "active": cfg.proxy_active,   # "" → the Direct (no proxy) entry
+            "direct": True}
+
+
+class ProfileSave(BaseModel):
+    profiles: list[dict] = []
+    active: str = ""                 # "" is the explicit off value (Q4)
+
+
+def _host_of(url: str) -> str:
+    """Host (and port) of a base URL, for masked display."""
+    from urllib.parse import urlparse
+    u = urlparse((url or "").strip())
+    netloc = u.netloc or (url or "").strip().strip("/")
+    return netloc.split("@")[-1]        # strip user:pass@ if present
+
+
+# Last known verdict of POST /api/credentials/check/provider —
+# a convenience cache so the GET view can show a chip without
+# probing. In-memory only; a restart simply shows no verdict.
+_provider_verdict: dict = {}
 
 
 def _credentials_view():
@@ -390,11 +482,22 @@ def _credentials_view():
     st["supabase_bucket"] = cfg.supabase_bucket
     st["supabase_key_set"] = bool(cfg.supabase_key)
     st["supabase_key_masked"] = mask_key(cfg.supabase_key)
-    st["router_provider"] = cfg.router_provider
-    st["router_url"] = cfg.router_base_url
-    st["router_model"] = cfg.router_model
-    st["router_key_set"] = bool(cfg.router_api_key)
-    st["router_key_masked"] = mask_key(cfg.router_api_key)
+    # Per-section saved providers — two independent lists, masked (TASK 2/3).
+    st["extraction_providers"] = [_provider_view(p)
+                                  for p in cfg.extraction_providers]
+    st["extraction_active"] = cfg.extraction_active
+    st["revision_providers"] = [_provider_view(p)
+                                for p in cfg.revision_providers]
+    st["revision_active"] = cfg.revision_active
+    # Local/other Postgres, beside Supabase (TASK 6).
+    st["postgres_host"] = cfg.postgres_host
+    st["postgres_port"] = str(cfg.postgres_port)
+    st["postgres_db"] = cfg.postgres_db
+    st["postgres_user"] = cfg.postgres_user
+    st["postgres_sslmode"] = cfg.postgres_sslmode
+    st["postgres_password_set"] = bool(cfg.postgres_password)
+    st["postgres_password_masked"] = mask_key(cfg.postgres_password)
+    st["provider_ok"] = dict(_provider_verdict) or None
     st["legacy_pool"] = os.getenv("GEMINI_API_KEYS") is None and bool(cfg.gemini_key_pool)
     return st
 
@@ -443,19 +546,70 @@ async def credentials_save(body: CredentialSave):
 
     ladder = [m.strip() for m in body.model_ladder if m.strip()]
     if not ladder:
+        # An absent ladder (older client) keeps the current one; a
+        # submitted-but-blank ladder is a user error, not a fallback.
+        if body.model_ladder:
+            return JSONResponse(
+                {"ok": False, "error": "The model ladder cannot be "
+                                       "empty — list at least one model."},
+                status_code=400)
         ladder = list(cfg.gemini_model_ladder)
+    if len(set(ladder)) != len(ladder):
+        return JSONResponse(
+            {"ok": False, "error": "The model ladder has duplicate "
+                                   "entries — every rung must be unique."},
+            status_code=400)
 
     url = cfg.supabase_url if body.supabase_url == KEEP else body.supabase_url.strip().rstrip("/")
-    skey = cfg.supabase_key if body.supabase_key == KEEP else body.supabase_key.strip()
+    skey = cfg.supabase_key if body.supabase_key == KEEP else (
+        "" if body.supabase_key == "__CLEAR__" else body.supabase_key.strip())
     bucket = cfg.supabase_bucket if body.supabase_bucket == KEEP else body.supabase_bucket.strip()
 
-    rurl = cfg.router_base_url if body.router_url == KEEP else body.router_url.strip().rstrip("/")
-    rkey = cfg.router_api_key if body.router_key == KEEP else body.router_key.strip()
-    rmodel = cfg.router_model if body.router_model == KEEP else body.router_model.strip()
-    rprov = body.router_provider.strip().lower()
-    if rprov not in ("local", "openai"):
-        rprov = _router_provider_guess(rurl)
+    # Local/other Postgres (TASK 6) — KEEP keeps the stored value.
+    pg_host = cfg.postgres_host if body.postgres_host == KEEP else body.postgres_host.strip()
+    pg_port = str(cfg.postgres_port) if body.postgres_port == KEEP else body.postgres_port.strip()
+    if pg_port and not pg_port.isdigit():
+        return JSONResponse(
+            {"ok": False, "error": "Postgres port must be a number — "
+                                   "leave it blank to keep the stored value."},
+            status_code=400)
+    pg_db = cfg.postgres_db if body.postgres_db == KEEP else body.postgres_db.strip()
+    pg_user = cfg.postgres_user if body.postgres_user == KEEP else body.postgres_user.strip()
+    pg_password = (cfg.postgres_password if body.postgres_password == KEEP
+                   else body.postgres_password.strip())
+    pg_sslmode = (cfg.postgres_sslmode if body.postgres_sslmode == KEEP
+                  else body.postgres_sslmode.strip().lower())
 
+    # Per-section custom providers (TASK 2/3): lists merge over what is
+    # stored, "" is the meaningful "not selected" value (Gemini pool for
+    # extraction, no endpoint for revision).
+    providers_x = (list(cfg.extraction_providers)
+                   if body.extraction_providers is None
+                   else _merge_providers(list(cfg.extraction_providers),
+                                         body.extraction_providers))
+    active_x = (cfg.extraction_active if body.extraction_active == KEEP
+                else body.extraction_active.strip())
+    providers_r = (list(cfg.revision_providers)
+                   if body.revision_providers is None
+                   else _merge_providers(list(cfg.revision_providers),
+                                         body.revision_providers))
+    active_r = (cfg.revision_active if body.revision_active == KEEP
+                else body.revision_active.strip())
+    if active_x and active_x not in {p["label"] for p in providers_x}:
+        return JSONResponse(
+            {"ok": False, "error": f"Extraction active provider "
+                                   f"'{active_x}' is not in the saved list."},
+            status_code=400)
+    if active_r and active_r not in {p["label"] for p in providers_r}:
+        return JSONResponse(
+            {"ok": False, "error": f"Revision active provider "
+                                   f"'{active_r}' is not in the saved list."},
+            status_code=400)
+
+    # Legacy ROUTER_*/OCR_* keys are deliberately NOT written: Q1 keeps
+    # them read-only, and a fresh write would resurrect the local/openai
+    # vocabulary acceptance 2 forbids — _providers() in config.py is the
+    # read-fallback that keeps an untouched older .env working.
     envfile.update_env_file(ENV_PATH, {
         "GEMINI_API_KEYS": ",".join(keys),
         "GEMINI_KEY_NAMES": ",".join(names),
@@ -463,10 +617,16 @@ async def credentials_save(body: CredentialSave):
         "SUPABASE_URL": url,
         "SUPABASE_SERVICE_KEY": skey,
         "SUPABASE_BUCKET": bucket,
-        "ROUTER_PROVIDER": rprov,
-        "ROUTER_BASE_URL": rurl,
-        "ROUTER_API_KEY": rkey,
-        "ROUTER_MODEL": rmodel,
+        "POSTGRES_HOST": pg_host,
+        "POSTGRES_PORT": pg_port,
+        "POSTGRES_DB": pg_db,
+        "POSTGRES_USER": pg_user,
+        "POSTGRES_PASSWORD": pg_password,
+        "POSTGRES_SSLMODE": pg_sslmode,
+        "EXTRACTION_PROVIDERS": json.dumps(list(providers_x), ensure_ascii=False),
+        "EXTRACTION_ACTIVE": active_x,
+        "REVISION_PROVIDERS": json.dumps(list(providers_r), ensure_ascii=False),
+        "REVISION_ACTIVE": active_r,
     })
     load_dotenv(ENV_PATH, override=True)   # pick up the file we just wrote
     cfg = load_config()
@@ -475,6 +635,34 @@ async def credentials_save(body: CredentialSave):
     view["saved"] = True
     view["key_count"] = len(cfg.gemini_key_pool)
     return JSONResponse(view)
+
+
+@app.post("/api/credentials/check/provider")
+async def credentials_check_provider():
+    """Free health check for the custom OCR endpoint: ONE GET
+    <base>/models listing, no model run, no generation tokens — the same
+    philosophy as the Gemini key checks. (The LIVE test that really chats
+    is POST /api/credentials/test below.) Gemini itself has no single
+    endpoint to probe here (its keys are checked individually above).
+
+    Registered BEFORE the {index} route below — literal paths must
+    precede parameterized ones or FastAPI matches 'provider' as an int."""
+    if (cfg.ocr_provider or "gemini").lower() == "gemini":
+        return JSONResponse(
+            {"ok": False, "provider": "gemini", "url": "",
+             "status": 0, "models": [],
+             "detail": "The Gemini pool has no endpoint to test — "
+                       "use Check all keys to verify the pool.",
+             "fault": None}, status_code=409)
+    try:
+        report = await asyncio.to_thread(vision.check_provider, cfg)
+    except Exception as exc:                       # pragma: no cover
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    # Never echo the raw base URL — it may carry user:pass@ in it.
+    report["url"] = _host_of(report.get("url", ""))
+    _provider_verdict.clear()
+    _provider_verdict.update(report)
+    return JSONResponse(report)
 
 
 @app.post("/api/credentials/check")
@@ -487,6 +675,66 @@ async def credentials_check():
     except Exception as exc:                       # pragma: no cover
         return JSONResponse({"error": str(exc)}, status_code=500)
     return JSONResponse(report)
+
+class ProviderTest(BaseModel):
+    section: str = "extraction"     # 'extraction' | 'revision'
+    base_url: str = ""              # "" → test the Gemini key pool instead
+    api_key: str = ""               # unsent values are sent by the UI as stored
+    model: str = ""
+
+
+@app.post("/api/credentials/test")
+async def credentials_test(body: ProviderTest):
+    """One real model call: reply snippet + latency (TASK item 4).
+
+    This is deliberately NOT /api/credentials/check/provider — that one is
+    a free metadata listing and can never show a reply. Exactly one
+    generateContent pong for the Gemini pool, or one tiny chat completion
+    for a custom provider (Gemini keys and custom providers alike)."""
+    started = time.monotonic()
+    if not (body.base_url or "").strip():
+        pool = cfg.gemini_key_pool
+        if not pool:
+            return JSONResponse(
+                {"ok": False, "error": "No Gemini key is saved — add one first."},
+                status_code=400)
+        model = (cfg.gemini_model_ladder[0] if cfg.gemini_model_ladder
+                 else "gemini-3.5-flash")
+
+        def _one():
+            return gemini_mod.call_gemini(
+                pool[0], model, 'Reply with exactly: {"pong": true}', "",
+                "text/plain", max_tokens=16, retries=1)
+        try:
+            parsed, _raw = await asyncio.to_thread(_one)
+        except Exception as exc:                       # pragma: no cover
+            flt = getattr(exc, "fault", None)
+            return JSONResponse(
+                {"ok": False, "error": str(exc)[:400],
+                 "fault": (flt or {}).get("label", ""),
+                 "latency_ms": round((time.monotonic() - started) * 1000, 1)},
+                status_code=502)
+        return JSONResponse(
+            {"ok": True, "model": model,
+             "snippet": json.dumps(parsed, ensure_ascii=False)[:200],
+             "latency_ms": round((time.monotonic() - started) * 1000, 1)})
+
+    try:
+        snippet, _ms = await asyncio.to_thread(
+            vision.test_chat, body.base_url.strip(), body.api_key,
+            body.model.strip())
+    except Exception as exc:
+        flt = getattr(exc, "fault", None)
+        return JSONResponse(
+            {"ok": False, "error": str(exc)[:400],
+             "fault": (flt or {}).get("label", ""),
+             "latency_ms": round((time.monotonic() - started) * 1000, 1)},
+            status_code=502)
+    return JSONResponse(
+        {"ok": True, "model": body.model,
+         "snippet": snippet,
+         "latency_ms": round((time.monotonic() - started) * 1000, 1)})
+
 
 @app.post("/api/credentials/check/{index}")
 async def credentials_check_one(index: int):
@@ -501,6 +749,68 @@ async def credentials_check_one(index: int):
     except Exception as exc:                       # pragma: no cover
         return JSONResponse({"error": str(exc)}, status_code=500)
     return JSONResponse(row)
+
+
+# ════════════════ PROFILES · named proxy profiles (pipeline tab) ════════════════
+# The lane only ever rewrites calls that would otherwise hit
+# generativelanguage.googleapis.com (OCR, health checks, gateway probes) —
+# Supabase, Postgres and the local routers keep their direct paths, which is
+# exactly what a system-wide VPN would have slowed down.
+
+@app.get("/api/profiles")
+async def profiles_get():
+    return JSONResponse(_profiles_view())
+
+
+@app.post("/api/profiles")
+async def profiles_save(body: ProfileSave):
+    """Persist named proxy profiles + the active one to .env and hot-swap
+    the live lane — no restart (Q4: active "" is Direct, no proxy)."""
+    global cfg
+    names, clean = [], []
+    stored = {p.get("name", ""): p for p in cfg.proxy_profiles}
+    for raw in body.profiles:
+        name = str(raw.get("name", "")).strip()
+        host = str(raw.get("host", "")).strip()
+        if not name or name in names or not host:
+            continue
+        names.append(name)
+        # Password KEEP rules: KEEP → stored one at the same name,
+        # "KEEP:<i>" → stored one at position i (reorder/rename safe),
+        # anything else is a new literal.
+        prev = stored.get(name, {})
+        key = str(raw.get("password", "") or "")
+        if key == KEEP:
+            password = prev.get("password", "")
+        elif key.startswith(KEEP + ":"):
+            try:
+                j = int(key.split(":", 1)[1])
+            except ValueError:
+                password = ""
+            else:
+                ordered = [p.get("password", "") for p in cfg.proxy_profiles]
+                password = ordered[j] if 0 <= j < len(ordered) else ""
+        else:
+            password = key
+        clean.append({"name": name, "host": host,
+                      "port": str(raw.get("port", "")).strip(),
+                      "scheme": (raw.get("scheme") or "http").lower(),
+                      "user": str(raw.get("user", "")).strip(),
+                      "password": password})
+    active = body.active.strip()
+    if active and active not in names:
+        active = ""
+    envfile.update_env_file(ENV_PATH, {
+        "PROXY_PROFILES": json.dumps(clean, ensure_ascii=False),
+        "PROXY_ACTIVE": active,
+    })
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    gemini_mod.set_proxy(cfg)        # live lane swap, no restart
+    view = _profiles_view()
+    view["ok"] = True
+    view["saved"] = True
+    return JSONResponse(view)
 
 
 @app.post("/api/review/bbox")

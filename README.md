@@ -41,9 +41,9 @@ Manually:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/Scripts/pip install -r requirements.txt
 cp .env.example .env   # then fill in credentials
-.venv/bin/python main.py
+.venv/Scripts/python main.py
 ```
 
 ## Configuration
@@ -54,9 +54,10 @@ Main groups:
 | Group | Keys | Notes |
 |-------|------|-------|
 | Input tree | `INPUT_ROOT`¹, `MIN_AGE_SECONDS` | watched folder root, defaults to `./konkour-ocr` |
-| Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set |
+| Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD/SSLMODE`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set; blank `SSLMODE` keeps the driver default |
 | Gemini | `GEMINI_API_KEY`, `GEMINI_API_KEY_QUESTIONS/ANSWERS`, `GEMINI_MODEL_QUESTIONS/ANSWERS` | per-lane keys and models |
 | Router | `ROUTER_BASE_URL/API_KEY/MODEL` | optional OpenAI-compatible front for Gemini |
+| Providers / proxy | `EXTRACTION_PROVIDERS`, `EXTRACTION_ACTIVE`, `REVISION_PROVIDERS`, `REVISION_ACTIVE`, `PROXY_PROFILES`, `PROXY_ACTIVE` | written by the dashboard; legacy `ROUTER_*` / `OCR_*` / `GEMINI_API_KEY*` are still read when absent |
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |
@@ -90,10 +91,10 @@ notes. Keep `MIN_AGE_SECONDS` at its default so scans don't race the converter.
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests
+.venv/Scripts/python -m unittest discover -s tests
 ```
 
-131 tests, no network or database access required (DB-dependent paths are
+166 tests, no network or database access required (DB-dependent paths are
 stubbed or skipped).
 
 ## Project layout

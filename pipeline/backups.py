@@ -47,10 +47,12 @@ def keep_sets():
 
 
 def _connect(cfg):
-    conn = psycopg2.connect(
-        host=cfg.postgres_host, port=cfg.postgres_port, dbname=cfg.postgres_db,
-        user=cfg.postgres_user, password=cfg.postgres_password, connect_timeout=10,
-    )
+    kwargs = dict(host=cfg.postgres_host, port=cfg.postgres_port,
+                  dbname=cfg.postgres_db, user=cfg.postgres_user,
+                  password=cfg.postgres_password, connect_timeout=10)
+    if cfg.postgres_sslmode:
+        kwargs["sslmode"] = cfg.postgres_sslmode   # "" → libpq default
+    conn = psycopg2.connect(**kwargs)
     conn.autocommit = True
     return conn
 

@@ -14,14 +14,15 @@ class Database:
 
     # ── connection handling ────────────────────────────────────────
     def _connect(self):
-        self._conn = psycopg2.connect(
-            host=self.cfg.postgres_host,
-            port=self.cfg.postgres_port,
-            dbname=self.cfg.postgres_db,
-            user=self.cfg.postgres_user,
-            password=self.cfg.postgres_password,
-            connect_timeout=10,
-        )
+        kwargs = dict(host=self.cfg.postgres_host,
+                      port=self.cfg.postgres_port,
+                      dbname=self.cfg.postgres_db,
+                      user=self.cfg.postgres_user,
+                      password=self.cfg.postgres_password,
+                      connect_timeout=10)
+        if self.cfg.postgres_sslmode:
+            kwargs["sslmode"] = self.cfg.postgres_sslmode   # "" → libpq default
+        self._conn = psycopg2.connect(**kwargs)
         self._conn.autocommit = True
 
     def _execute(self, sql, params=None, fetch=False):
