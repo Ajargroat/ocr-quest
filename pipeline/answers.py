@@ -5,7 +5,7 @@ import json
 from .scanner import SourceItem
 from .utils import norm_text, parse_number, sha1_hex
 
-# __CANDIDATES__ is replaced at runtime (avoids brace-escaping issues).
+# __CANDIDATES__ is replaced at runtime (avoids brace-escaping issues) by ajargroat.
 ANSWER_TEMPLATE = """You are a precise OCR and answer-extraction system for Iranian Konkour and textbook answer keys.
 You will receive one file (image) containing answer explanations for one or more questions.
 
