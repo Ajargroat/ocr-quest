@@ -248,6 +248,7 @@ const RAIL = {
   stageOf: {queued:0, uploading:1, ocr:2, saving:3},
   counts: null, last: null, cur: null,
   running: false, total: 0, processed: 0, errors: 0,
+  wait: null,                            // {until,total,attempt,tries,where} · Q8
 };
 const railBox   = $('stages');
 const railStages= railBox.querySelectorAll('.stage');
@@ -339,7 +340,7 @@ function renderRail(){
 
   // caption line
   const now = $('stageNow'), name = $('stageNowName'), detail = $('stageNowDetail');
-  let st = 'idle', nm = 'idle', dt = 'press “Start Scan” to feed the pipeline';
+  let st = 'idle', nm = 'idle', dt = '';
   if (complete){
     st = 'done'; nm = 'complete';
     dt = RAIL.processed + ' archived · ' + RAIL.errors + ' failed · run finished';
@@ -354,6 +355,15 @@ function renderRail(){
              : railStages[active].dataset.desc));
     } else {
       nm = 'Pipeline'; dt = 'waiting for the next file…';
+    }
+    if (RAIL.wait){
+      const w = RAIL.wait;
+      const left = Math.max(0, Math.ceil((w.until * 1000 - Date.now()) / 1000));
+      if (left > 0){
+        st = 'wait';
+        nm = w.attempt && w.tries ? `Retry ${w.attempt}/${w.tries}` : 'Backing off';
+        dt = (w.where ? w.where + ' · ' : '') + `${left}s left of ${Math.round(w.total)}s`;
+      } else RAIL.wait = null;
     }
     if (cur && cur.status === 'failed'){ st = 'err'; nm = 'Failed'; dt = cur.name + (cur.detail ? ' · ' + cur.detail : ''); }
   } else if (RAIL.cur && RAIL.cur.status === 'failed' && doneN >= RAIL.total && RAIL.total > 0){
@@ -405,7 +415,29 @@ function handle(ev){
       CredState.events.push({ ts: ev.ts || '', message: ev.text });
       if ($('viewCredentials').classList.contains('active')) credRenderSide();
       break;
+    case 'wait': waitCountdown(ev); break;
+    case 'upload': upApplyEvent(ev); break;
+    case 'usage': credUsageLive(ev); break;
   }
+}
+
+/* ═══════════ RETRY COUNTDOWN (Q8) ═══════════
+   The runner sends the exact seconds it is about to sleep, so the number
+   shown here always equals the wait actually being taken. */
+let WAIT_TICK = null;
+function waitCountdown(ev){
+  RAIL.wait = { until: ev.until || 0, total: Math.max(0, ev.total || 0),
+                attempt: ev.attempt || 0, tries: ev.tries || 0,
+                where: ev.where || '' };
+  clearInterval(WAIT_TICK);
+  renderRail();
+  WAIT_TICK = setInterval(() => {
+    if (!RAIL.wait){ clearInterval(WAIT_TICK); WAIT_TICK = null; return; }
+    if (RAIL.wait.until * 1000 <= Date.now()){
+      RAIL.wait = null; clearInterval(WAIT_TICK); WAIT_TICK = null;
+    }
+    renderRail();
+  }, 500);
 }
 function connect(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -434,9 +466,9 @@ $('runBtn').onclick = async () => {
 };
 
 /* ═══════════ TAB SWITCHING ═══════════ */
-document.querySelectorAll('.tab').forEach(tab => {
+document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
   tab.onclick = () => {
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('#side .side-btn').forEach(t => t.classList.remove('active'));
     tab.classList.add('active');
     const target = tab.dataset.view;
     $('viewPipeline').classList.toggle('active', target === 'pipeline');
@@ -463,6 +495,28 @@ document.querySelectorAll('.tab').forEach(tab => {
     if (target === 'pipeline' && !PipeState.loaded) loadPipeProfiles();
   };
 });
+
+/* sidebar collapse — icons only; not persisted (PREFERENCE §5) */
+$('sideToggle').onclick = () => {
+  const min = document.body.classList.toggle('side-min');
+  $('sideToggle').querySelector('i').className =
+    'fa ' + (min ? 'fa-angles-right' : 'fa-angles-left');
+  $('sideToggle').title = min ? 'Expand the sidebar' : 'Collapse the sidebar';
+};
+
+/* theme toggle — session-only in-memory state; reload resets to dark
+   (PREFERENCE §5: zero browser storage, same rule as the sidebar collapse) */
+(function themeToggle(){
+  const btn = $('themeToggle');
+  if (!btn) return;
+  const apply = dark => {
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    btn.querySelector('i').className = 'fa ' + (dark ? 'fa-moon' : 'fa-sun');
+    btn.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
+  };
+  apply(true);   // dark is the default
+  btn.onclick = () => apply(document.documentElement.dataset.theme === 'light');
+})();
 
 /* ═══════════ QBANK ═══════════ */
 const STATUS_FA = {pending:'در انتظار', approved:'تأیید شده', rejected:'رد شده'};
@@ -946,7 +1000,7 @@ function mountDiagrams(){
     canvas.style.maxWidth = MAX_W + 'px';
     canvas.style.aspectRatio = '4 / 3';
     canvas.style.display = 'block';
-    canvas.style.background = '#0a0c14';
+    canvas.style.background = 'var(--surface-2)';
     canvas.width = MAX_W * DPR;
     canvas.height = MAX_W * 0.75 * DPR;
     box.appendChild(canvas);
@@ -1478,7 +1532,7 @@ function revRail(st){
       + ' revised · ' + (ls.needs_human || 0) + ' need review';
   } else {
     now.dataset.state = 'idle'; name.textContent = 'idle';
-    det.textContent = 'press “Run Scan” — the three stages run over 50-item batches';
+    det.textContent = '';
   }
 }
 
@@ -1922,7 +1976,8 @@ revPollOnce().then(() => {
         if (d2 < LINK*LINK){
           const d = Math.sqrt(d2);
           const alpha = (1 - d / LINK) * 0.18;
-          ctx.strokeStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+          const dark = document.documentElement.dataset.theme !== 'light';
+          ctx.strokeStyle = 'rgba(' + (dark ? '255,255,255' : '16,24,48') + ',' + alpha.toFixed(3) + ')';
           ctx.lineWidth = 1;
           ctx.beginPath();
           ctx.moveTo(a.x, a.y);
@@ -1932,7 +1987,8 @@ revPollOnce().then(() => {
       }
     }
     /* nodes */
-    ctx.fillStyle = 'rgba(255,255,255,.5)';
+    const dark = document.documentElement.dataset.theme !== 'light';
+    ctx.fillStyle = 'rgba(' + (dark ? '255,255,255' : '16,24,48') + ',.5)';
     for (const n of nodes){
       ctx.beginPath();
       ctx.arc(n.x, n.y, 1.3, 0, Math.PI * 2);
@@ -2120,7 +2176,7 @@ function credRenderSide(){
   const list = CredState.events.slice(-14).reverse();
   ev.innerHTML = list.length
     ? list.map(e => `<div class="cev"><i>${credEsc(e.ts)}</i><span>${credEsc(e.message)}</span></div>`).join('')
-    : '<div class="cev dim">no routing events yet — run a scan or a health check</div>';
+    : '';
 }
 
 function credOcrFields(){
@@ -2177,13 +2233,13 @@ function credMarkDirty(){
 
 function credButtons(){
   const busy = CredState.busy || !CredState.loaded;
-  const blocked = busy || CredState.dirty;
+  const ready = CredState.loaded && CredState.dirty;
   const save = $('credSaveBtn');
   if (save){
-    save.disabled = blocked;
+    save.disabled = busy || !ready;
     save.title = busy ? 'Loading or busy — wait for the current operation'
-      : CredState.dirty ? 'Save or reload unsaved changes first'
-      : 'Save everything to .env';
+      : CredState.dirty ? 'Save everything to .env'
+      : 'Nothing to save yet — edit a field or add a provider';
   }
   const r = $('credReloadBtn');
   if (r) r.disabled = busy;
@@ -2205,6 +2261,7 @@ async function loadCredentials(){
     CredState.usageCap = (d.keys && d.keys[0] && d.keys[0].usage && d.keys[0].usage.limit) || 20;
     CredState.rows = (d.keys || []).map(k => ({
       keep:k.index, masked:k.masked, name:k.name || '', value:'', replaced:false, removed:false,
+      okModel:k.ok_model || '',
       models:{}, blocked:k.blocked_models || [], usage:k.usage || null, calls:k.calls || 0,
       checking:false, latency:k.latency_ms || 0, penalized:!!k.penalized,
       state: k.serving ? 'ok' : k.cooling ? 'cooldown'
@@ -2242,6 +2299,7 @@ async function loadCredentials(){
     $('credPgSsl').value = d.postgres_sslmode || '';
     credRenderProviders('extraction');
     credRenderProviders('revision');
+    credRenderSummaries();
     document.querySelectorAll('#ocrProvider button').forEach(b =>
       b.classList.toggle('active', b.dataset.ocr === CredState.extraction.engine));
     credOcrFields();
@@ -2528,9 +2586,95 @@ function credAddProvider(section){
   toast('Provider “' + label + '” staged — save to write it to .env');
 }
 
+/* ── compact credentials page: summary cards + modal forms ──
+   One reusable modal (#credModal) carries whichever form the card
+   opened. The form's ids are the SAME ids the inline page used, so
+   loadCredentials()/credSave()/credRenderProviders()/the dirty
+   listeners all keep working unchanged — only the location moved.
+   Modal markup is static (in index.html), never rebuilt, so the
+   listeners bound once at load never go stale. */
+const CredModal = { form:null };
+
+function credOpenModal(form, title, hint){
+  CredModal.form = form;
+  $('credModalTitle').textContent = title;
+  $('credModalHint').textContent = hint;
+  // exactly one form is visible per open; ids are unique document-wide
+  document.querySelectorAll('#credModalBody .cred-form')
+    .forEach(el => { el.hidden = el.dataset.form !== form; });
+  $('credModal').hidden = false;
+  const first = $('credModalBody')
+    .querySelector(`[data-form="${form}"] input, [data-form="${form}"] select`);
+  if (first) first.focus();
+}
+
+function credCloseModal(){ $('credModal').hidden = true; }
+
+/* Compact card body: masked values + a status chip, no inputs.
+   Reads only what loadCredentials() already fills: CredState for the
+   two provider sections, the (now modal-resident) inputs for the DB
+   sections — .value and .placeholder are readable while hidden. No new
+   CredState fields are needed: loadCredentials() writes the masked
+   secret into each password input's placeholder. */
+function credSummary(el, rows){
+  el.innerHTML = rows.map(r =>
+    `<div class="cred-sum"><span>${credEsc(r[0])}</span>` +
+    `<b class="${r[2] || ''}">${credEsc(r[1])}</b></div>`).join('');
+}
+
+function credRenderSummaries(){
+  // Gemini routing card — the key rows themselves live in the modal,
+  // so the card carries the counts the user needs at a glance.
+  const stored = CredState.rows.filter(r => !r.removed && r.keep !== null);
+  const live = stored.filter(r => r.state === 'ok' || r.state === 'alive_unlisted').length;
+  const sends = CredState.ladder.map(m => {
+    const n = CredState.rows.reduce((s, r) =>
+      s + (((r.usage && r.usage.models) || {})[m] || 0), 0);
+    return credModelTag(m) + ' ' + n;
+  }).join(' · ');
+  credSummary($('credPoolSummary'), [
+    ['keys', stored.length + ' stored · ' + live + ' verified',
+     (stored.length && live === stored.length) ? 'cred-chip ok' : 'cred-chip amber'],
+    ['ladder', CredState.ladder.join(' → ') || '— not set —'],
+    ['completed sends', sends || '— none yet'],
+  ]);
+
+  const ex = CredState.extraction;
+  const p = ex.providers.find(x => x.label === ex.active);
+  credSummary($('ocrSummary'), [
+    ['engine', ex.engine === 'gemini' ? 'Gemini key pool' : 'Custom provider',
+     ex.engine === 'gemini' ? 'cred-chip ok' : 'cred-chip amber'],
+    ['active', p ? p.label : '— none —'],
+    ['base URL', p ? (p.base_url || '—') : '—'],
+    ['model', p ? (p.model || '—') : '—'],
+    ['API key', (p && p.api_key_masked) || (p && p.api_key_set ? 'set' : '— not set —')],
+  ]);
+  const rv = CredState.revision;
+  const rp = rv.providers.find(x => x.label === rv.active);
+  credSummary($('credSummary'), [
+    ['active', rp ? rp.label : '— none —'],
+    ['base URL', rp ? (rp.base_url || '—') : '—'],
+    ['model', rp ? (rp.model || '—') : '—'],
+    ['API key', (rp && rp.api_key_masked) || (rp && rp.api_key_set ? 'set' : '— not set —')],
+  ]);
+  credSummary($('supaSummary'), [
+    ['Project URL', $('credSupaUrl').value || '— not set —'],
+    ['Bucket', $('credSupaBucket').value || '— not set —'],
+    ['Service key', $('credSupaKey').placeholder || '— not set —'],
+  ]);
+  credSummary($('pgSummary'), [
+    ['host · port', ($('credPgHost').value || '—') +
+      ($('credPgPort').value ? ':' + $('credPgPort').value : '')],
+    ['database · user', ($('credPgDb').value || '—') +
+      ' · ' + ($('credPgUser').value || '—')],
+    ['SSL mode', $('credPgSsl').value || 'driver default'],
+    ['password', $('credPgPass').placeholder || '— not set —'],
+  ]);
+}
+
 /* ONE real model call against the endpoint — reply snippet + latency
    (TASK item 4). Gemini pool mode posts an empty base_url and the
-   backend pongs with the first ladder model; custom mode chats over
+   backend replies ping with the first ladder model; custom mode chats over
    /chat/completions. */
 async function credTestChat(section){
   if (CredState.busy){ toast('Busy — wait for the current operation'); return; }
@@ -2553,7 +2697,7 @@ async function credTestChat(section){
     const d = await res.json();
     const ok = res.ok && d.ok;
     const detail = ok
-      ? (d.snippet || 'pong') + ' · ' + d.latency_ms + ' ms'
+      ? (d.snippet || 'ping') + ' · ' + d.latency_ms + ' ms'
       : (d.fault || d.error || ('HTTP ' + res.status));
     if (section === 'extraction'){
       CredState.providerOk = { ok, detail, models: [],
@@ -2576,6 +2720,26 @@ $('credSaveBtn').onclick = credSave;
 $('ocrProviderTest').onclick = () => credTestChat('extraction');
 $('credProviderTest').onclick = () => credTestChat('revision');
 $('credReloadBtn').onclick = () => { if (!CredState.busy) loadCredentials(); };
+$('ocrEdit').onclick    = () => credOpenModal('extraction',
+  'Main OCR provider', 'Four fields: label · base URL · API key · model. Blank key input keeps the stored secret.');
+$('credEdit').onclick   = () => credOpenModal('revision',
+  'Revision AI provider', 'Separate endpoint — selecting it never changes the extraction engine.');
+$('supaEdit').onclick   = () => credOpenModal('supabase',
+  'Supabase', 'Project URL, bucket and the service key. Blank key input keeps the stored secret.');
+$('pgEdit').onclick     = () => credOpenModal('postgres',
+  'Local / other database', 'All six fields are needed to connect; leave SSL mode blank for the driver default.');
+$('credLadderEdit').onclick = () => credOpenModal('pool',
+  'Gemini key pool & model ladder',
+  'One model per line, oldest first · drag a key by its grip to reorder — order IS routing priority.');
+$('credModalClose').onclick = credCloseModal;
+$('credModalSave').onclick  = () => { credCloseModal(); credMarkDirty(); };
+$('credModal').addEventListener('click',
+  e => { if (e.target === $('credModal')) credCloseModal(); });
+// top-level, NOT inside dbWireOnce() — that Escape handler is behind
+// DbState.wireOnce and would only arm after the Database tab is opened.
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('credModal').hidden) credCloseModal();
+});
 
 /* ═══════════ PIPELINE · proxy profiles (the only proxy surface) ═══════════
    Named profiles live in .env (PROXY_PROFILES / PROXY_ACTIVE); this
@@ -2634,24 +2798,44 @@ $('pipeProxySel').onchange = async () => {
   catch(e){ toast('Proxy save failed — ' + e); loadPipeProfiles(); }
 };
 
-$('pipeProxyNew').onclick = async () => {
-  const name = (window.prompt('Profile name (e.g. home):') || '').trim();
-  if (!name) return;
-  if (PipeState.profiles.some(p => p.name === name)){
-    toast('A profile with that name already exists'); return;
+$('pipeProxyNew').onclick = () => {        // pop-up form, required fields first (Q9/criterion 9)
+  $('pxName').value = ''; $('pxHost').value = ''; $('pxPort').value = '';
+  $('pxScheme').value = 'http'; $('pxUser').value = ''; $('pxPass').value = '';
+  $('proxyModalErr').textContent = '';
+  $('proxyModal').hidden = false;
+  $('pxName').focus();
+};
+function proxyClose(){ $('proxyModal').hidden = true; }
+$('proxyModalClose').onclick = proxyClose;
+$('proxyModalCancel').onclick = proxyClose;
+$('proxyModal').addEventListener('click', e => { if (e.target === $('proxyModal')) proxyClose(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !$('proxyModal').hidden) proxyClose();
+});
+
+$('proxyModalSave').onclick = async () => {
+  const name = $('pxName').value.trim();
+  const host = $('pxHost').value.trim();
+  const port = $('pxPort').value.trim();
+  const err = $('proxyModalErr');
+  if (!name || !host || !port){
+    err.textContent = 'Name, host and port are required.';
+    return;
   }
-  const host = (window.prompt('Proxy host (e.g. 127.0.0.1):') || '').trim();
-  if (!host) return;
-  const port = (window.prompt('Port (blank = none):') || '').trim();
-  const scheme = (((window.prompt('Scheme — http or socks5 (blank = http):') || '').trim()) || 'http').toLowerCase();
-  const user = (window.prompt('Username (blank = none):') || '').trim();
-  const password = window.prompt('Password (blank = none):') || '';
-  PipeState.profiles.push({ name, host, port, scheme, user, password });
+  if (PipeState.profiles.some(p => p.name === name)){
+    err.textContent = 'A profile with that name already exists.';
+    return;
+  }
+  const scheme = ($('pxScheme').value || 'http').toLowerCase();
+  const row = { name, host, port, scheme,
+                user: $('pxUser').value.trim(), password: $('pxPass').value };
+  PipeState.profiles.push(row);
   try{
     await pipePost('Profile “' + name + '” saved');
+    proxyClose();
   }catch(e){
     PipeState.profiles.pop();
-    toast('Could not save the profile — ' + e);
+    err.textContent = 'Could not save the profile — ' + e;
   }
 };
 
@@ -2671,6 +2855,81 @@ $('pipeProxyDel').onclick = async () => {
 };
 
 loadPipeProfiles();   // the pipeline tab is the default view — no lazy slot fires
+
+/* ═══════════ PIPELINE · extraction provider selector ═══════════
+   Extraction only (user decision Q1) — Revision stays switchable
+   from the Credentials tab. ONE source of truth with #ocrSel: the
+   persisted EXTRACTION_ACTIVE, read from the same /api/credentials
+   view loadCredentials() uses. The payload is rebuilt from that
+   SERVER view (not from client state that may never have loaded),
+   and every stored key goes back as a KEEP sentinel — because
+   CredentialSave.gemini_keys defaults to [] and a body without the
+   keys blanks GEMINI_API_KEYS (main.py:614). The pipeline tab is
+   the default view, so this loads at startup without ever opening
+   the Credentials tab. */
+const ProvState = { loaded:false, providers:[], active:'', keys:[], ladder:[] };
+
+async function loadPipeProviders(){
+  try{
+    const d = await (await fetch('/api/credentials')).json();
+    ProvState.providers = d.extraction_providers || [];
+    ProvState.active = d.extraction_active || '';
+    ProvState.keys = d.keys || [];          // {index, name, masked, …}
+    ProvState.ladder = d.models || [];
+    ProvState.loaded = true;
+    const sel = $('pipeProvSel');
+    sel.innerHTML = '';
+    const pool = document.createElement('option');
+    pool.value = '';
+    pool.textContent = 'Gemini pool';
+    sel.appendChild(pool);
+    ProvState.providers.forEach(p => {
+      const o = document.createElement('option');
+      o.value = p.label;
+      o.textContent = p.label + (p.model ? ' · ' + p.model : '');
+      sel.appendChild(o);
+    });
+    sel.value = ProvState.active;
+    const hint = $('pipeProvHint');
+    if (hint) hint.textContent = ProvState.active
+      ? 'extraction runs on “' + ProvState.active + '”'
+      : 'extraction runs on the Gemini key pool';
+  }catch(e){ /* first paint before the server is up */ }
+}
+
+$('pipeProvSel').onchange = async () => {
+  const label = $('pipeProvSel').value;
+  try{
+    if (!ProvState.loaded) await loadPipeProviders();
+    const res = await fetch('/api/credentials', {
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({
+        gemini_keys:  ProvState.keys.map(k => CRED_KEEP + ':' + k.index),
+        gemini_names: ProvState.keys.map(k => k.name || ''),
+        model_ladder: ProvState.ladder,
+        extraction_active: label,        // "" = the Gemini pool
+      }),
+    });
+    const d = await res.json();
+    if (!res.ok) throw new Error(d.error || d.detail || ('HTTP ' + res.status));
+    toast('OCR provider saved to .env');
+    await loadPipeProviders();           // read the persisted value back
+    // keep the Credentials tab honest without disturbing its edits:
+    // refresh only if it is already loaded AND has nothing unsaved.
+    if (CredState.loaded && !CredState.dirty) await loadCredentials();
+    else if (CredState.loaded){
+      CredState.extraction.active = label;
+      CredState.extraction.engine = label ? 'custom' : 'gemini';
+      credRenderProviders('extraction');
+      credOcrFields();
+    }
+  }catch(e){
+    toast('Provider save failed — ' + e);
+    loadPipeProviders();                 // put the selector back in sync
+  }
+};
+
+loadPipeProviders();
 
 /* ═══════════ DATABASE · data console ═══════════
    One UI over the five Supabase tables the pipeline writes:
@@ -3125,3 +3384,384 @@ function dbWireOnce(){
     if (e.key === 'Escape' && !$('dbModal').hidden) dbCloseModal();
   });
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   WORKSTREAMS A–D · the surfaces added by the 2026-10-06 task
+   credentials rail (Q3) · model rings · usage reports (Q4/Q11)
+   upload queue (Q9) · period stats (Q4/Q11) · proxy pop-up (criterion 9)
+   ═══════════════════════════════════════════════════════════════ */
+
+const NINEROUTER_URL = 'http://127.0.0.1:20128/v1';
+const PERIODS = ['24h', '7d', '30d', 'all'];
+const PERIOD_LABEL = { '24h':'24 hours', '7d':'7 days', '30d':'30 days', 'all':'all time' };
+
+/* ── 1 · credentials rail: one press, one panel (Q3) ───────────── */
+const CRED_SERVICES = ['gemini', 'router', 'ocr', 'revision',
+                       'supabase', 'postgres', 'routing'];
+
+function credShow(service){
+  CRED_SERVICES.forEach(s => {
+    const panel = document.querySelector('.cred-card[data-cred="' + s + '"]');
+    if (panel) panel.hidden = (s !== service);
+    const btn = document.querySelector('#credRail .rail-btn[data-cred="' + s + '"]');
+    if (btn) btn.classList.toggle('active', s === service);
+  });
+  if (service === 'gemini') credRing('ringGemini', gemModels(), gemActiveModel());
+  if (service === 'router') credRing('ringRouter', rtModels(), rtActiveModel());
+  if (service === 'gemini' || service === 'router') usageRender(service);
+}
+document.querySelectorAll('#credRail .rail-btn[data-cred]').forEach(btn => {
+  btn.onclick = () => credShow(btn.dataset.cred);
+});
+
+/* ── 2 · model ring: centre node, models around, line to the one in use ── */
+function gemModels(){ return (CredState.ladder || []).slice(); }
+function gemActiveModel(){
+  const rows = CredState.rows || [];
+  const live = rows.find(r => r.okModel && r.state === 'ok');
+  if (live) return live.okModel;
+  const any = rows.find(r => r.okModel);
+  return any ? any.okModel : (ACTIVE_MODEL.gemini || '');
+}
+function rtProvider(){
+  return ((CredState.extraction && CredState.extraction.providers) || [])
+    .find(p => p.label === '9router')
+    || ((CredState.revision && CredState.revision.providers) || [])
+         .find(p => p.label === '9router')
+    || null;
+}
+function rtModels(){
+  const p = rtProvider();
+  if (!p) return [];
+  const list = (p.models && p.models.length) ? p.models.slice() : [];
+  if (p.model && !list.includes(p.model)) list.push(p.model);
+  return list;
+}
+function rtActiveModel(){
+  const p = rtProvider();
+  return (p && p.model) || ACTIVE_MODEL.router || '';
+}
+
+function credRing(id, models, active){
+  const box = $(id);
+  if (!box) return;
+  const list = (models || []).filter(Boolean);
+  if (!list.length){
+    box.innerHTML = '';
+    return;
+  }
+  /* 9router topology: core card in the middle, one node card per model on an ellipse */
+  const W = 640, H = 440, CX = W / 2, CY = H / 2;
+  const CORE_W = 176, CORE_H = 48, NODE_W = 208, NODE_H = 44;
+  const RX = (W - NODE_W) / 2 - 8, RY = (H - NODE_H) / 2 - 8;
+  const idx = Math.max(0, list.indexOf(active));
+  const at = (from, to, hw, hh) => {            // exit point of a rect toward `to`
+    const dx = to.x - from.x, dy = to.y - from.y;
+    const s = Math.min(hw / (Math.abs(dx) || 1e-6), hh / (Math.abs(dy) || 1e-6));
+    return { x: from.x + dx * s, y: from.y + dy * s };
+  };
+  const core = { x: CX, y: CY };
+  const geo = list.map((m, i) => {              // 12 o'clock first, evenly spaced
+    const a = -Math.PI / 2 + (2 * Math.PI * i) / list.length;
+    return { m, i, a, p: { x: CX + RX * Math.cos(a), y: CY + RY * Math.sin(a) } };
+  });
+  const edges = [], cards = geo.map(({ m, i, p }) => {
+    const on = i === idx;
+    const label = m.length > 26 ? m.slice(0, 25) + '…' : m;
+    const p0 = at(core, p, CORE_W / 2, CORE_H / 2);
+    const p1 = at(p, core, NODE_W / 2, NODE_H / 2);
+    const k = 0.45;                             // cubic pull, like getBezierPath
+    edges.push(`<path class="pane-edge${on ? ' on' : ''}" d="M ${p0.x} ${p0.y}` +
+      ` C ${p0.x + (p1.x - p0.x) * k} ${p0.y + (p1.y - p0.y) * k},` +
+      ` ${p1.x - (p1.x - p0.x) * k} ${p1.y - (p1.y - p0.y) * k}, ${p1.x} ${p1.y}"/>`);
+    const x = p.x - NODE_W / 2, y = p.y - NODE_H / 2;
+    const ini = credEsc(m.replace(/^.*[\\/]/, '').slice(0, 2).toUpperCase());
+    return `<g class="pane-card${on ? ' on' : ''}">` +
+      `<rect class="pane-node" x="${x}" y="${y}" rx="8" width="${NODE_W}" height="${NODE_H}"/>` +
+      `<rect class="pane-ico" x="${x + 8}" y="${y + 6}" rx="6" width="32" height="32"/>` +
+      `<text class="pane-ico-t" x="${x + 24}" y="${y + 27}">${ini}</text>` +
+      `<text class="pane-label${on ? ' on' : ''}" x="${x + 50}" y="${y + 27}">${credEsc(label)}</text>` +
+      (on ? `<circle class="pane-ping" cx="${x + NODE_W - 14}" cy="${p.y}" r="4"/>` : '') +
+      `</g>`;
+  });
+  box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img"' +
+    ' aria-label="model pane — the highlighted node is the model in use">' +
+    edges.join('') +
+    `<rect class="pane-core" x="${CX - CORE_W / 2}" y="${CY - CORE_H / 2}" rx="12"` +
+    ` width="${CORE_W}" height="${CORE_H}"/>` +
+    `<text class="pane-core-t" x="${CX}" y="${CY + 5}">9Router</text>` +
+    cards.join('') + '</svg>';
+}
+
+/* live model from the per-call usage event pushed on every send (criterion 10) */
+const ACTIVE_MODEL = { gemini: '', router: '' };
+function credUsageLive(ev){
+  if (!ev || !ev.model) return;
+  ACTIVE_MODEL.gemini = ev.model;
+  if (!$('viewCredentials').classList.contains('active')) return;
+  const open = CRED_SERVICES.find(s => {
+    const p = document.querySelector('.cred-card[data-cred="' + s + '"]');
+    return p && !p.hidden;
+  });
+  if (open === 'gemini') credRing('ringGemini', gemModels(), gemActiveModel());
+  if (open === 'gemini' || open === 'router') usageRefresh();
+}
+
+/* ── 3 · usage report: calls, tokens, per-call ms, model, key (criterion 6) ── */
+const UsageState = { period: 'all', box: 'gemini', data: null, busy: false };
+
+async function usageRefresh(){
+  if (UsageState.busy) return;
+  UsageState.busy = true;
+  try{
+    const res = await fetch('/api/usage?period=' + encodeURIComponent(UsageState.period));
+    UsageState.data = await res.json();
+  }catch(e){ UsageState.data = null; }
+  UsageState.busy = false;
+  usageRender(UsageState.box, UsageState.data);
+}
+
+function usageRender(service, data){
+  UsageState.box = service;
+  const box = $(service === 'gemini' ? 'usageGemini' : 'usageRouter');
+  if (!box) return;
+  const d = data || UsageState.data;
+  const chips = '<div class="ps-chips usage-chips">' + PERIODS.map(p =>
+    `<button class="ps-chip${p === UsageState.period ? ' active' : ''}" type="button"` +
+    ` data-uperiod="${p}">${p === 'all' ? 'All time' : p}</button>`).join('') + '</div>';
+  if (!d || !d.ok){
+    box.innerHTML = chips + '<p class="hint">Usage history unavailable.</p>';
+    usageWire(box);
+    return;
+  }
+  const t = d.totals || {};
+  const rows = (d.calls || []).slice(-40).reverse();
+  const head = `<div class="usage-totals">
+      <span><b>${t.calls || 0}</b> calls</span>
+      <span><b>${(t.tokens_in || 0).toLocaleString()}</b> in</span>
+      <span><b>${(t.tokens_out || 0).toLocaleString()}</b> out</span>
+      <span><b>${(t.ms || 0).toLocaleString()}</b> ms total</span>
+      <span class="hint">${PERIOD_LABEL[UsageState.period] || 'all time'}</span>
+    </div>`;
+  const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
+      <td>${credEsc((r.ts_utc || '').slice(0, 19).replace('T', ' '))}</td>
+      <td class="mono">${credEsc(r.model || '—')}</td>
+      <td>${credEsc(r.key_name || '—')}</td>
+      <td class="mono">${credEsc(r.key_masked || '—')}</td>
+      <td class="num">${(r.tokens_in || 0).toLocaleString()} / ${(r.tokens_out || 0).toLocaleString()}</td>
+      <td class="num">${(r.ms || 0).toLocaleString()}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="6" class="hint">No calls recorded in this period.</td></tr>';
+  box.innerHTML = chips + head + `<div class="usage-scroll"><table class="usage-table">
+      <thead><tr><th>Time (UTC)</th><th>Model</th><th>Key name</th><th>Key</th>
+      <th>Tokens in / out</th><th>ms</th></tr></thead>
+      <tbody>${body}</tbody></table></div>`;
+  usageWire(box);
+}
+function usageWire(box){
+  box.querySelectorAll('button[data-uperiod]').forEach(b => {
+    b.onclick = () => { UsageState.period = b.dataset.uperiod; usageRefresh(); };
+  });
+}
+
+/* the 9router panel's own summary line */
+function credRouterSummary(){
+  const el = $('routerSummary');
+  if (!el) return;
+  const p = rtProvider();
+  credSummary(el, [
+    ['Base URL', NINEROUTER_URL],
+    ['API key', p && p.api_key_set ? (p.api_key_masked || '— not set —') : '— not set —'],
+    ['Active model', rtActiveModel() || '—'],
+    ['Model list', rtModels().join(' · ') || '— none yet —'],
+    ['Used by', (CredState.extraction && CredState.extraction.active === '9router' ? 'Extraction' : '') +
+                (CredState.extraction && CredState.extraction.active === '9router' &&
+                 CredState.revision && CredState.revision.active === '9router' ? ' + ' : '') +
+                (CredState.revision && CredState.revision.active === '9router' ? 'Revision' : '') ||
+                'nothing right now'],
+  ]);
+}
+
+/* ── 4 · upload queue (workstream B · Q9) ──────────────────────── */
+const UpState = { items: [] };
+const UP_FINAL = ['done', 'failed', 'cancelled'];
+
+async function upLoad(){
+  try{
+    const d = await (await fetch('/api/uploads')).json();
+    UpState.items = d.items || [];
+  }catch(e){ return; }
+  upRender();
+}
+function upApplyEvent(){ upLoad(); }   // the server owns the queue state
+
+/* the destination folders are picked, never typed — the three subjects the app
+   ships (shimi / zist / physic) x grade x chapter, straight from the watched tree */
+const UP_TREE = {
+  shimi:  { 10: 3, 11: 3, 12: 4 },
+  zist:   { 10: 6, 11: 9, 12: 8 },
+  physic: { 10: 4, 11: 3, 12: 4 },
+};
+const upDds = {};
+(function wireUploadDds(){
+  upDds.subject = createDropdown('upSubject', 'subject');
+  upDds.grade   = createDropdown('upGrade', 'grade');
+  upDds.topic   = createDropdown('upTopic', 'chapter');
+  upDds.type    = createDropdown('upType', 'type');
+  upDds.subject.setOptions(Object.keys(UP_TREE).map(s => [s, s]));
+  upDds.grade.setOptions([]);
+  upDds.topic.setOptions([]);
+  upDds.type.setOptions([['question', 'question'], ['answer', 'answer']], 'question');
+  upDds.subject.onChange = s => {
+    upDds.grade.setOptions(Object.keys(UP_TREE[s] || {}).map(g => [g, g]));
+    upDds.topic.setOptions([]);
+  };
+  upDds.grade.onChange = g => {
+    const n = (UP_TREE[upDds.subject.value] || {})[g] || 0;
+    upDds.topic.setOptions(Array.from({ length: n }, (_, i) => {
+      const c = 'chapter' + (i + 1); return [c, c];
+    }));
+  };
+})();
+
+function upRender(){
+  const list = $('upList');
+  if (!list) return;
+  const items = UpState.items;
+  $('upQueueHint').textContent = items.length
+    ? items.length + ' in the queue — extracted one at a time'
+    : '';
+  if (!items.length){
+    list.innerHTML = '';
+    return;
+  }
+  list.innerHTML = items.map(it => {
+    const st = it.status || 'queued';
+    const canCancel = !UP_FINAL.includes(st) || st === 'failed' || st === 'cancelled';
+    return `<div class="up-row" data-id="${credEsc(it.id)}">
+      <i class="fa ${st === 'done' ? 'fa-circle-check ok' : st === 'failed' ? 'fa-circle-xmark bad'
+          : st === 'extracting' ? 'fa-gears spin' : 'fa-hourglass-half'}" aria-hidden="true"></i>
+      <div class="up-meta">
+        <b>${credEsc(it.filename || '')}</b>
+        <span class="hint">${credEsc(it.dest_rel || '')}${it.detail ? ' · ' + credEsc(it.detail) : ''}</span>
+      </div>
+      <span class="up-status" data-st="${credEsc(st)}">${credEsc(st)}</span>
+      ${canCancel ? `<button class="ghost-btn neutral sm up-cancel" type="button" data-id="${credEsc(it.id)}"
+        ${st === 'cancelled' ? 'disabled' : ''}>${st === 'failed' || st === 'cancelled' ? 'Remove' : 'Cancel'}</button>` : ''}
+    </div>`;
+  }).join('');
+  list.querySelectorAll('button.up-cancel').forEach(b => {
+    b.onclick = async () => {
+      const res = await fetch('/api/uploads/' + encodeURIComponent(b.dataset.id) + '/cancel',
+                              { method: 'POST' });
+      const d = await res.json().catch(() => ({}));
+      if (!d.ok) toast(d.error || 'Cannot cancel that upload');
+      await upLoad();
+    };
+  });
+}
+
+$('upRefresh').onclick = upLoad;
+$('upFiles').onchange = () => {
+  const n = $('upFiles').files.length;
+  $('upPickText').textContent = n ? n + ' file(s) selected' : 'Choose PDF files…';
+};
+$('upAdd').onclick = async () => {
+  const files = Array.from($('upFiles').files || []);
+  if (!files.length){ toast('Pick at least one PDF first'); return; }
+  const s = upDds.subject.value, g = upDds.grade.value, t = upDds.topic.value;
+  if (!s || !g || !t){ toast('Subject, grade and chapter are all required'); return; }
+  const dest = [s, g, t].join('/') + '/' + upDds.type.value;
+  let ok = 0;
+  for (const f of files){                    // one at a time — the server queue is sequential
+    const fd = new FormData();
+    fd.append('file', f);
+    fd.append('dest', dest);
+    try{
+      const res = await fetch('/api/uploads', { method: 'POST', body: fd });
+      const d = await res.json().catch(() => ({}));
+      if (d.ok) ok++;
+      else toast(f.name + ': ' + (d.error || 'upload failed'));
+    }catch(e){ toast(f.name + ': ' + e); }
+  }
+  $('upFiles').value = '';
+  $('upPickText').textContent = 'Choose PDF files…';
+  if (ok) toast(ok + ' file(s) queued for ' + dest);
+  await upLoad();
+};
+
+/* ── 5 · period stats — existing DB data only (Q4, criterion 11) ── */
+const StatsState = { period: 'all' };
+
+async function statsLoad(period){
+  StatsState.period = period || 'all';
+  document.querySelectorAll('.ps-chip[data-period]').forEach(c =>
+    c.classList.toggle('active', c.dataset.period === StatsState.period));
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  set('psError', ''); if ($('psError')) $('psError').hidden = true;
+  try{
+    const d = await (await fetch('/api/stats?period=' + encodeURIComponent(StatsState.period))).json();
+    if (!d.ok) throw new Error(d.error || 'request failed');
+    set('psSucceeded', (d.succeeded || 0).toLocaleString());
+    set('psErrors', (d.errors || 0).toLocaleString());
+    set('psTotal', (d.total || d.files || 0).toLocaleString());
+    set('psQuestions', (d.questions || 0).toLocaleString());
+    set('psAnswers', (d.answers || 0).toLocaleString());
+    set('psCaption', 'last ' + (PERIOD_LABEL[StatsState.period] || 'all time') + ' · from existing DB rows');
+  }catch(e){
+    const el = $('psError');
+    if (el){ el.hidden = false; el.textContent = String(e.message || e); }
+    set('psCaption', 'counts unavailable');
+  }
+}
+document.querySelectorAll('.ps-chip[data-period]').forEach(c => {
+  c.onclick = () => statsLoad(c.dataset.period);
+});
+
+/* ── 6 · wire the new surfaces once the DOM is up ──────────────── */
+function bootNewSurfaces(){
+  if (!ProvState.loaded) loadPipeProviders();      // 9router shows up in the selector (bug d)
+  upLoad();
+  statsLoad('all');
+  if (CredState.loaded) credRouterSummary();
+}
+bootNewSurfaces();
+
+/* keep the 9router panel honest whenever credentials reload */
+const _loadCredentials = loadCredentials;
+loadCredentials = async function(){
+  await _loadCredentials.apply(this, arguments);
+  credRouterSummary();
+  const openGem = !document.querySelector('.cred-card[data-cred="gemini"]').hidden;
+  const openRt  = !document.querySelector('.cred-card[data-cred="router"]').hidden;
+  if (openGem) credRing('ringGemini', gemModels(), gemActiveModel());
+  if (openRt)  credRing('ringRouter', rtModels(), rtActiveModel());
+  if (openGem || openRt) usageRefresh();
+};
+
+/* Q2 — the built-in 9router is the only non-Gemini provider: the label and
+   base URL are fixed, only the key and the model list stay editable. */
+(function ninerouterForm(){
+  const pin = () => {
+    ['ocr', 'cred'].forEach(pre => {
+      const u = $(pre + 'RouterUrl'), l = $(pre + 'Label');
+      if (u){ u.value = NINEROUTER_URL; u.readOnly = true;
+              u.placeholder = NINEROUTER_URL; }
+      if (l && !l.value) l.value = '9router';
+    });
+  };
+  ['ocrEdit', 'credEdit'].forEach(id => {
+    const btn = $(id);
+    if (!btn) return;
+    const orig = btn.onclick;
+    btn.onclick = () => { if (orig) orig(); pin(); };
+  });
+  const add = (section) => {
+    credAddProvider(section);
+    pin();
+    toast('9router is built in — only the API key and model list can change.');
+  };
+  const oa = $('ocrAddProvider'), ca = $('credAddProvider');
+  if (oa) oa.onclick = () => add('extraction');
+  if (ca) ca.onclick = () => add('revision');
+})();
