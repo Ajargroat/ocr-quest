@@ -30,6 +30,12 @@ def _csv(value: str) -> tuple:
     return tuple(part.strip() for part in (value or "").split(",") if part.strip())
 
 
+def _flag(name):
+    """Section enable switch (Q1). Absent key → ON, so an untouched .env keeps
+    running exactly as before; 0/false/off/no are the OFF spellings."""
+    return os.getenv(name, "1").strip().lower() not in ("0", "false", "off", "no")
+
+
 def _gemini_pool() -> tuple:
     """All usable Gemini keys, de-duplicated, in pool order.
 
@@ -217,6 +223,12 @@ class Config:
     revision_chunk_size: int
     revision_scan_chunk: int
     converter_enabled: bool = True
+    # Section enable switches (Q1) + presentation-only DB list (Q2).
+    gemini_pool_enabled: bool = True
+    ninerouter_enabled: bool = True
+    revision_provider_enabled: bool = True
+    supabase_enabled: bool = True
+    db_connections: tuple = ()
 
 
 def load_config() -> Config:
@@ -291,4 +303,9 @@ def load_config() -> Config:
         revision_scan_chunk=int(os.getenv("REVISION_SCAN_CHUNK", "50")),
         converter_enabled=os.getenv("CONVERTER_ENABLED", "1").strip().lower()
         not in ("", "0", "false", "no", "off"),
+        gemini_pool_enabled=_flag("GEMINI_POOL_ENABLED"),
+        ninerouter_enabled=_flag("NINEROUTER_ENABLED"),
+        revision_provider_enabled=_flag("REVISION_PROVIDER_ENABLED"),
+        supabase_enabled=_flag("SUPABASE_ENABLED"),
+        db_connections=_json_list("DB_CONNECTIONS"),
     )

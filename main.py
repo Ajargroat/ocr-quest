@@ -498,6 +498,57 @@ class CredentialSave(BaseModel):
     extraction_active: str = KEEP   # "" → the Gemini pool
     revision_providers: list[dict] | None = None
     revision_active: str = KEEP
+    # Q1 section toggles (ui key → .env flag) and Q2 extra connections.
+    enabled: dict[str, bool] | None = None
+    db_connections: list[dict] | None = None
+
+
+def _merge_db_connections(stored, incoming):
+    """Extra connections under the Supabase card (Q2 — presentation only: the
+    pipeline keeps its one fixed active connection, db.py untouched).
+    Fields take the submitted value; `password` follows the KEEP / "KEEP:<i>"
+    / literal sentinel rule of _merge_providers, `enabled` defaults on."""
+    out = []
+    for i, raw in enumerate(incoming or []):
+        label = str(raw.get("label", "")).strip().replace(",", " ")
+        if not label:
+            continue
+        pwd = str(raw.get("password", KEEP) or KEEP)
+        if pwd == "__CLEAR__":
+            pwd = ""
+        elif pwd == KEEP:
+            pwd = (stored[i] if i < len(stored) else {}).get("password", "")
+        elif pwd.startswith(KEEP + ":"):
+            try:
+                j = int(pwd.split(":", 1)[1])
+            except ValueError:
+                pwd = ""
+            else:
+                pwd = stored[j].get("password", "") if 0 <= j < len(stored) else ""
+        out.append({"label": label,
+                    "host": str(raw.get("host", "")).strip(),
+                    "port": str(raw.get("port", "")).strip(),
+                    "db": str(raw.get("db", "")).strip(),
+                    "user": str(raw.get("user", "")).strip(),
+                    "password": pwd,
+                    "sslmode": str(raw.get("sslmode", "")).strip().lower(),
+                    "enabled": bool(raw.get("enabled", True))})
+    seen, dedup = set(), []
+    for c in out:
+        if c["label"] not in seen:
+            seen.add(c["label"])
+            dedup.append(c)
+    return dedup
+
+
+def _db_conn_view(c: dict) -> dict:
+    """Masked row for the dashboard — never the raw password."""
+    return {"label": c.get("label", ""), "host": c.get("host", ""),
+            "port": c.get("port", ""), "db": c.get("db", ""),
+            "user": c.get("user", ""), "sslmode": c.get("sslmode", ""),
+            "enabled": bool(c.get("enabled", True)),
+            "password_set": bool(c.get("password")),
+            "password_masked": mask_key(c.get("password", ""))}
 
 
 def _merge_providers(stored, incoming):
@@ -623,6 +674,17 @@ def _credentials_view():
     st["postgres_password_masked"] = mask_key(cfg.postgres_password)
     st["provider_ok"] = dict(_provider_verdict) or None
     st["legacy_pool"] = os.getenv("GEMINI_API_KEYS") is None and bool(cfg.gemini_key_pool)
+    # Q1 section toggles + Q2 extra connections (presentation-only) + Q3 dates.
+    st["enabled"] = {"gemini": cfg.gemini_pool_enabled,
+                     "ninerouter": cfg.ninerouter_enabled,
+                     "revision": cfg.revision_provider_enabled,
+                     "supabase": cfg.supabase_enabled}
+    st["db_connections"] = [_db_conn_view(c) for c in cfg.db_connections]
+    meta = router._key_meta()
+    for row in st["keys"]:
+        i = row["index"]
+        if 0 <= i < len(cfg.gemini_key_pool):
+            row["added"] = meta.get(router._key_hash(cfg.gemini_key_pool[i]), "")
     return st
 
 
@@ -734,7 +796,12 @@ async def credentials_save(body: CredentialSave):
     # them read-only, and a fresh write would resurrect the local/openai
     # vocabulary acceptance 2 forbids — _providers() in config.py is the
     # read-fallback that keeps an untouched older .env working.
-    envfile.update_env_file(ENV_PATH, {
+    # Q3 — "date added" is stamped the first time a key is saved; keys that
+    # predate this file keep showing "-" in the pane (PREFERENCE §2).
+    for v in keys:
+        if v not in old_keys:
+            router._key_meta_stamp(v)
+    env_values = {
         "GEMINI_API_KEYS": ",".join(keys),
         "GEMINI_KEY_NAMES": ",".join(names),
         "GEMINI_MODEL_LADDER": ",".join(ladder),
@@ -751,7 +818,22 @@ async def credentials_save(body: CredentialSave):
         "EXTRACTION_ACTIVE": active_x,
         "REVISION_PROVIDERS": json.dumps(list(providers_r), ensure_ascii=False),
         "REVISION_ACTIVE": active_r,
-    })
+    }
+    # Q1 — the section enable switches (ui key → .env flag; 1 = on).
+    if body.enabled is not None:
+        for ui_key, env_key in (("gemini", "GEMINI_POOL_ENABLED"),
+                                ("ninerouter", "NINEROUTER_ENABLED"),
+                                ("revision", "REVISION_PROVIDER_ENABLED"),
+                                ("supabase", "SUPABASE_ENABLED")):
+            if ui_key in body.enabled:
+                env_values[env_key] = "1" if body.enabled[ui_key] else "0"
+    # Q2 — extra connection cards under Supabase (presentation only).
+    if body.db_connections is not None:
+        db_conns = _merge_db_connections(list(cfg.db_connections),
+                                         body.db_connections)
+        env_values["DB_CONNECTIONS"] = json.dumps(list(db_conns),
+                                                  ensure_ascii=False)
+    envfile.update_env_file(ENV_PATH, env_values)
     load_dotenv(ENV_PATH, override=True)   # pick up the file we just wrote
     cfg = load_config()
     router.reset()                         # new pool → stale cooldowns are void

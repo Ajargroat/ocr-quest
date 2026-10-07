@@ -78,15 +78,59 @@ class ScaleTokenTests(unittest.TestCase):
         html = _read("index.html")
         for gone in ('class="sub"', 'class="sep"', 'id="routerHint"', '<section class="stats">'):
             self.assertNotIn(gone, html, gone)
-        for kept in ('id="upQueueHint"', 'id="stTotal"'):
+        for kept in ('id="upQueueHint"',):
             self.assertIn(kept, html, kept)
-        self.assertLess(html.index('id="periodStats"'), html.index('id="stTotal"'))
+        self.assertNotIn('id="stTotal"', html)
+        self.assertLess(html.index('id="periodStats"'), html.index('id="psSucceeded"'))
         for line in html.splitlines():
             if 'id="revNow"' in line:
                 self.assertNotIn("></div>", line)
                 break
         else:
             self.fail("id=revNow not found")
+
+    def test_toolbar_shares_the_pipeline_edge(self):
+        """The pipeline toolbar pads to the same 34px edge as .stages /
+        .period-stats, and its context gap matches the ps-grid gap."""
+        css = _read("styles.css")
+        body = _rule(css, "#viewPipeline .toolbar")
+        self.assertIsNotNone(body, "#viewPipeline .toolbar")
+        self.assertIn("34px", body)
+        ctx = _rule(css, "#viewPipeline .tb-context")
+        self.assertIsNotNone(ctx, "#viewPipeline .tb-context")
+        self.assertIn("gap:var(--sp-3)", ctx)
+
+    def test_upload_form_has_room_and_placeholders(self):
+        """The upload form gets its bottom margin; the file picker is a
+        centred empty-state block that only shows while the queue is empty;
+        the destination dropdowns wear the Gemini/proxy field look (flat
+        surface, 1px border, left-aligned caption) instead of a centred pill."""
+        css = _read("styles.css")
+        form = _rule(css, ".up-form")
+        self.assertIsNotNone(form, ".up-form")
+        self.assertIn("margin-bottom:var(--sp-5)", form)
+        empty = _rule(css, ".up-empty")
+        self.assertIsNotNone(empty, ".up-empty")
+        for need in ("align-items:center", "justify-content:center",
+                     "min-height:300px"):
+            self.assertIn(need, empty, need)
+        pick = _rule(css, ".up-pick")
+        self.assertIsNotNone(pick, ".up-pick")
+        self.assertIn("flex-direction:column", pick)
+        dest = _rule(css, ".up-dest .dd-btn")
+        self.assertIsNotNone(dest, ".up-dest .dd-btn")
+        self.assertIn("justify-content:flex-start", dest)
+        self.assertIn("border:1px solid var(--border)", dest)
+
+    def test_pipeline_panes_start_with_room(self):
+        """The log / files / upload-queue panes start at ~300px instead of
+        collapsing to content height."""
+        css = _read("styles.css")
+        for sel in ("#viewPipeline #log", "#viewPipeline #files",
+                    "#viewPipeline #upList"):
+            body = _rule(css, sel)
+            self.assertIsNotNone(body, sel)
+            self.assertIn("min-height:300px", body, sel)
 
 
 if __name__ == "__main__":

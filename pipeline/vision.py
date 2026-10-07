@@ -136,12 +136,21 @@ def check_provider(cfg, timeout=(8, 20)):
     """Free health check for an OpenAI-compatible OCR endpoint:
     ONE GET <base>/models metadata listing — no model is run, no
     generation tokens are spent (same philosophy as the Gemini
-    key checks). Returns a verdict dict, never raises."""
+    key checks). Returns a verdict dict, never raises.
+    `latency_ms` is the wall time of the probe (0.0 when there is
+    nothing to probe) — the dashboard's signal-bars ping."""
     base = (cfg.ocr_base_url or "").strip().rstrip("/")
+    started = time.monotonic()
+
+    def _with_timing(report):
+        report["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        return report
+
     if not base:
-        return {"ok": False, "provider": "openai", "url": "",
-                "status": 0, "models": [], "detail": "No OCR endpoint "
-                "URL is configured (OCR_BASE_URL).", "fault": None}
+        return _with_timing(
+            {"ok": False, "provider": "openai", "url": "",
+             "status": 0, "models": [], "detail": "No OCR endpoint "
+             "URL is configured (OCR_BASE_URL).", "fault": None})
     headers = {}
     if cfg.ocr_api_key:
         headers["Authorization"] = "Bearer " + cfg.ocr_api_key
@@ -150,17 +159,19 @@ def check_provider(cfg, timeout=(8, 20)):
                             timeout=timeout)
     except requests.RequestException as exc:
         flt = _openai_fault(exc=exc)
-        return {"ok": False, "provider": "openai", "url": base,
-                "status": 0, "models": [],
-                "detail": f"{flt['label']} — {flt['hint']}",
-                "fault": flt}
+        return _with_timing(
+            {"ok": False, "provider": "openai", "url": base,
+             "status": 0, "models": [],
+             "detail": f"{flt['label']} — {flt['hint']}",
+             "fault": flt})
     if resp.status_code != 200:
         flt = _openai_fault(resp=resp)
-        return {"ok": False, "provider": "openai", "url": base,
-                "status": resp.status_code, "models": [],
-                "detail": f"HTTP {resp.status_code}: "
-                          f"{(resp.text or '')[:200]}",
-                "fault": flt}
+        return _with_timing(
+            {"ok": False, "provider": "openai", "url": base,
+             "status": resp.status_code, "models": [],
+             "detail": f"HTTP {resp.status_code}: "
+                       f"{(resp.text or '')[:200]}",
+             "fault": flt})
     names = []
     try:
         body = resp.json()
@@ -170,13 +181,15 @@ def check_provider(cfg, timeout=(8, 20)):
     except ValueError:
         # Some minimal servers answer 200 with a non-JSON body;
         # the endpoint is reachable, just not model-listing.
-        return {"ok": True, "provider": "openai", "url": base,
-                "status": 200, "models": [],
-                "detail": "reachable, but /models returned a "
-                          "non-JSON body", "fault": None}
-    return {"ok": True, "provider": "openai", "url": base,
-            "status": 200, "models": names,
-            "detail": f"{len(names)} model(s) listed", "fault": None}
+        return _with_timing(
+            {"ok": True, "provider": "openai", "url": base,
+             "status": 200, "models": [],
+             "detail": "reachable, but /models returned a "
+                       "non-JSON body", "fault": None})
+    return _with_timing(
+        {"ok": True, "provider": "openai", "url": base,
+         "status": 200, "models": names,
+         "detail": f"{len(names)} model(s) listed", "fault": None})
 
 
 def test_chat(base_url, api_key, model, timeout=(8, 40)):

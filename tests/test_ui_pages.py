@@ -28,6 +28,13 @@ def _view(html, view_id):
     return body[:nxt] if nxt != -1 else body
 
 
+def _pane(html, cred):
+    """The markup of one credentials pane, up to the next pane section."""
+    body = html.split('class="panel cred-card" data-cred="%s"' % cred, 1)[1]
+    nxt = body.find('<section class="panel cred-card"')
+    return body[:nxt] if nxt != -1 else body
+
+
 class PipelineCoherenceTests(unittest.TestCase):
     def test_pipeline_uses_the_house_vocabulary(self):
         html = _read("index.html")
@@ -51,8 +58,27 @@ class PipelineCoherenceTests(unittest.TestCase):
         self.assertLess(view.index('id="periodStats"'),
                         view.index('class="stages"'),
                         "period stats must sit at the very top of the pipeline")
-        for need in ('id="psSucceeded"', 'id="stTotal"', 'id="psCaption"'):
+        for need in ('id="psSucceeded"', 'id="psCaption"'):
             self.assertIn(need, view, need)
+
+    def test_period_stats_single_set_and_24h_default(self):
+        """One stats set only: the five duplicate st* cells are gone and the
+        default chip is 24h (markup + JS agree)."""
+        html = _read("index.html")
+        view = _view(html, "viewPipeline")
+        for kept in ('id="psSucceeded"', 'id="psCaption"'):
+            self.assertIn(kept, view, kept)
+        for gone in ('id="stTotal"', 'id="stProcessed"', 'id="stQuestions"',
+                     'id="stAnswers"', 'id="stErrors"'):
+            self.assertNotIn(gone, view, gone)
+        self.assertIn('class="ps-chip active" data-period="24h"', view)
+        self.assertNotIn('class="ps-chip active" data-period="all"', view)
+        js = _read("app.js")
+        for gone in ("$('stTotal')", "$('stProcessed')", "$('stQuestions')",
+                     "$('stAnswers')", "$('stErrors')"):
+            self.assertNotIn(gone, js, gone)
+        self.assertIn("period: '24h'", js)
+        self.assertIn("statsLoad('24h')", js)
 
     def test_log_sits_in_the_bottom_grid(self):
         html = _read("index.html")
@@ -82,9 +108,13 @@ class PipelineCoherenceTests(unittest.TestCase):
         html = _read("index.html")
         view = _view(html, "viewPipeline")
         bar = view.split('class="toolbar"', 1)[1].split("</section>", 1)[0]
-        for need in ('id="runBtn"', 'id="pipeProvSel"', 'id="pipeProvHint"',
-                     'id="pipeProxySel"', 'id="pipeProxyHint"'):
+        for need in ('id="runBtn"', 'id="pipeProvSel"', 'id="pipeProxySel"'):
             self.assertIn(need, bar, need)
+        for gone in ('id="pipeProvHint"', 'id="pipeProxyHint"'):
+            self.assertNotIn(gone, bar, gone)
+        js = _read("app.js")
+        self.assertNotIn('pipeProvHint', js)
+        self.assertNotIn('pipeProxyHint', js)
         # the profile buttons belong to Credentials, not the pipeline toolbar
         self.assertNotIn('id="pipeProxyNew"', bar)
         self.assertNotIn('id="pipeProxyDel"', bar)
@@ -94,11 +124,56 @@ class PipelineCoherenceTests(unittest.TestCase):
         view = _view(html, "viewPipeline")
         panel = view.split('class="panel upload-panel"', 1)[1].split("</section>", 1)[0]
         for need in ('id="upList"', 'id="upFiles"', 'id="upAdd"',
-                     'id="upSubject"', 'id="upGrade"', 'id="upTopic"', 'id="upType"'):
+                     'id="upEmpty"', 'id="upSubject"', 'id="upGrade"',
+                     'id="upTopic"', 'id="upType"'):
             self.assertIn(need, panel, need)
         # the destination is picked from themed dropdowns, never typed
         self.assertNotIn('id="upPath"', panel)
         self.assertNotIn("<select", panel)
+
+    def test_upload_picker_is_an_empty_state_that_disappears(self):
+        """The file-add control is an empty-state: it takes one or many PDFs
+        and is hidden as soon as the queue has rows."""
+        html = _read("index.html")
+        view = _view(html, "viewPipeline")
+        self.assertIn('id="upEmpty"', view)
+        self.assertRegex(view, r'id="upFiles"[^>]*multiple')
+        js = _read("app.js")
+        self.assertIn("$('upEmpty')", js)
+        self.assertIn("empty.hidden", js)
+
+    def test_conn_is_a_signal_bars_indicator(self):
+        """The connection pill is a signal-bars widget: three bars, a ping
+        readout and a provider tooltip, fed by the provider check fetch."""
+        html = _read("index.html")
+        m = re.search(r'<div class="conn" id="conn"[^>]*>(.*?)</div>',
+                      html, re.S)
+        self.assertIsNotNone(m, "conn pill not found")
+        pill = m.group(1)
+        self.assertIn('id="connBars"', pill)
+        bars = re.search(r'id="connBars"[^>]*>(.*?)</span>', pill, re.S)
+        self.assertIsNotNone(bars, "connBars wrapper not found")
+        self.assertEqual(bars.group(1).count("<b>"), 3, "want 3 signal bars")
+        self.assertIn('id="connPing"', pill)
+        self.assertIn('id="connText"', pill)
+        self.assertRegex(m.group(0), r"title=")
+        js = _read("app.js")
+        for need in ("pingProvider", "connBars", "connPing",
+                     "'/api/credentials/check/provider'"):
+            self.assertIn(need, js, need)
+
+    def test_dd_caption_swap_is_scoped_to_the_upload_form(self):
+        """Only the four up-form dropdowns trade their caption for the chosen
+        value; the revision rv* hosts keep their static Persian captions."""
+        js = _read("app.js")
+        m = re.search(r"UPFORM_DDS\s*=\s*\[([^\]]*)\]", js)
+        self.assertIsNotNone(m, "UPFORM_DDS list missing")
+        hosts = re.findall(r"'([^']+)'", m.group(1))
+        self.assertEqual(sorted(hosts),
+                         sorted(["upSubject", "upGrade", "upTopic", "upType"]))
+        for h in hosts:
+            self.assertNotIn("rv", h)
+        self.assertIn("cap.textContent", js)
 
     def test_log_is_a_house_panel(self):
         html = _read("index.html")
@@ -115,16 +190,66 @@ class CredentialsCoherenceTests(unittest.TestCase):
     def test_rail_is_a_service_switcher(self):
         html = _read("index.html")
         rail = html.split('id="credRail"', 1)[1].split("</div>", 1)[0]
-        self.assertEqual(rail.count('class="rail-btn'), 7, "7 services")
-        for svc in ("gemini", "router", "ocr", "revision",
-                    "supabase", "postgres", "routing"):
+        self.assertEqual(rail.count('class="rail-btn'), 3, "3 services")
+        for svc in ("ocr", "revision", "database"):
             self.assertIn('data-cred="%s"' % svc, rail, svc)
 
     def test_one_detail_pane_per_service(self):
         html = _read("index.html")
-        for svc in ("gemini", "router", "ocr", "revision",
-                    "supabase", "postgres", "routing"):
+        for svc in ("ocr", "revision", "database"):
             self.assertIn('class="panel cred-card" data-cred="%s"' % svc, html, svc)
+
+    def test_no_ring_or_live_routing_surface(self):
+        """Q4: the model rings and the Live-routing panel are dropped — no
+        host, no renderer, no rail button survives."""
+        html = _read("index.html")
+        js = _read("app.js")
+        for gone in ("ringGemini", "ringRouter", 'id="credRoute"',
+                     'id="credEvents"', "Live routing", "#usageGemini",
+                     "#usageRouter", "usageGemini", "usageRouter"):
+            self.assertNotIn(gone, html, gone)
+        for gone in ("credRing(", "credRenderSide", "gemModels(", "gemActiveModel("):
+            self.assertNotIn(gone, js, gone)
+
+    def test_ocr_pane_holds_two_credential_sections(self):
+        """The OCR pane carries the Gemini key rows AND a 9router row inline,
+        each behind its own enable toggle; the pool modal keeps only the ladder."""
+        html = _read("index.html")
+        pane = _pane(html, "ocr")
+        for need in ('id="credKeys"', 'id="credKeys9r"', 'id="swGemini"',
+                     'id="sw9router"'):
+            self.assertIn(need, pane, need)
+        pool = html.split('data-form="pool"', 1)[1].split('data-form="supabase"', 1)[0]
+        self.assertIn('id="credLadder"', pool)
+        self.assertNotIn('id="credKeys"', pool)
+
+    def test_gemini_key_row_shows_name_date_health_and_bars(self):
+        js = _read("app.js")
+        self.assertIn('class="cred-date"', js)
+        self.assertIn("added:k.added", js)
+        self.assertIn("${used}/${lim}", js)
+        self.assertIn('cred-btn chk', js)      # the ♥ health-check button
+
+    def test_database_pane_holds_supabase_and_connection_cards(self):
+        html = _read("index.html")
+        pane = _pane(html, "database")
+        for need in ('id="supaSummary"', 'id="dbConns"', 'id="dbConnAdd"',
+                     'id="swSupabase"'):
+            self.assertIn(need, pane, need)
+        self.assertNotIn('data-cred="supabase"', html)
+        self.assertNotIn('data-cred="postgres"', html)
+
+    def test_usage_is_a_top_level_tab_with_a_plot(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        css = _read("styles.css")
+        side = html.split('id="side"', 1)[1].split("</nav>", 1)[0]
+        self.assertIn('data-view="usage"', side)
+        self.assertIn('id="viewUsage"', html)
+        self.assertIn("function usagePlot(", js)
+        self.assertIn(".usage-plot{", css)
+        self.assertNotIn("usageGemini", html)
+        self.assertNotIn("usageRouter", html)
 
     def test_profile_buttons_live_in_credentials(self):
         html = _read("index.html")

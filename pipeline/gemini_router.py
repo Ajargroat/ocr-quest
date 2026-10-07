@@ -99,6 +99,12 @@ CALLS_PATH = os.path.join(os.path.dirname(USAGE_PATH), ".gemini-calls.json")
 
 def _calls_path():
     return os.path.join(os.path.dirname(USAGE_PATH), ".gemini-calls.json")
+
+
+def _key_meta_path():
+    """When each key was first saved — beside the usage gauge, derived at call
+    time like _calls_path so tests that redirect USAGE_PATH isolate it too."""
+    return os.path.join(os.path.dirname(USAGE_PATH), ".gemini-key-meta.json")
 # History growth bound: oldest entries are dropped past this.
 CALLS_CAP = 20000
 # Preset report windows (Q11) in hours; "all" means no cutoff.
@@ -209,6 +215,30 @@ class GeminiRouter:
     def _key_hash(self, key):
         """Identity for the usage file — a hash, never the secret itself."""
         return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+    def _key_meta(self):
+        try:
+            with open(_key_meta_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _key_meta_stamp(self, key):
+        """First save wins — a hash already stamped keeps its original date."""
+        meta = self._key_meta()
+        h = self._key_hash(key)
+        if h in meta:
+            return
+        meta[h] = {"added": datetime.now(timezone.utc).isoformat()}
+        path = _key_meta_path()
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, path)
+        except OSError:
+            pass
 
     def day_limit(self):
         """Cap of successful sends per key × model per day (free tier is

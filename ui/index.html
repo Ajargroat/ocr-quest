@@ -28,7 +28,13 @@ window.MathJax = {
 
 <header>
   <div class="actions">
-    <div class="conn" id="conn"><i></i><em id="connText">connecting…</em></div>
+    <div class="conn" id="conn" title="Gemini pool">
+      <span class="conn-sig">
+        <span class="conn-bars" id="connBars"><b></b><b></b><b></b></span>
+        <em id="connPing">—</em>
+      </span>
+      <em id="connText">connecting…</em>
+    </div>
     <button class="theme-toggle" id="themeToggle" type="button"
             title="Switch to light theme" aria-label="Toggle light and dark theme">
       <i class="fa fa-moon" aria-hidden="true"></i>
@@ -46,6 +52,8 @@ window.MathJax = {
     <i class="fa fa-rotate" aria-hidden="true"></i><span>Revision</span></button>
   <button class="side-btn" data-view="database" title="Database">
     <i class="fa fa-database" aria-hidden="true"></i><span>Database</span></button>
+  <button class="side-btn" data-view="usage" title="Usage">
+    <i class="fa fa-chart-line" aria-hidden="true"></i><span>Usage</span></button>
   <button class="side-btn" data-view="credentials" title="Credentials">
     <i class="fa fa-key" aria-hidden="true"></i><span>Credentials</span></button>
   <button class="side-btn side-collapse" id="sideToggle" type="button"
@@ -60,10 +68,10 @@ window.MathJax = {
     <div class="ps-head">
       <h3>Period stats</h3>
       <div class="ps-chips" role="tablist" aria-label="Stats period">
-        <button class="ps-chip" data-period="24h" type="button">24h</button>
+        <button class="ps-chip active" data-period="24h" type="button">24h</button>
         <button class="ps-chip" data-period="7d" type="button">7d</button>
         <button class="ps-chip" data-period="30d" type="button">30d</button>
-        <button class="ps-chip active" data-period="all" type="button">All time</button>
+        <button class="ps-chip" data-period="all" type="button">All time</button>
       </div>
     </div>
     <div class="ps-grid">
@@ -74,11 +82,6 @@ window.MathJax = {
       <div class="ps-cell"><span class="k a" id="psAnswers">—</span><label>Answers</label></div>
       <div class="ps-cell ps-note"><span class="k ps-err" id="psError" hidden></span>
         <label id="psCaption">from existing DB rows</label></div>
-      <div class="ps-cell"><span class="k" id="stTotal">0</span><label>Files found</label></div>
-      <div class="ps-cell"><span class="k ok" id="stProcessed">0</span><label>Processed</label></div>
-      <div class="ps-cell"><span class="k q" id="stQuestions">0</span><label>Questions</label></div>
-      <div class="ps-cell"><span class="k a" id="stAnswers">0</span><label>Answers</label></div>
-      <div class="ps-cell"><span class="k err" id="stErrors">0</span><label>Errors</label></div>
     </div>
   </section>
 
@@ -131,12 +134,10 @@ window.MathJax = {
       <div class="tb-field">
         <label class="cred-label" for="pipeProvSel">OCR provider</label>
         <select id="pipeProvSel" class="cred-in"></select>
-        <span class="hint" id="pipeProvHint"></span>
       </div>
       <div class="tb-field">
         <label class="cred-label" for="pipeProxySel">Proxy</label>
         <select id="pipeProxySel" class="cred-in"></select>
-        <span class="hint" id="pipeProxyHint"></span>
       </div>
     </div>
   </div>
@@ -154,11 +155,6 @@ window.MathJax = {
       </div>
     </div>
     <div class="up-form">
-      <label class="up-pick" for="upFiles">
-        <i class="fa fa-file-pdf" aria-hidden="true"></i>
-        <span id="upPickText">Choose PDF files…</span>
-        <input id="upFiles" type="file" accept="application/pdf,.pdf" multiple>
-      </label>
       <div class="up-dest" aria-label="Destination folder">
         <div class="dd" id="upSubject"></div>
         <div class="dd" id="upGrade"></div>
@@ -168,6 +164,13 @@ window.MathJax = {
       <button class="ghost-btn neutral" id="upAdd" type="button">
         <i class="fa fa-plus" aria-hidden="true"></i><span>Add to queue</span>
       </button>
+    </div>
+    <div class="up-empty" id="upEmpty">
+      <label class="up-pick" for="upFiles">
+        <i class="fa fa-file-circle-plus" aria-hidden="true"></i>
+        <span id="upPickText">Add PDF files…</span>
+        <input id="upFiles" type="file" accept="application/pdf,.pdf" multiple>
+      </label>
     </div>
     <div class="up-list" id="upList"></div>
   </section>
@@ -326,13 +329,9 @@ window.MathJax = {
   <!-- service switcher · same top .seg idiom Database uses for its panels -->
   <div class="cred-toolbar">
     <div class="seg" id="credRail" role="tablist" aria-label="Credential services">
-      <button class="rail-btn active" data-cred="gemini" type="button">Gemini</button>
-      <button class="rail-btn" data-cred="router" type="button">9router</button>
-      <button class="rail-btn" data-cred="ocr" type="button">OCR engine</button>
+      <button class="rail-btn active" data-cred="ocr" type="button">OCR engine</button>
       <button class="rail-btn" data-cred="revision" type="button">Revision</button>
-      <button class="rail-btn" data-cred="supabase" type="button">Supabase</button>
-      <button class="rail-btn" data-cred="postgres" type="button">PostgreSQL</button>
-      <button class="rail-btn" data-cred="routing" type="button">Live routing</button>
+      <button class="rail-btn" data-cred="database" type="button">Database</button>
     </div>
     <div class="cred-profiles">
       <button class="ghost-btn neutral sm" id="pipeProxyNew" type="button">New profile</button>
@@ -341,73 +340,105 @@ window.MathJax = {
   </div>
 
   <div class="cred-panels">
-    <section class="panel cred-card" data-cred="gemini">
-      <div class="panel-head">
-        <h2>Gemini routing</h2>
-        <div class="head-tools">
-          <span class="hint" id="credKeyHint"></span>
-          <button class="ghost-btn neutral" id="credCheckBtn" type="button" title="Checks every key one by one — a keyless googleapis probe plus a free model listing per key. No model is ever called, no generation tokens billed.">
-            <i class="fa fa-heart-pulse" aria-hidden="true"></i>
-            <span>Check all keys</span>
+    <section class="panel cred-card" data-cred="ocr">
+      <div class="cred-section">
+        <div class="cred-sec-head">
+          <h3><span class="svc-mark" aria-hidden="true"></span>Gemini</h3>
+          <label class="sw" title="GEMINI_POOL_ENABLED in .env">
+            <input type="checkbox" id="swGemini" checked>
+            <span class="tr" aria-hidden="true"></span><em>Enabled</em>
+          </label>
+          <div class="head-tools">
+            <span class="hint" id="credKeyHint"></span>
+            <button class="ghost-btn neutral" id="credCheckBtn" type="button" title="Checks every key one by one — a keyless googleapis probe plus a free model listing per key. No model is ever called, no generation tokens billed.">
+              <i class="fa fa-heart-pulse" aria-hidden="true"></i>
+              <span>Check all keys</span>
+            </button>
+            <button class="ghost-btn neutral sm" id="credLadderEdit" type="button">Edit ladder</button>
+          </div>
+        </div>
+        <div class="cred-body">
+          <div class="cred-models-hint" id="credModelsHint"></div>
+          <div id="credGateway" class="cred-gw" hidden></div>
+          <div id="credKeys" class="cred-keys"></div>
+          <button class="icon-btn sm cred-add" id="credAddKey" type="button" dir="ltr" title="Add another API key to the pool">
+            <i class="fa fa-plus" aria-hidden="true"></i>
           </button>
-          <button class="ghost-btn neutral sm" id="credLadderEdit" type="button">Edit keys &amp; ladder</button>
+          <p class="cred-note" id="credIdleNote" hidden>
+            ⏸ The Gemini pool is idle — extraction currently runs via a
+            built-in 9router provider. Keys and ladder are kept, just unused.
+          </p>
+          <p class="cred-note" id="credLegacyNote" hidden>
+            ⚠ Your pool came from the legacy <code>GEMINI_API_KEY</code> variables — saving here
+            migrates them into <code>GEMINI_API_KEYS</code>, and the Credentials tab becomes the single source of truth.
+          </p>
         </div>
       </div>
-      <div class="cred-body">
-        <div class="cred-models-hint" id="credModelsHint"></div>
-        <div id="credGateway" class="cred-gw" hidden></div>
-        <div id="credPoolSummary"></div>
-        <p class="cred-note" id="credIdleNote" hidden>
-          ⏸ The Gemini pool is idle — extraction currently runs via a
-          built-in 9router provider. Keys and ladder are kept, just unused.
-        </p>
-        <p class="cred-note" id="credLegacyNote" hidden>
-          ⚠ Your pool came from the legacy <code>GEMINI_API_KEY</code> variables — saving here
-          migrates them into <code>GEMINI_API_KEYS</code>, and the Credentials tab becomes the single source of truth.
-        </p>
+
+      <div class="cred-section">
+        <div class="cred-sec-head">
+          <h3><span class="svc-mark" aria-hidden="true"></span>9router</h3>
+          <label class="sw" title="NINEROUTER_ENABLED in .env">
+            <input type="checkbox" id="sw9router" checked>
+            <span class="tr" aria-hidden="true"></span><em>Enabled</em>
+          </label>
+          <div class="head-tools">
+            <button class="ghost-btn neutral sm" id="ocrEdit" type="button">Edit</button>
+          </div>
+        </div>
+        <div class="cred-body">
+          <div id="routerSummary"></div>
+          <div id="credKeys9r" class="cred-keys"></div>
+        </div>
       </div>
-      <div class="cred-ring" id="ringGemini" aria-label="Model ring"></div>
-      <div class="cred-usage" id="usageGemini"></div>
     </section>
 
-    <section class="panel cred-card" data-cred="router" hidden>
-      <div class="panel-head">
-        <h2><span class="svc-mark" aria-hidden="true"></span>9router</h2>
-        <div id="routerSummary"></div>
-      </div>
-      <div class="cred-ring" id="ringRouter" aria-label="Model ring"></div>
-      <div class="cred-usage" id="usageRouter"></div>
-    </section>
-
-    <section class="panel cred-card" data-cred="ocr" hidden>
-      <div class="panel-head"><h2>Main OCR provider</h2>
-        <button class="ghost-btn neutral sm" id="ocrEdit" type="button">Edit</button>
-      </div>
-      <div class="cred-body" id="ocrSummary"></div>
-    </section>
     <section class="panel cred-card" data-cred="revision" hidden>
-      <div class="panel-head"><h2>Revision AI · provider</h2>
-        <button class="ghost-btn neutral sm" id="credEdit" type="button">Edit</button>
+      <div class="cred-section">
+        <div class="cred-sec-head">
+          <h3>Revision AI · provider</h3>
+          <label class="sw" title="REVISION_PROVIDER_ENABLED in .env">
+            <input type="checkbox" id="swRevision" checked>
+            <span class="tr" aria-hidden="true"></span><em>Enabled</em>
+          </label>
+          <div class="head-tools">
+            <button class="ghost-btn neutral sm" id="credEdit" type="button">Edit</button>
+          </div>
+        </div>
+        <div class="cred-body" id="credSummary"></div>
       </div>
-      <div class="cred-body" id="credSummary"></div>
     </section>
-    <section class="panel cred-card" data-cred="supabase" hidden>
-      <div class="panel-head"><h2>Supabase</h2>
-        <button class="ghost-btn neutral sm" id="supaEdit" type="button">Edit</button>
+
+    <section class="panel cred-card" data-cred="database" hidden>
+      <div class="cred-section">
+        <div class="cred-sec-head">
+          <h3><span class="svc-mark" aria-hidden="true"></span>Supabase</h3>
+          <label class="sw" title="SUPABASE_ENABLED in .env">
+            <input type="checkbox" id="swSupabase" checked>
+            <span class="tr" aria-hidden="true"></span><em>Enabled</em>
+          </label>
+          <div class="head-tools">
+            <button class="ghost-btn neutral sm" id="supaEdit" type="button">Edit</button>
+          </div>
+        </div>
+        <div class="cred-body" id="supaSummary"></div>
       </div>
-      <div class="cred-body" id="supaSummary"></div>
-    </section>
-    <section class="panel cred-card" data-cred="postgres" hidden>
-      <div class="panel-head"><h2>Local / other database</h2>
-        <button class="ghost-btn neutral sm" id="pgEdit" type="button">Edit</button>
-      </div>
-      <div class="cred-body" id="pgSummary"></div>
-    </section>
-    <section class="panel cred-card" data-cred="routing" hidden>
-      <div class="panel-head"><h2>Live routing</h2></div>
-      <div class="cred-body">
-        <div id="credRoute" class="cred-route">idle</div>
-        <div id="credEvents" class="cred-events no-mathjax"></div>
+
+      <div class="cred-section">
+        <div class="cred-sec-head">
+          <h3>Local / other connection</h3>
+          <div class="head-tools">
+            <button class="ghost-btn neutral sm" id="dbConnAdd" type="button">
+              <i class="fa fa-plus" aria-hidden="true"></i><span>Add connection</span>
+            </button>
+            <button class="ghost-btn neutral sm" id="pgEdit" type="button">Edit current</button>
+          </div>
+        </div>
+        <div class="cred-body">
+          <div id="dbConns" class="cred-keys"></div>
+          <p class="cred-note">Presentation only — the pipeline keeps its one fixed
+            active connection; the enabled flag is stored with each entry.</p>
+        </div>
       </div>
     </section>
   </div>
@@ -421,7 +452,22 @@ window.MathJax = {
   </div>
 </section>
 
-<!-- ════════════ VIEW 5 · DATABASE (data console) ════════════ -->
+<!-- ════════════ VIEW 5 · USAGE (model usage plot) ════════════ -->
+<section id="viewUsage" class="view">
+  <div class="panel usage-panel">
+    <div class="panel-head">
+      <h2>Usage</h2>
+      <div class="head-tools">
+        <div class="ps-chips usage-chips" id="usagePeriods" role="tablist" aria-label="Usage period"></div>
+      </div>
+    </div>
+    <div class="usage-totals" id="usageTotals"></div>
+    <div class="usage-plot" id="usagePlot" aria-label="Tokens over time"></div>
+    <div class="usage-scroll"><table class="usage-table" id="usageTable"></table></div>
+  </div>
+</section>
+
+<!-- ════════════ VIEW 6 · DATABASE (data console) ════════════ -->
 <section id="viewDatabase" class="view">
   <div class="db-strip" id="dbStrip"></div>
 
@@ -575,11 +621,7 @@ window.MathJax = {
         <label class="cred-label" for="credLadder">Model ladder <span class="cred-sub">oldest first · every key walks the whole ladder, stepping up only on failure</span></label>
         <textarea id="credLadder" class="cred-in mono" rows="2" spellcheck="false"
                   placeholder="gemini-3.5-flash, gemini-3.6-flash, …" dir="ltr"></textarea>
-        <label class="cred-label">API keys <span class="cred-sub">label · key · completed sends per model (⋮⋮ to reorder) · healthy keys share the load round-robin</span></label>
-        <div id="credKeys" class="cred-keys"></div>
-        <button class="icon-btn sm cred-add" id="credAddKey" type="button" dir="ltr" title="Add another API key to the pool">
-          <i class="fa fa-plus" aria-hidden="true"></i>
-        </button>
+        <p class="hint">The keys themselves live in the OCR engine pane — this pop-up edits only the ladder.</p>
       </div>
       <div class="cred-form" data-form="supabase" hidden>
         <label class="cred-label" for="credSupaUrl">Project URL</label>

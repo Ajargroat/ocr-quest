@@ -53,6 +53,28 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
     return parsed
 
 
+def missing_credentials(cfg):
+    """Pre-flight gate — the env names a run's active providers need.
+    A switched-off section reports its own flag, so the log names the toggle
+    that turned the run down (Q1)."""
+    missing = []
+    if not cfg.supabase_key:
+        missing.append("SUPABASE_SERVICE_KEY")
+    if (cfg.ocr_provider or "gemini").lower() == "gemini":
+        if not cfg.gemini_pool_enabled:
+            missing.append("GEMINI_POOL_ENABLED (Credentials · OCR engine)")
+        elif not cfg.gemini_key_pool:
+            missing.append("GEMINI_API_KEYS (Credentials tab)")
+    else:
+        if not cfg.ninerouter_enabled:
+            missing.append("NINEROUTER_ENABLED (Credentials · OCR engine)")
+        elif not cfg.ocr_base_url:
+            missing.append("OCR_BASE_URL (Credentials tab)")
+    if cfg.revision_active and not cfg.revision_provider_enabled:
+        missing.append("REVISION_PROVIDER_ENABLED (Credentials · Revision)")
+    return missing
+
+
 def _sleep_or_stop(hub, seconds):
     """Sleep that wakes early when the stop button is pressed (criterion 10).
 
@@ -179,13 +201,7 @@ def _run(hub: Hub, cfg: Config, db: Database):
 
         # --- pre-flight checks -------------------------------------
         set_proxy(cfg)                # profile lane for Google-bound calls
-        missing = []
-        if not cfg.supabase_key:
-            missing.append("SUPABASE_SERVICE_KEY")
-        if (cfg.ocr_provider or "gemini").lower() == "gemini" and not cfg.gemini_key_pool:
-            missing.append("GEMINI_API_KEYS (Credentials tab)")
-        elif (cfg.ocr_provider or "").lower() != "gemini" and not cfg.ocr_base_url:
-            missing.append("OCR_BASE_URL (Credentials tab)")
+        missing = missing_credentials(cfg)
         if missing:
             log("error", "Missing credentials in .env: " + ", ".join(missing), "bad_key")
             return

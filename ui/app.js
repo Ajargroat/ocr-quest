@@ -92,26 +92,43 @@ function typesetMath(el){
 }
 
 /* ═══════════ PIPELINE (unchanged logic) ═══════════ */
+/* signal bars: 1 red bar while the socket is down, green bars whose
+   count follows the OCR provider's ping (outline item 3). */
+let PING = {ms: null, ok: true};          // ms null → nothing measured (Gemini pool)
+
 function setConn(ok){
   $('conn').className = 'conn ' + (ok ? 'on' : 'off');
-  $('connText').textContent = ok ? 'live' : 'reconnecting…';
+  paintConn();
 }
-function tween(el, to){
-  const from = parseInt(el.dataset.v || '0');
-  if (from === to){ el.textContent = to; el.dataset.v = to; return; }
-  const t0 = performance.now(), dur = 500;
-  (function step(t){
-    const p = Math.min(1, (t - t0) / dur);
-    el.textContent = Math.round(from + (to - from) * (1 - Math.pow(1 - p, 3)));
-    if (p < 1) requestAnimationFrame(step); else el.dataset.v = to;
-  })(t0);
+function paintConn(){
+  const live = $('conn').classList.contains('on');
+  const good = live && PING.ok;
+  const n = !good ? 1
+    : PING.ms == null ? 3
+    : PING.ms <= 300 ? 3 : PING.ms <= 1200 ? 2 : 1;
+  const bars = $('connBars').children;
+  for (let i = 0; i < bars.length; i++) bars[i].classList.toggle('on', i < n);
+  $('conn').classList.toggle('down', !good);
+  $('connText').textContent = live ? 'live' : 'reconnecting…';
+  $('connPing').textContent = (good && PING.ms != null) ? Math.round(PING.ms) + ' ms' : '—';
+  $('conn').title = $('pipeProvSel').value || 'Gemini pool';
+}
+async function pingProvider(){
+  try{
+    const res = await fetch('/api/credentials/check/provider', {method: 'POST'});
+    if (res.status === 409){              // Gemini pool — nothing to probe (Q2a)
+      PING = {ms: null, ok: true};
+    } else {
+      const d = await res.json();
+      PING = {ms: (typeof d.latency_ms === 'number' ? d.latency_ms : null),
+              ok: !!d.ok};
+    }
+  }catch(e){
+    PING = {ms: null, ok: false};
+  }
+  paintConn();
 }
 function applyStats(s){
-  tween($('stTotal'), s.total || 0);
-  tween($('stProcessed'), s.processed || 0);
-  tween($('stQuestions'), s.questions || 0);
-  tween($('stAnswers'), s.answers || 0);
-  tween($('stErrors'), s.errors || 0);
   const done = (s.processed || 0) + (s.errors || 0), total = s.total || 0;
   $('barFill').style.width = total ? (done / total * 100) + '%' : '0%';
   $('barLabel').textContent = total ? done + ' / ' + total : 'idle';
@@ -411,10 +428,6 @@ function handle(ev){
     case 'stats': applyStats(ev.stats || {}); break;
     case 'run_started': PIPE_STOPPING = false; setRunning(true); DIAG.counts = {}; updateDiagCount(); break;
     case 'run_finished': PIPE_STOPPING = false; setRunning(false); break;
-    case 'route':
-      CredState.events.push({ ts: ev.ts || '', message: ev.text });
-      if ($('viewCredentials').classList.contains('active')) credRenderSide();
-      break;
     case 'wait': waitCountdown(ev); break;
     case 'upload': upApplyEvent(ev); break;
     case 'usage': credUsageLive(ev); break;
@@ -447,6 +460,7 @@ function connect(){
   ws.onmessage = m => handle(JSON.parse(m.data));
 }
 connect();
+pingProvider();
 $('runBtn').onclick = async () => {
   if (PIPE_RUNNING){
     if (PIPE_STOPPING) return;                  // already asked — one wish is enough
@@ -475,7 +489,12 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
     $('viewReview').classList.toggle('active', target === 'review');
     $('viewRevision').classList.toggle('active', target === 'revision');
     $('viewDatabase').classList.toggle('active', target === 'database');
+    $('viewUsage').classList.toggle('active', target === 'usage');
     $('viewCredentials').classList.toggle('active', target === 'credentials');
+    if (target === 'usage' && !UsageState.loaded){
+      UsageState.loaded = true;
+      usageRefresh();
+    }
     if (target === 'review' && !RState.loaded){
       RState.loaded = true;
       loadReviewMeta().then(loadReviewRows);
@@ -531,6 +550,9 @@ function closeAllDD(){
 }
 document.addEventListener('click', closeAllDD);
 
+/* Q3(b): only the up-form dropdowns trade their caption for the selection;
+   the revision rv* hosts keep their static Persian captions. */
+const UPFORM_DDS = ['upSubject', 'upGrade', 'upTopic', 'upType'];
 function createDropdown(hostId, caption, multi = false){
   const host = $(hostId);
   host.innerHTML =
@@ -540,6 +562,7 @@ function createDropdown(hostId, caption, multi = false){
     '</button><div class="dd-menu" role="listbox"></div>';
   const btn   = host.querySelector('.dd-btn');
   const pip   = host.querySelector('.dd-pip');
+  const cap   = host.querySelector('.dd-cap');
   const menu  = host.querySelector('.dd-menu');
   const has   = v => multi
     ? dd.value.some(x => String(x) === String(v))
@@ -607,6 +630,8 @@ function createDropdown(hostId, caption, multi = false){
     pip.classList.toggle('on', active);
     btn.title = active ? caption + ': ' + labels.join('، ') : caption + ': همه';
     host.classList.toggle('has-value', active);
+    if (cap && UPFORM_DDS.indexOf(hostId) !== -1)
+      cap.textContent = active ? labels.join('، ') : caption;
   }
   btn.onclick = e => {
     e.stopPropagation();
@@ -2013,7 +2038,9 @@ const CredState = { loaded:false, rows:[], ladder:[], events:[], supaKeySet:fals
                     gateway:null, usageCap:20, dragIdx:null,
                     extraction:{ engine:'gemini', active:'', providers:[] },
                     revision:{ active:'', providers:[] },
-                    providerOk:null, dirty:false, busy:false };
+                    providerOk:null, dirty:false, busy:false,
+                    enabled:{ gemini:true, ninerouter:true, revision:true, supabase:true },
+                    dbConnections:[] };
 
 const credEsc = s => String(s ?? '').replace(/[<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -2071,6 +2098,8 @@ function credRowEl(r, i){
       : '') +
     `<input class="cred-in cred-name" type="text" spellcheck="false" autocomplete="off"
        placeholder="${credEsc('Key ' + ((r.keep ?? i) + 1))}" value="${credEsc(r.name || '')}">` +
+    `<span class="cred-date" title="${credEsc(r.added ? 'added ' + r.added : 'no saved date yet')}">` +
+    `${credEsc(r.added ? r.added.slice(0, 10) : '—')}</span>` +
     keyField +
     (r.keep !== null
       ? `<button class="cred-btn chk" type="button" title="Re-check this key — one free googleapis listing call, no model used">♥</button>`
@@ -2141,7 +2170,7 @@ function credRender(){
   $('credKeyHint').textContent =
     `${stored.length + CredState.rows.filter(r => r.keep === null && !r.removed).length} key(s) · ${live} verified`;
   credGatewayBar();
-  credRenderSide();
+  cred9rRow();
 }
 
 function credGatewayBar(){
@@ -2164,20 +2193,67 @@ function credGatewayBar(){
   }
 }
 
-function credRenderSide(){
-  const stored = CredState.rows.filter(r => !r.removed && r.keep !== null);
-  const live = stored.filter(r => r.state === 'ok' || r.state === 'alive_unlisted').length;
-  $('credRoute').innerHTML =
-    `<b>${live}/${stored.length}</b> keys verified · ladder ` +
-    CredState.ladder.map((m, j) =>
-      (j ? '<span class="arr">→</span>' : '') +
-      `<em title="${credEsc(m)}">${credEsc(credModelTag(m))}</em>`).join(' ');
-  const ev = $('credEvents');
-  const list = CredState.events.slice(-14).reverse();
-  ev.innerHTML = list.length
-    ? list.map(e => `<div class="cev"><i>${credEsc(e.ts)}</i><span>${credEsc(e.message)}</span></div>`).join('')
-    : '';
+/* the 9router credential, inline under its section header (no usage, no ring) */
+function cred9rRow(){
+  const box = $('credKeys9r');
+  if (!box) return;
+  const ex = CredState.extraction;
+  const p = ex.providers.find(x => x.label === ex.active) || ex.providers[0] || null;
+  const on = p && p.api_key_set;
+  box.innerHTML =
+    `<div class="cred-key s-${on ? 'ok' : 'unknown'}"><div class="cred-key-main">` +
+    `<i class="dot" title="${on ? 'key set' : 'key not set'}"></i>` +
+    `<b class="cred-name-ro">${credEsc(p ? p.label : '9router')}</b>` +
+    `<code class="cred-mask">${credEsc((p && p.api_key_masked) || '— not set —')}</code>` +
+    `<span class="hint">${credEsc(p && p.model ? p.model : '—')}</span>` +
+    `</div></div>`;
 }
+
+/* Q2 — extra connections are a presentation list beside Supabase */
+function credDbConnRow(c, i){
+  const wrap = document.createElement('div');
+  wrap.className = 'cred-key s-' + (c.enabled ? 'ok' : 'removed');
+  wrap.innerHTML = `<div class="cred-key-main">` +
+    `<i class="dot"></i>` +
+    `<b class="cred-name-ro">${credEsc(c.label)}</b>` +
+    `<span class="hint">${credEsc(c.host || '—')}:${credEsc(c.port || '5432')}/${credEsc(c.db || '—')}</span>` +
+    `<span class="hint">${credEsc(c.user || '—')}</span>` +
+    `<span class="hint">${credEsc(c.password_set ? 'password set' : '— not set —')}</span>` +
+    `<label class="sw"><input type="checkbox" ${c.enabled ? 'checked' : ''} data-conn="${i}">` +
+    `<span class="tr" aria-hidden="true"></span><em>Enabled</em></label>` +
+    `<button class="cred-btn rm" type="button" data-rm="${i}" title="Remove on save">${fi('xmark')}</button></div>`;
+  const sw = wrap.querySelector('input[data-conn]');
+  if (sw) sw.onchange = () => {
+    CredState.dbConnections[i].enabled = sw.checked;
+    wrap.className = 'cred-key s-' + (sw.checked ? 'ok' : 'removed');
+    credMarkDirty();
+  };
+  const rm = wrap.querySelector('.rm');
+  if (rm) rm.onclick = () => {
+    CredState.dbConnections.splice(i, 1);
+    credRenderDbConns();
+    credMarkDirty();
+  };
+  return wrap;
+}
+
+function credRenderDbConns(){
+  const box = $('dbConns');
+  if (!box) return;
+  box.innerHTML = '';
+  (CredState.dbConnections || []).forEach((c, i) => box.appendChild(credDbConnRow(c, i)));
+}
+
+/* section enable switches → .env flags; a run with the active provider off is blocked */
+const CRED_FLAGS = { swGemini: 'gemini', sw9router: 'ninerouter',
+                     swRevision: 'revision', swSupabase: 'supabase' };
+Object.keys(CRED_FLAGS).forEach(id => {
+  const el = $(id);
+  if (el) el.addEventListener('change', () => {
+    CredState.enabled[CRED_FLAGS[id]] = el.checked;
+    credMarkDirty();
+  });
+});
 
 function credOcrFields(){
   const off = CredState.extraction.engine === 'gemini';
@@ -2261,6 +2337,7 @@ async function loadCredentials(){
     CredState.usageCap = (d.keys && d.keys[0] && d.keys[0].usage && d.keys[0].usage.limit) || 20;
     CredState.rows = (d.keys || []).map(k => ({
       keep:k.index, masked:k.masked, name:k.name || '', value:'', replaced:false, removed:false,
+      added:k.added || '',
       okModel:k.ok_model || '',
       models:{}, blocked:k.blocked_models || [], usage:k.usage || null, calls:k.calls || 0,
       checking:false, latency:k.latency_ms || 0, penalized:!!k.penalized,
@@ -2299,6 +2376,20 @@ async function loadCredentials(){
     $('credPgSsl').value = d.postgres_sslmode || '';
     credRenderProviders('extraction');
     credRenderProviders('revision');
+    // Section enable flags (Q1) + the presentation-only connection list (Q2).
+    CredState.enabled = Object.assign(
+      { gemini:true, ninerouter:true, revision:true, supabase:true }, d.enabled || {});
+    Object.keys(CRED_FLAGS).forEach(id => {
+      const el = $(id);
+      if (el) el.checked = !!CredState.enabled[CRED_FLAGS[id]];
+    });
+    CredState.dbConnections = (d.db_connections || []).map(c => Object.assign({}, c));
+    if (!CredState.dbConnections.length && (d.postgres_host || d.postgres_user)){
+      CredState.dbConnections = [{
+        label:'Local / other', host:d.postgres_host || '', port:d.postgres_port || '',
+        db:d.postgres_db || '', user:d.postgres_user || '', sslmode:d.postgres_sslmode || '',
+        password_set:!!d.postgres_password_set, enabled:true }];
+    }
     credRenderSummaries();
     document.querySelectorAll('#ocrProvider button').forEach(b =>
       b.classList.toggle('active', b.dataset.ocr === CredState.extraction.engine));
@@ -2460,6 +2551,11 @@ async function credSave(){
           ? '' : (CredState.extraction.active || ''),
         revision_providers: CredState.revision.providers,
         revision_active: CredState.revision.active || '',
+        enabled: CredState.enabled,
+        db_connections: (CredState.dbConnections || []).map(c => ({
+          label: c.label, host: c.host, port: c.port, db: c.db, user: c.user,
+          sslmode: c.sslmode, enabled: !!c.enabled,
+          password: c.password_set ? (c.password !== undefined ? c.password : CRED_KEEP) : '' })),
       }),
     });
     const d = await res.json();
@@ -2593,10 +2689,11 @@ function credAddProvider(section){
    listeners all keep working unchanged — only the location moved.
    Modal markup is static (in index.html), never rebuilt, so the
    listeners bound once at load never go stale. */
-const CredModal = { form:null };
+const CredModal = { form:null, addConn:false };
 
 function credOpenModal(form, title, hint){
   CredModal.form = form;
+  CredModal.addConn = false;
   $('credModalTitle').textContent = title;
   $('credModalHint').textContent = hint;
   // exactly one form is visible per open; ids are unique document-wide
@@ -2623,32 +2720,6 @@ function credSummary(el, rows){
 }
 
 function credRenderSummaries(){
-  // Gemini routing card — the key rows themselves live in the modal,
-  // so the card carries the counts the user needs at a glance.
-  const stored = CredState.rows.filter(r => !r.removed && r.keep !== null);
-  const live = stored.filter(r => r.state === 'ok' || r.state === 'alive_unlisted').length;
-  const sends = CredState.ladder.map(m => {
-    const n = CredState.rows.reduce((s, r) =>
-      s + (((r.usage && r.usage.models) || {})[m] || 0), 0);
-    return credModelTag(m) + ' ' + n;
-  }).join(' · ');
-  credSummary($('credPoolSummary'), [
-    ['keys', stored.length + ' stored · ' + live + ' verified',
-     (stored.length && live === stored.length) ? 'cred-chip ok' : 'cred-chip amber'],
-    ['ladder', CredState.ladder.join(' → ') || '— not set —'],
-    ['completed sends', sends || '— none yet'],
-  ]);
-
-  const ex = CredState.extraction;
-  const p = ex.providers.find(x => x.label === ex.active);
-  credSummary($('ocrSummary'), [
-    ['engine', ex.engine === 'gemini' ? 'Gemini key pool' : 'Custom provider',
-     ex.engine === 'gemini' ? 'cred-chip ok' : 'cred-chip amber'],
-    ['active', p ? p.label : '— none —'],
-    ['base URL', p ? (p.base_url || '—') : '—'],
-    ['model', p ? (p.model || '—') : '—'],
-    ['API key', (p && p.api_key_masked) || (p && p.api_key_set ? 'set' : '— not set —')],
-  ]);
   const rv = CredState.revision;
   const rp = rv.providers.find(x => x.label === rv.active);
   credSummary($('credSummary'), [
@@ -2662,14 +2733,7 @@ function credRenderSummaries(){
     ['Bucket', $('credSupaBucket').value || '— not set —'],
     ['Service key', $('credSupaKey').placeholder || '— not set —'],
   ]);
-  credSummary($('pgSummary'), [
-    ['host · port', ($('credPgHost').value || '—') +
-      ($('credPgPort').value ? ':' + $('credPgPort').value : '')],
-    ['database · user', ($('credPgDb').value || '—') +
-      ' · ' + ($('credPgUser').value || '—')],
-    ['SSL mode', $('credPgSsl').value || 'driver default'],
-    ['password', $('credPgPass').placeholder || '— not set —'],
-  ]);
+  credRenderDbConns();
 }
 
 /* ONE real model call against the endpoint — reply snippet + latency
@@ -2705,7 +2769,7 @@ async function credTestChat(section){
       credProvStatus(CredState.providerOk);
     }
     CredState.events.push({ ts:'', message: (ok ? '✓ live test — ' : '✗ live test — ') + detail });
-    credRenderSide();
+    credRouterSummary();
     toast(ok ? 'Test OK — ' + detail : 'Test failed — ' + detail);
   }catch(e){
     toast('Test failed — ' + e);
@@ -2728,11 +2792,30 @@ $('supaEdit').onclick   = () => credOpenModal('supabase',
   'Supabase', 'Project URL, bucket and the service key. Blank key input keeps the stored secret.');
 $('pgEdit').onclick     = () => credOpenModal('postgres',
   'Local / other database', 'All six fields are needed to connect; leave SSL mode blank for the driver default.');
+$('dbConnAdd').onclick  = () => {
+  credOpenModal('postgres', 'Add database connection',
+    'Appends a new connection card under Supabase — presentation only, the pipeline keeps its one active connection.');
+  CredModal.addConn = true;
+};
 $('credLadderEdit').onclick = () => credOpenModal('pool',
   'Gemini key pool & model ladder',
   'One model per line, oldest first · drag a key by its grip to reorder — order IS routing priority.');
 $('credModalClose').onclick = credCloseModal;
-$('credModalSave').onclick  = () => { credCloseModal(); credMarkDirty(); };
+$('credModalSave').onclick  = () => {
+  if (CredModal.form === 'postgres' && CredModal.addConn){
+    const label = ($('credPgDb').value.trim() || $('credPgHost').value.trim() || 'connection')
+      + ' @ ' + ($('credPgHost').value.trim() || 'host');
+    CredState.dbConnections.push({
+      label, host:$('credPgHost').value.trim(), port:$('credPgPort').value.trim(),
+      db:$('credPgDb').value.trim(), user:$('credPgUser').value.trim(),
+      sslmode:$('credPgSsl').value.trim(), enabled:true,
+      password_set:!!$('credPgPass').value.trim(),
+      password:$('credPgPass').value.trim() });
+    credRenderDbConns();
+  }
+  credCloseModal();
+  credMarkDirty();
+};
 $('credModal').addEventListener('click',
   e => { if (e.target === $('credModal')) credCloseModal(); });
 // top-level, NOT inside dbWireOnce() — that Escape handler is behind
@@ -2770,10 +2853,6 @@ async function loadPipeProfiles(){
       sel.appendChild(o);
     });
     sel.value = PipeState.active;
-    const hint = $('pipeProxyHint');
-    if (hint) hint.textContent = PipeState.active
-      ? 'Google-bound calls ride the “' + PipeState.active + '” profile'
-      : 'direct — no proxy profile';
   }catch(e){ /* first paint before the server is up */ }
 }
 
@@ -2890,10 +2969,7 @@ async function loadPipeProviders(){
       sel.appendChild(o);
     });
     sel.value = ProvState.active;
-    const hint = $('pipeProvHint');
-    if (hint) hint.textContent = ProvState.active
-      ? 'extraction runs on “' + ProvState.active + '”'
-      : 'extraction runs on the Gemini key pool';
+    paintConn();
   }catch(e){ /* first paint before the server is up */ }
 }
 
@@ -2914,6 +2990,7 @@ $('pipeProvSel').onchange = async () => {
     if (!res.ok) throw new Error(d.error || d.detail || ('HTTP ' + res.status));
     toast('OCR provider saved to .env');
     await loadPipeProviders();           // read the persisted value back
+    pingProvider();                      // re-measure the freshly selected provider
     // keep the Credentials tab honest without disturbing its edits:
     // refresh only if it is already loaded AND has nothing unsaved.
     if (CredState.loaded && !CredState.dirty) await loadCredentials();
@@ -3396,8 +3473,7 @@ const PERIODS = ['24h', '7d', '30d', 'all'];
 const PERIOD_LABEL = { '24h':'24 hours', '7d':'7 days', '30d':'30 days', 'all':'all time' };
 
 /* ── 1 · credentials rail: one press, one panel (Q3) ───────────── */
-const CRED_SERVICES = ['gemini', 'router', 'ocr', 'revision',
-                       'supabase', 'postgres', 'routing'];
+const CRED_SERVICES = ['ocr', 'revision', 'database'];
 
 function credShow(service){
   CRED_SERVICES.forEach(s => {
@@ -3406,23 +3482,12 @@ function credShow(service){
     const btn = document.querySelector('#credRail .rail-btn[data-cred="' + s + '"]');
     if (btn) btn.classList.toggle('active', s === service);
   });
-  if (service === 'gemini') credRing('ringGemini', gemModels(), gemActiveModel());
-  if (service === 'router') credRing('ringRouter', rtModels(), rtActiveModel());
-  if (service === 'gemini' || service === 'router') usageRender(service);
 }
 document.querySelectorAll('#credRail .rail-btn[data-cred]').forEach(btn => {
   btn.onclick = () => credShow(btn.dataset.cred);
 });
 
-/* ── 2 · model ring: centre node, models around, line to the one in use ── */
-function gemModels(){ return (CredState.ladder || []).slice(); }
-function gemActiveModel(){
-  const rows = CredState.rows || [];
-  const live = rows.find(r => r.okModel && r.state === 'ok');
-  if (live) return live.okModel;
-  const any = rows.find(r => r.okModel);
-  return any ? any.okModel : (ACTIVE_MODEL.gemini || '');
-}
+/* ── 2 · 9router model helpers (the section summary reads these) ── */
 function rtProvider(){
   return ((CredState.extraction && CredState.extraction.providers) || [])
     .find(p => p.label === '9router')
@@ -3442,73 +3507,18 @@ function rtActiveModel(){
   return (p && p.model) || ACTIVE_MODEL.router || '';
 }
 
-function credRing(id, models, active){
-  const box = $(id);
-  if (!box) return;
-  const list = (models || []).filter(Boolean);
-  if (!list.length){
-    box.innerHTML = '';
-    return;
-  }
-  /* 9router topology: core card in the middle, one node card per model on an ellipse */
-  const W = 640, H = 440, CX = W / 2, CY = H / 2;
-  const CORE_W = 176, CORE_H = 48, NODE_W = 208, NODE_H = 44;
-  const RX = (W - NODE_W) / 2 - 8, RY = (H - NODE_H) / 2 - 8;
-  const idx = Math.max(0, list.indexOf(active));
-  const at = (from, to, hw, hh) => {            // exit point of a rect toward `to`
-    const dx = to.x - from.x, dy = to.y - from.y;
-    const s = Math.min(hw / (Math.abs(dx) || 1e-6), hh / (Math.abs(dy) || 1e-6));
-    return { x: from.x + dx * s, y: from.y + dy * s };
-  };
-  const core = { x: CX, y: CY };
-  const geo = list.map((m, i) => {              // 12 o'clock first, evenly spaced
-    const a = -Math.PI / 2 + (2 * Math.PI * i) / list.length;
-    return { m, i, a, p: { x: CX + RX * Math.cos(a), y: CY + RY * Math.sin(a) } };
-  });
-  const edges = [], cards = geo.map(({ m, i, p }) => {
-    const on = i === idx;
-    const label = m.length > 26 ? m.slice(0, 25) + '…' : m;
-    const p0 = at(core, p, CORE_W / 2, CORE_H / 2);
-    const p1 = at(p, core, NODE_W / 2, NODE_H / 2);
-    const k = 0.45;                             // cubic pull, like getBezierPath
-    edges.push(`<path class="pane-edge${on ? ' on' : ''}" d="M ${p0.x} ${p0.y}` +
-      ` C ${p0.x + (p1.x - p0.x) * k} ${p0.y + (p1.y - p0.y) * k},` +
-      ` ${p1.x - (p1.x - p0.x) * k} ${p1.y - (p1.y - p0.y) * k}, ${p1.x} ${p1.y}"/>`);
-    const x = p.x - NODE_W / 2, y = p.y - NODE_H / 2;
-    const ini = credEsc(m.replace(/^.*[\\/]/, '').slice(0, 2).toUpperCase());
-    return `<g class="pane-card${on ? ' on' : ''}">` +
-      `<rect class="pane-node" x="${x}" y="${y}" rx="8" width="${NODE_W}" height="${NODE_H}"/>` +
-      `<rect class="pane-ico" x="${x + 8}" y="${y + 6}" rx="6" width="32" height="32"/>` +
-      `<text class="pane-ico-t" x="${x + 24}" y="${y + 27}">${ini}</text>` +
-      `<text class="pane-label${on ? ' on' : ''}" x="${x + 50}" y="${y + 27}">${credEsc(label)}</text>` +
-      (on ? `<circle class="pane-ping" cx="${x + NODE_W - 14}" cy="${p.y}" r="4"/>` : '') +
-      `</g>`;
-  });
-  box.innerHTML = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img"' +
-    ' aria-label="model pane — the highlighted node is the model in use">' +
-    edges.join('') +
-    `<rect class="pane-core" x="${CX - CORE_W / 2}" y="${CY - CORE_H / 2}" rx="12"` +
-    ` width="${CORE_W}" height="${CORE_H}"/>` +
-    `<text class="pane-core-t" x="${CX}" y="${CY + 5}">9Router</text>` +
-    cards.join('') + '</svg>';
-}
-
 /* live model from the per-call usage event pushed on every send (criterion 10) */
 const ACTIVE_MODEL = { gemini: '', router: '' };
 function credUsageLive(ev){
   if (!ev || !ev.model) return;
   ACTIVE_MODEL.gemini = ev.model;
-  if (!$('viewCredentials').classList.contains('active')) return;
-  const open = CRED_SERVICES.find(s => {
-    const p = document.querySelector('.cred-card[data-cred="' + s + '"]');
-    return p && !p.hidden;
-  });
-  if (open === 'gemini') credRing('ringGemini', gemModels(), gemActiveModel());
-  if (open === 'gemini' || open === 'router') usageRefresh();
+  ACTIVE_MODEL.router = ev.model;
+  if (!$('viewUsage').classList.contains('active')) return;
+  usageRefresh();
 }
 
-/* ── 3 · usage report: calls, tokens, per-call ms, model, key (criterion 6) ── */
-const UsageState = { period: 'all', box: 'gemini', data: null, busy: false };
+/* ── 3 · usage tab: a plot + per-call table (criterion 6) ── */
+const UsageState = { period: 'all', data: null, busy: false, loaded: false };
 
 async function usageRefresh(){
   if (UsageState.busy) return;
@@ -3518,31 +3528,34 @@ async function usageRefresh(){
     UsageState.data = await res.json();
   }catch(e){ UsageState.data = null; }
   UsageState.busy = false;
-  usageRender(UsageState.box, UsageState.data);
+  usageRender(UsageState.data);
 }
 
-function usageRender(service, data){
-  UsageState.box = service;
-  const box = $(service === 'gemini' ? 'usageGemini' : 'usageRouter');
-  if (!box) return;
+function usageRender(data){
   const d = data || UsageState.data;
-  const chips = '<div class="ps-chips usage-chips">' + PERIODS.map(p =>
+  const chips = $('usagePeriods');
+  if (chips) chips.innerHTML = PERIODS.map(p =>
     `<button class="ps-chip${p === UsageState.period ? ' active' : ''}" type="button"` +
-    ` data-uperiod="${p}">${p === 'all' ? 'All time' : p}</button>`).join('') + '</div>';
+    ` data-uperiod="${p}">${p === 'all' ? 'All time' : p}</button>`).join('');
+  const totals = $('usageTotals');
+  const table = $('usageTable');
+  const plot = $('usagePlot');
   if (!d || !d.ok){
-    box.innerHTML = chips + '<p class="hint">Usage history unavailable.</p>';
-    usageWire(box);
+    if (totals) totals.innerHTML = '<span class="hint">Usage history unavailable.</span>';
+    if (plot) plot.innerHTML = '';
+    if (table) table.innerHTML = '';
+    usageWire();
     return;
   }
   const t = d.totals || {};
   const rows = (d.calls || []).slice(-40).reverse();
-  const head = `<div class="usage-totals">
-      <span><b>${t.calls || 0}</b> calls</span>
-      <span><b>${(t.tokens_in || 0).toLocaleString()}</b> in</span>
-      <span><b>${(t.tokens_out || 0).toLocaleString()}</b> out</span>
-      <span><b>${(t.ms || 0).toLocaleString()}</b> ms total</span>
-      <span class="hint">${PERIOD_LABEL[UsageState.period] || 'all time'}</span>
-    </div>`;
+  if (totals) totals.innerHTML =
+    `<span><b>${t.calls || 0}</b> calls</span>` +
+    `<span><b>${(t.tokens_in || 0).toLocaleString()}</b> in</span>` +
+    `<span><b>${(t.tokens_out || 0).toLocaleString()}</b> out</span>` +
+    `<span><b>${(t.ms || 0).toLocaleString()}</b> ms total</span>` +
+    `<span class="hint">${PERIOD_LABEL[UsageState.period] || 'all time'}</span>`;
+  usagePlot(d.calls || []);
   const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
       <td>${credEsc((r.ts_utc || '').slice(0, 19).replace('T', ' '))}</td>
       <td class="mono">${credEsc(r.model || '—')}</td>
@@ -3552,14 +3565,42 @@ function usageRender(service, data){
       <td class="num">${(r.ms || 0).toLocaleString()}</td>
     </tr>`).join('')
     : '<tr><td colspan="6" class="hint">No calls recorded in this period.</td></tr>';
-  box.innerHTML = chips + head + `<div class="usage-scroll"><table class="usage-table">
-      <thead><tr><th>Time (UTC)</th><th>Model</th><th>Key name</th><th>Key</th>
-      <th>Tokens in / out</th><th>ms</th></tr></thead>
-      <tbody>${body}</tbody></table></div>`;
-  usageWire(box);
+  if (table) table.innerHTML = `<thead><tr><th>Time (UTC)</th><th>Model</th><th>Key name</th><th>Key</th>
+      <th>Tokens in / out</th><th>ms</th></tr></thead><tbody>${body}</tbody>`;
+  usageWire();
 }
-function usageWire(box){
-  box.querySelectorAll('button[data-uperiod]').forEach(b => {
+
+/* one curve: tokens_out per time bucket, for the selected period (no chart lib) */
+function usagePlot(rows){
+  const box = $('usagePlot');
+  if (!box) return;
+  const data = (rows || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
+  if (!data.length){ box.innerHTML = '<p class="hint">No calls in this period.</p>'; return; }
+  const W = 760, H = 220, PAD = 34, N = 32;
+  const t0 = data[0].ts || 0, t1 = data[data.length - 1].ts || t0;
+  const span = Math.max(1, t1 - t0);
+  const buckets = new Array(N).fill(0);
+  data.forEach(r => {
+    const i = Math.min(N - 1, Math.floor((((r.ts || t0) - t0) / span) * (N - 1)));
+    buckets[i] += (r.tokens_out || 0);
+  });
+  const max = Math.max.apply(null, buckets) || 1;
+  const x = i => PAD + (i * (W - PAD * 2)) / (N - 1);
+  const y = v => H - PAD - (v / max) * (H - PAD * 2);
+  const line = buckets.map((v, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join(' ');
+  const area = line + ` L ${x(N - 1).toFixed(1)} ${H - PAD} L ${PAD} ${H - PAD} Z`;
+  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" ` +
+    `aria-label="tokens out over the selected period">` +
+    `<path class="usage-area" d="${area}"/>` +
+    `<path class="usage-line" d="${line}"/>` +
+    `<line class="usage-axis" x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}"/>` +
+    `<text class="usage-max" x="${PAD}" y="${PAD - 8}">${max.toLocaleString()} tokens out</text>` +
+    `</svg>`;
+}
+function usageWire(){
+  const chips = $('usagePeriods');
+  if (!chips) return;
+  chips.querySelectorAll('button[data-uperiod]').forEach(b => {
     b.onclick = () => { UsageState.period = b.dataset.uperiod; usageRefresh(); };
   });
 }
@@ -3628,6 +3669,9 @@ function upRender(){
   const list = $('upList');
   if (!list) return;
   const items = UpState.items;
+  const empty = $('upEmpty');
+  if (empty) empty.hidden = items.length > 0;   // picker is an empty-state
+  list.hidden = !items.length;
   $('upQueueHint').textContent = items.length
     ? items.length + ' in the queue — extracted one at a time'
     : '';
@@ -3664,7 +3708,7 @@ function upRender(){
 $('upRefresh').onclick = upLoad;
 $('upFiles').onchange = () => {
   const n = $('upFiles').files.length;
-  $('upPickText').textContent = n ? n + ' file(s) selected' : 'Choose PDF files…';
+  $('upPickText').textContent = n ? n + ' file(s) selected' : 'Add PDF files…';
 };
 $('upAdd').onclick = async () => {
   const files = Array.from($('upFiles').files || []);
@@ -3685,16 +3729,16 @@ $('upAdd').onclick = async () => {
     }catch(e){ toast(f.name + ': ' + e); }
   }
   $('upFiles').value = '';
-  $('upPickText').textContent = 'Choose PDF files…';
+  $('upPickText').textContent = 'Add PDF files…';
   if (ok) toast(ok + ' file(s) queued for ' + dest);
   await upLoad();
 };
 
 /* ── 5 · period stats — existing DB data only (Q4, criterion 11) ── */
-const StatsState = { period: 'all' };
+const StatsState = { period: '24h' };
 
 async function statsLoad(period){
-  StatsState.period = period || 'all';
+  StatsState.period = period || '24h';
   document.querySelectorAll('.ps-chip[data-period]').forEach(c =>
     c.classList.toggle('active', c.dataset.period === StatsState.period));
   const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
@@ -3722,21 +3766,16 @@ document.querySelectorAll('.ps-chip[data-period]').forEach(c => {
 function bootNewSurfaces(){
   if (!ProvState.loaded) loadPipeProviders();      // 9router shows up in the selector (bug d)
   upLoad();
-  statsLoad('all');
+  statsLoad('24h');
   if (CredState.loaded) credRouterSummary();
 }
 bootNewSurfaces();
 
-/* keep the 9router panel honest whenever credentials reload */
+/* keep the 9router section honest whenever credentials reload */
 const _loadCredentials = loadCredentials;
 loadCredentials = async function(){
   await _loadCredentials.apply(this, arguments);
   credRouterSummary();
-  const openGem = !document.querySelector('.cred-card[data-cred="gemini"]').hidden;
-  const openRt  = !document.querySelector('.cred-card[data-cred="router"]').hidden;
-  if (openGem) credRing('ringGemini', gemModels(), gemActiveModel());
-  if (openRt)  credRing('ringRouter', rtModels(), rtActiveModel());
-  if (openGem || openRt) usageRefresh();
 };
 
 /* Q2 — the built-in 9router is the only non-Gemini provider: the label and

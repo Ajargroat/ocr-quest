@@ -55,6 +55,26 @@ class MinimalThemeTests(unittest.TestCase):
             body = _rule(css, sel)
             self.assertIsNotNone(body, sel)
 
+    def test_light_theme_buttons_stay_legible(self):
+        """`--brand` is near-black in the light theme, so every rule that
+        paints text on it must flip to the off-white idiom (like
+        `.side-btn.active`). The run button also becomes a circle."""
+        css = _read("styles.css")
+        for sel in (':root[data-theme="light"] #runBtn',
+                    ':root[data-theme="light"] .btn.primary',
+                    ':root[data-theme="light"] .stage.active .hub',
+                    ':root[data-theme="light"] .stage .bubble',
+                    ':root[data-theme="light"] .ps-chip.active'):
+            body = _rule(css, sel)
+            self.assertIsNotNone(body, sel)
+            self.assertIn("#f4f5f7", body, sel)
+        dd = _rule(css, ':root[data-theme="light"] .dd.has-value .dd-btn')
+        self.assertIsNotNone(dd, "light dd selection colour")
+        self.assertIn("color:var(--text)", dd)
+        run = _rule(css, "#runBtn")
+        self.assertIsNotNone(run, "#runBtn")
+        self.assertIn("border-radius:50%", run)
+
 
 if __name__ == "__main__":
     unittest.main()

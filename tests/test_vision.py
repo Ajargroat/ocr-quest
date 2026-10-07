@@ -117,6 +117,18 @@ class CheckProviderTest(unittest.TestCase):
         self.assertFalse(v["ok"])
         self.assertIn("OCR_BASE_URL", v["detail"])
 
+    def test_check_provider_reports_latency_ms(self):
+        """Every return path carries a wall-clock `latency_ms` (>= 0) so the
+        dashboard's signal-bars ping never reads a missing field."""
+        self._use(Resp(200, json_body={"data": [{"id": "ocr-model"}]}))
+        v = vision.check_provider(make_cfg())
+        self.assertIn("latency_ms", v)
+        self.assertIsInstance(v["latency_ms"], float)
+        self.assertGreaterEqual(v["latency_ms"], 0.0)
+        self._use(exc=vision.requests.ConnectionError("refused"))
+        v = vision.check_provider(make_cfg())
+        self.assertIn("latency_ms", v)
+
 
 class ProviderLabelTest(unittest.TestCase):
     def test_loopback_urls_are_local(self):
