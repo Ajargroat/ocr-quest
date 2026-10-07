@@ -7,7 +7,7 @@ import time
 from contextlib import asynccontextmanager
 
 import requests as http_requests
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,6 +30,18 @@ cfg = load_config()
 db = Database(cfg)
 console = DataConsole(cfg, db)
 hub = Hub()
+
+
+def _router_usage_push(key, model, usage):
+    """Router callback: 0/20 bars update on EVERY call (criterion 10)."""
+    try:
+        hub.emit({"type": "usage", "key": mask_key(key),
+                  "model": model, "usage": usage})
+    except Exception:
+        pass
+
+
+router.on_usage = _router_usage_push
 
 
 async def _backup_loop():
@@ -58,10 +70,21 @@ async def lifespan(_app):
             "PROXY_PROFILES": json.dumps(list(seeded), ensure_ascii=False)})
         load_dotenv(ENV_PATH, override=True)
     backup_task = asyncio.create_task(_backup_loop())
+    if getattr(cfg, "converter_enabled", True):
+        from pipeline import converter
+        await asyncio.to_thread(converter.start, cfg)
+        print("[converter] embedded watcher started")
+    else:
+        print("[converter] disabled via CONVERTER_ENABLED=0")
     try:
         yield
     finally:
         backup_task.cancel()
+        try:
+            from pipeline import converter
+            converter.stop()
+        except Exception:
+            pass
     # Shutdown: wake every blocked WebSocket handler so uvicorn doesn't hang
     # waiting for connections to finish (which required a second Ctrl+C).
     for queue in list(hub.clients):
@@ -94,6 +117,90 @@ async def stop():
     stopping = hub.request_stop()
     return JSONResponse({"stopping": stopping},
                         status_code=200 if stopping else 409)
+
+
+# ════════════════ UPLOADS · in-app PDF queue (workstream B) ════════════════
+
+@app.post("/api/uploads")
+async def upload_pdf(file: UploadFile = File(...), dest: str = Form("")):
+    """Enqueue one PDF into the watched tree (criterion 2).
+
+    The file streams to disk chunked (never whole-file in RAM); the
+    embedded converter watcher extracts its pages and the normal
+    scanner/runner pipeline processes them — sequential by construction.
+    """
+    from pipeline import uploads
+    try:
+        item = await asyncio.to_thread(
+            uploads.enqueue, cfg, file.file,
+            file.filename or "upload.pdf", dest or "")
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": f"Cannot store upload: {exc}"},
+                            status_code=500)
+    hub.emit({"type": "upload", "id": item["id"], "status": "queued",
+              "filename": item["filename"], "dest": item["dest_rel"]})
+    return JSONResponse({"ok": True, **item})
+
+
+@app.get("/api/uploads")
+async def upload_list():
+    from pipeline import uploads
+    return JSONResponse({"items": uploads.list_items()})
+
+
+@app.post("/api/uploads/{uid}/cancel")
+async def upload_cancel(uid: str):
+    """Remove a pending upload / cancel a queued-or-failed one (Q9)."""
+    from pipeline import uploads
+    item = uploads.cancel(uid)
+    if item is None:
+        return JSONResponse({"ok": False, "error": "Unknown, in-flight or finished upload."},
+                            status_code=404)
+    hub.emit({"type": "upload", "id": uid, "status": "cancelled"})
+    return JSONResponse({"ok": True, **item})
+
+
+# ════════════════ STATS · pipeline period panel (criterion 11) ════════════════
+
+_STATS_CACHE = {"at": 0.0, "period": "", "payload": None}
+
+
+@app.get("/api/stats")
+async def period_stats(period: str = "all"):
+    """Period stats from data the DB already stores — no schema change (Q4).
+
+    Preset chips only (Q11): 24h | 7d | 30d | all. Cached 60s per period.
+    """
+    from datetime import date, timedelta
+    period = (period or "all").strip()
+    if period not in ("24h", "7d", "30d", "all"):
+        return JSONResponse({"ok": False, "error": "period must be 24h, 7d, 30d or all."},
+                            status_code=400)
+    now = time.time()
+    if _STATS_CACHE["payload"] is not None and _STATS_CACHE["period"] == period \
+            and now - _STATS_CACHE["at"] < 60:
+        return JSONResponse(_STATS_CACHE["payload"])
+    date_to = date.today().isoformat()
+    days = {"24h": 1, "7d": 7, "30d": 30}.get(period)
+    date_from = (date.today() - timedelta(days=days - 1)).isoformat() if days else None
+    try:
+        counts = await asyncio.to_thread(db.fetch_period_counts, date_from, date_to)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Stats unavailable: {exc}"},
+                            status_code=502)
+    payload = {"ok": True, "period": period, **counts}
+    _STATS_CACHE.update({"at": now, "period": period, "payload": payload})
+    return JSONResponse(payload)
+
+
+@app.get("/api/usage")
+async def usage_report(period: str = "all"):
+    """Per-call usage history for the credentials reports (Q4/Q11)."""
+    report = router.usage_report(period if period in ("24h", "7d", "30d", "all") else "all")
+    report["ok"] = True
+    return JSONResponse(report)
 
 class StatusUpdate(BaseModel):
     table: str
@@ -421,13 +528,30 @@ def _merge_providers(stored, incoming):
         out.append({"label": label,
                     "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
                     "api_key": key,
-                    "model": str(raw.get("model", "")).strip()})
+                    "model": str(raw.get("model", "")).strip(),
+                    "models": list(raw.get("models") or []) if isinstance(raw.get("models"), list) else []})
     seen, dedup = set(), []
     for p in out:
         if p["label"] not in seen:
             seen.add(p["label"])
             dedup.append(p)
-    return tuple(dedup)
+    # Q2: the generic custom-provider kind is deleted — only the built-in
+    # 9router entry (fixed loopback URL) survives the save; every other
+    # custom entry is discarded by design. Matches the load-time
+    # _migrate_ninerouter() coercion in pipeline/config.py.
+    kept = ()
+    for p in dedup:
+        url = p.get("base_url") or ""
+        if ("127.0.0.1:20128" in url or "localhost:20128" in url
+                or p.get("label") == "9router"):
+            if not kept:
+                p["label"] = "9router"
+                p["base_url"] = "http://127.0.0.1:20128/v1"
+                kept = (p,)
+        else:
+            print(f"[credentials] dropping non-9router provider "
+                  f"'{p.get('label', '')}' ({url}) - custom kind removed (Q2)")
+    return kept
 
 
 def _provider_view(p: dict) -> dict:
@@ -689,7 +813,7 @@ async def credentials_test(body: ProviderTest):
 
     This is deliberately NOT /api/credentials/check/provider — that one is
     a free metadata listing and can never show a reply. Exactly one
-    generateContent pong for the Gemini pool, or one tiny chat completion
+    generateContent ping for the Gemini pool, or one tiny chat completion
     for a custom provider (Gemini keys and custom providers alike)."""
     started = time.monotonic()
     if not (body.base_url or "").strip():
@@ -703,7 +827,7 @@ async def credentials_test(body: ProviderTest):
 
         def _one():
             return gemini_mod.call_gemini(
-                pool[0], model, 'Reply with exactly: {"pong": true}', "",
+                pool[0], model, 'Reply with exactly: {"ping": true}', "",
                 "text/plain", max_tokens=16, retries=1)
         try:
             parsed, _raw = await asyncio.to_thread(_one)
@@ -829,6 +953,6 @@ async def review_bbox(body: BboxUpdate):
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Konkour OCR dashboard → http://localhost:{cfg.port}")
+    print(f"Konkour OCR dashboard -> http://localhost:{cfg.port}")
     uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning",
                 timeout_graceful_shutdown=3)

@@ -46,6 +46,40 @@ class Database:
     def ping(self):
         self._execute("SELECT 1")
 
+    def fetch_period_counts(self, date_from=None, date_to=None):
+        """Pipeline period stats from data the DB already stores (Q4).
+
+        No schema change: counts over created_at on questions/answers plus
+        the live sources total. date_from/date_to are ISO date strings or
+        None (all-time). Returns {questions, answers, errors, files}.
+        "errors" counts rows flagged 'rejected' in review; "files" is the
+        sources total (the run's file unit).
+        """
+        def _count(table, extra="", params=()):
+            sql = f"SELECT COUNT(*) FROM public.{table} WHERE 1=1"
+            args = list(params)
+            if date_from:
+                sql += f" AND created_at::date >= %s::date"
+                args.append(str(date_from))
+            if date_to:
+                sql += f" AND created_at::date <= %s::date"
+                args.append(str(date_to))
+            if extra:
+                sql += " " + extra
+            try:
+                rows = self._execute(sql, tuple(args), fetch=True) or [(0,)]
+            except Exception:
+                return 0
+            return int(rows[0][0] or 0)
+
+        questions = _count("questions")
+        answers = _count("answers")
+        errors = _count("questions", "AND review_status = 'rejected'")
+        files = _count("sources")
+        return {"questions": questions, "answers": answers,
+                "errors": errors, "files": files, "total": files,
+                "succeeded": questions + answers}
+
     # ── sources ────────────────────────────────────────────────────
     def upsert_source(self, item: SourceItem, storage_url: str):
         sql = """

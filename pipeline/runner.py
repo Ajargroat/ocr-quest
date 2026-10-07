@@ -31,12 +31,44 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
     never rides the proxy lane (gemini.proxy_proxies only scopes
     Google-bound calls)."""
     if cfg is not None and (cfg.ocr_provider or "gemini").lower() != "gemini":
-        return call_ocr_openai(cfg, prompt, data_b64, mime_type,
-                               on_problem=on_problem, on_route=on_route)
+        # Custom lane (the built-in 9router, Q2): time the call and record
+        # it into the same per-call JSON history the usage reports read —
+        # Gemini rows are recorded by router._count_send, so this lane must
+        # record its own (criterion 6 covers both sections).
+        started = time.monotonic()
+        parsed = call_ocr_openai(cfg, prompt, data_b64, mime_type,
+                                 on_problem=on_problem, on_route=on_route)
+        try:
+            router._calls_append(
+                getattr(cfg, "ocr_api_key", "") or "",
+                getattr(cfg, "ocr_model", "") or "default",
+                ms=(time.monotonic() - started) * 1000.0,
+                key_name="9router", ok=True)
+        except Exception:
+            pass
+        return parsed
     parsed, _raw, _route = router.call(
         cfg, prompt, data_b64, mime_type,
         on_problem=on_problem, on_route=on_route)
     return parsed
+
+
+def _sleep_or_stop(hub, seconds):
+    """Sleep that wakes early when the stop button is pressed (criterion 10).
+
+    A plain time.sleep(wait) ignores Stop until the next file; chunked
+    waits make the button land mid-wait instead. Returns True when the
+    full wait elapsed, False when stop was requested. A single in-flight
+    HTTP request still cannot abort mid-socket (U2) — stop lands between
+    phases and retries.
+    """
+    end = time.monotonic() + max(0.0, seconds)
+    while True:
+        if hub.stop_flag.is_set():
+            return False
+        if end - time.monotonic() <= 0:
+            return True
+        time.sleep(min(0.5, end - time.monotonic()))
 
 
 class Hub:
@@ -320,6 +352,11 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
         route = f" [{where}]" if where else ""
         log("warn", f"  ↳ {flt['emoji']} {flt['label']}{route} · attempt {attempt}/{tries} "
                     f"failed — retrying in {int(wait)}s", flt["kind"])
+        # Q8 countdown: the UI counts down the exact slept value, so the
+        # stated wait always matches the actual wait by construction.
+        hub.emit({"type": "wait", "until": time.time() + wait,
+                  "total": wait, "attempt": attempt, "tries": tries,
+                  "where": where})
 
     def on_route(label, masked, model, attempt):
         if attempt > 1:   # first try is the planned path — no news
@@ -336,6 +373,22 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
 
     # Steps that failed their retries and were parked for the end-of-run import.
     parked_steps = []
+
+    class _Stopped(Exception):
+        pass
+
+    def check_stop(where=""):
+        """Stop between upload→OCR→save→archive phases (criterion 10).
+
+        A run stuck inside the blocking gemini-ocr call still cannot abort
+        mid-socket (U2) — but every phase boundary now honours the button,
+        and retry sleeps wake early via _sleep_or_stop.
+        """
+        if hub.stop_flag.is_set():
+            log("warn", f"Stop requested — halting during {where or 'processing'}; "
+                        f"file {index}/{total} stays for the next run.")
+            file_event("queued", "Stop requested")
+            raise _Stopped()
 
     def try_db(op_step, apply_now, where):
         """One Postgres write with growing retries; parks it in the cache and
@@ -355,9 +408,10 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
                 last = getattr(exc, "fault", None) or faults.classify(exc)
                 last["raw"] = last.get("raw") or str(exc)[:400]
                 if attempt < retries:
-                    wait = base * attempt
+                    wait = faults.backoff_wait(attempt, base)
                     on_problem(last, attempt, retries, wait, where=where)
-                    time.sleep(wait)
+                    if not _sleep_or_stop(hub, wait):
+                        return False
             else:
                 return True
         last = last or faults.fault("unknown")
@@ -385,6 +439,7 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
         file_event("uploading", "Uploading to Supabase Storage")
         storage_url = upload_file(cfg, item.source_id, raw, item.mime_type,
                                   on_problem=on_problem)
+        check_stop("Supabase upload")
 
         # 2) Upsert the sources row.
         phase = "source upsert"
@@ -397,8 +452,10 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
             # ---------- QUESTION BRANCH ----------
             phase = "OCR"
             file_event("ocr", f"{ocr_label} is extracting questions")
+            check_stop("source upsert")
             parsed = _call_ocr(cfg, QUESTION_PROMPT, data_b64, item.mime_type,
                                on_problem=on_problem, on_route=on_route)
+            check_stop("gemini-ocr")
             rows = build_question_rows(item, parsed, storage_url)
             if rows:
                 phase = "Postgres save"
@@ -418,8 +475,10 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
 
             phase = "OCR"
             file_event("ocr", f"{ocr_label} is extracting answers")
+            check_stop("DB context read")
             parsed = _call_ocr(cfg, prompt, data_b64, item.mime_type,
                                on_problem=on_problem, on_route=on_route)
+            check_stop("gemini-ocr")
 
             prepared = prepare_answer_rows(parsed)
             rows = finalize_answer_rows(item, prepared, candidates)
@@ -437,6 +496,7 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
         # parked writes is archived too: the Gemini result is safe on disk in
         # the cache, so re-running OCR for it would only burn quota.
         phase = "archiving to done/"
+        check_stop("Postgres save")
         _move_to_done(item.file_path)
         if parked_steps:
             deferrals.park(parked_steps, item=item)
@@ -449,6 +509,9 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
         bump("processed")
         return "clean"
 
+    except _Stopped:
+        # A manual stop is not an error: the file stays for the next run.
+        return "failed"
     except Exception as exc:
         bump("errors")
         flt = getattr(exc, "fault", None) or faults.classify(exc)

@@ -53,7 +53,7 @@ Main groups:
 
 | Group | Keys | Notes |
 |-------|------|-------|
-| Input tree | `INPUT_ROOT`¹, `MIN_AGE_SECONDS` | watched folder root, defaults to `./konkour-ocr` |
+| Input tree | `INPUT_ROOT`¹, `MIN_AGE_SECONDS` (default 30 s maturity wait) | watched folder root, defaults to `./konkour-ocr` |
 | Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD/SSLMODE`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set; blank `SSLMODE` keeps the driver default |
 | Gemini | `GEMINI_API_KEY`, `GEMINI_API_KEY_QUESTIONS/ANSWERS`, `GEMINI_MODEL_QUESTIONS/ANSWERS` | per-lane keys and models |
 | Router | `ROUTER_BASE_URL/API_KEY/MODEL` | optional OpenAI-compatible front for Gemini |
@@ -61,7 +61,7 @@ Main groups:
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |
-| Converter | `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_JPEG_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | also read by `docker-compose.converter.yml` |
+| Converter | `CONVERTER_ENABLED`, `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | the watcher runs inside the app (no Docker); `CONVERTER_ENABLED=0` turns it off; every page JPEG is capped at 200 KB by re-encoding at a lower quality (DPI is never lowered) |
 | Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | |
 
 ¹ `INPUT_ROOT` is read from the environment but not listed in `.env.example`; the
@@ -79,14 +79,21 @@ konkour-ocr/
 The grade level is optional. Processed sources move to `done/` (failures to
 `failed/`) and are skipped by later scans.
 
-## PDF converter (optional)
+## PDF converter (embedded, no Docker)
 
-```bash
-docker compose -f docker-compose.converter.yml up -d --build
-```
+The PDF→JPEG converter is a background watcher inside the FastAPI app
+(`pipeline/converter.py`): it starts with the server, honours
+`MIN_AGE_SECONDS` so scans never race a live run, and can be switched off
+with `CONVERTER_ENABLED=0`. Tune it with `CONVERTER_*` in `.env`. The old
+`converter/Dockerfile` + `converter/watch.sh` (and
+`docker-compose.converter.yml`) are retired — Docker is no longer required.
 
-See [converter/README.md](converter/README.md) for the folder flow and tuning
-notes. Keep `MIN_AGE_SECONDS` at its default so scans don't race the converter.
+PDFs can also be pushed in from the dashboard: **Upload PDFs** on the
+pipeline page queues files with a `konkour-ocr/{subject}/{grade}/{topic}/
+{question|answer}` destination, extracts them one at a time, and lets you
+cancel or remove queued/failed entries.
+
+Keep `MIN_AGE_SECONDS` at its default (30 s) so scans don't race the converter.
 
 ## Tests
 
@@ -94,23 +101,25 @@ notes. Keep `MIN_AGE_SECONDS` at its default so scans don't race the converter.
 .venv/Scripts/python -m unittest discover -s tests
 ```
 
-166 tests, no network or database access required (DB-dependent paths are
+207 tests, no network or database access required (DB-dependent paths are
 stubbed or skipped).
 
 ## Project layout
 
 ```text
 main.py            FastAPI app, WebSocket hub, dashboard endpoints
-pipeline/          config, scanner, db, gemini, runner, deferrals,
-                   dataconsole, backups, revision/ (audit, polish, batch, …)
+pipeline/          config, scanner, db, gemini, gemini_router, runner,
+                   converter (embedded PDF watcher), uploads (queue),
+                   deferrals, dataconsole, backups, revision/ (audit, …)
 ui/                dashboard front-end (static, served by main.py)
-converter/         Docker PDF→JPEG watcher
 tests/             unittest suite
 tools/ocr.ps1     PowerShell controller (ocr start/stop/status/open)
 ```
 
 ## Local state (intentionally not committed)
 
-`.env`, `backups/`, `.gemini-usage.json`, `.pending-deferrals.json*`,
-`.venv/`, and `__pycache__/` are git-ignored. The pending-deferrals file is a
-write-cache replayed into Postgres at the start of the next run.
+`.env`, `backups/`, `.gemini-usage.json`, `.gemini-calls.json`,
+`.pending-deferrals.json*`, `.venv/`, and `__pycache__/` are git-ignored. The
+pending-deferrals file is a write-cache replayed into Postgres at the start of
+the next run; `.gemini-calls.json` is the per-call usage history behind the
+credentials usage reports (tokens, latency, masked key per send).

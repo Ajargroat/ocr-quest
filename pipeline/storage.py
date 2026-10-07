@@ -19,7 +19,7 @@ def upload_file(cfg: Config, object_name: str, data: bytes, mime_type: str,
     """
     if retries is None:
         retries = max(1, int(os.getenv("NET_RETRIES", "3")))
-    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "8")))
+    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
     url = f"{cfg.supabase_url}/storage/v1/object/{cfg.supabase_bucket}/{object_name}"
     headers = {
         "apikey": cfg.supabase_key,
@@ -49,7 +49,7 @@ def upload_file(cfg: Config, object_name: str, data: bytes, mime_type: str,
             raise faults.FaultError(
                 last, f"{last['label']} — {last['hint']} · {last['raw'][:200]}")
         if attempt < retries:
-            wait = base_wait * attempt
+            wait = faults.backoff_wait(attempt, base_wait)
             if on_problem:
                 on_problem(last, attempt, retries, wait)
             time.sleep(wait)

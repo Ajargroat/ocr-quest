@@ -60,7 +60,7 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
     back-off sleep so the caller can log tunnel hiccups live."""
     if retries is None:
         retries = max(1, int(os.getenv("NET_RETRIES", "3")))
-    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "8")))
+    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
     parts = [{"text": prompt}]
     if data_b64:
         # Empty payload = a text-only call (the cheapest possible probe).
@@ -93,7 +93,7 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
             raise faults.FaultError(
                 last, f"{last['label']} — {last['hint']} · {last['raw'][:200]}")
         if attempt < retries:
-            wait = base_wait * attempt
+            wait = faults.backoff_wait(attempt, base_wait)
             if on_problem:
                 on_problem(last, attempt, retries, wait)
             time.sleep(wait)

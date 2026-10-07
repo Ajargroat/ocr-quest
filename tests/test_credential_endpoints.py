@@ -66,23 +66,30 @@ class EndpointCase(unittest.TestCase):
 
 class CredentialsSaveTest(EndpointCase):
     def test_provider_list_round_trips_and_masks_the_key(self):
+        # Q2: one built-in 9router per section (fixed loopback URL, own
+        # key + model list); the URL is pinned no matter which loopback
+        # spelling the client sent.
         res = self.client().post("/api/credentials", json={
             **self.base(),
             "extraction_providers": [
                 {"label": "9router", "base_url": "http://localhost:20128/v1",
-                 "api_key": "sk-secret-123", "model": "qwen2.5-vl"}],
+                 "api_key": "sk-secret-123", "model": "qwen2.5-vl",
+                 "models": ["qwen2.5-vl", "qwen3-vl"]}],
             "extraction_active": "9router",
             "revision_providers": [
-                {"label": "rev", "base_url": "http://localhost:20128/v1",
-                 "api_key": "sk-rev-456", "model": "OCR-Quest"}],
-            "revision_active": "rev",
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
+                 "api_key": "sk-rev-456", "model": "OCR-Quest",
+                 "models": ["OCR-Quest"]}],
+            "revision_active": "9router",
         })
         self.assertEqual(res.status_code, 200, res.text)
         body = res.json()
         self.assertTrue(body["saved"])
         self.assertEqual(body["extraction_active"], "9router")
+        self.assertEqual(len(body["extraction_providers"]), 1)
         p = body["extraction_providers"][0]
         self.assertEqual(p["label"], "9router")
+        self.assertEqual(p["base_url"], "http://127.0.0.1:20128/v1")
         self.assertTrue(p["api_key_set"])
         # the raw secret never appears in the API view …
         self.assertNotIn("sk-secret-123", json.dumps(body))
@@ -90,52 +97,87 @@ class CredentialsSaveTest(EndpointCase):
         # … but really round-trips into the temp .env as JSON
         stored = json.loads(os.environ["EXTRACTION_PROVIDERS"])
         self.assertEqual(stored[0]["api_key"], "sk-secret-123")
+        self.assertEqual(stored[0]["models"], ["qwen2.5-vl", "qwen3-vl"])
         self.assertEqual(os.environ["EXTRACTION_ACTIVE"], "9router")
         rev = json.loads(os.environ["REVISION_PROVIDERS"])
         self.assertEqual(rev[0]["api_key"], "sk-rev-456")
-        self.assertEqual(os.environ["REVISION_ACTIVE"], "rev")
+        self.assertEqual(os.environ["REVISION_ACTIVE"], "9router")
         # GET (the load path) agrees, still masked
         view = self.client().get("/api/credentials").json()
         self.assertEqual(len(view["extraction_providers"]), 1)
         self.assertTrue(view["extraction_providers"][0]["api_key_set"])
         self.assertNotIn("sk-secret-123", json.dumps(view))
 
+    def test_non_9router_entries_are_discarded(self):
+        # Q2: the generic custom-provider kind is deleted — anything that
+        # is not the 9router loopback entry is dropped on save.
+        res = self.client().post("/api/credentials", json={
+            **self.base(),
+            "extraction_providers": [
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
+                 "api_key": "sk-keep", "model": "m"},
+                {"label": "other", "base_url": "https://other.example/v1",
+                 "api_key": "sk-drop", "model": "m2"}],
+            "extraction_active": "9router"})
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertEqual([p["label"] for p in body["extraction_providers"]],
+                         ["9router"])
+        stored = json.loads(os.environ["EXTRACTION_PROVIDERS"])
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0]["api_key"], "sk-keep")
+        self.assertNotIn("sk-drop", os.environ["EXTRACTION_PROVIDERS"])
+
+    def test_stale_active_label_self_heals_to_the_kept_entry(self):
+        # A stored *_ACTIVE label whose entry migration dropped (e.g. the
+        # old legacy "default") resolves to the kept entry instead of
+        # dangling — saves keep working after the Q2 upgrade.
+        os.environ["EXTRACTION_PROVIDERS"] = json.dumps([{
+            "label": "legacy", "base_url": "https://old.example/v1",
+            "api_key": "sk-old", "model": "m"}])
+        os.environ["EXTRACTION_ACTIVE"] = "legacy"
+        main.cfg = main.load_config()
+        self.assertEqual(main.cfg.extraction_providers, ())
+        self.assertEqual(main.cfg.extraction_active, "")
+        self.assertEqual(main.cfg.ocr_provider, "gemini")
+
     def test_adding_a_provider_appends_and_the_sections_stay_independent(self):
+        # Q2: one built-in 9router per section — the sections stay
+        # independent, and a KEEP re-save preserves the secret.
         c = self.client()
         r1 = c.post("/api/credentials", json={
             **self.base(),
             "extraction_providers": [
-                {"label": "A", "base_url": "http://a/v1",
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
                  "api_key": "sk-aaa", "model": "m-a"}],
-            "extraction_active": "A"})
+            "extraction_active": "9router"})
         self.assertEqual(r1.status_code, 200, r1.text)
-        # second save: A kept (KEEP sentinel at its position), B appended,
-        # revision gets its own one-entry list — the two never mix.
+        # second save: 9router kept (KEEP sentinel), revision gets its own
+        # 9router entry with a different key — the two never mix.
         r2 = c.post("/api/credentials", json={
             **self.base(),
             "extraction_providers": [
-                {"label": "A", "base_url": "http://a/v1",
-                 "api_key": KEEP, "model": "m-a"},
-                {"label": "B", "base_url": "http://b/v1",
-                 "api_key": "sk-bbb", "model": "m-b"}],
-            "extraction_active": "B",
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
+                 "api_key": KEEP, "model": "m-a2"}],
+            "extraction_active": "9router",
             "revision_providers": [
-                {"label": "R", "base_url": "http://r/v1",
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
                  "api_key": "sk-rrr", "model": "m-r"}],
-            "revision_active": "R"})
+            "revision_active": "9router"})
         self.assertEqual(r2.status_code, 200, r2.text)
         ext = json.loads(os.environ["EXTRACTION_PROVIDERS"])
-        self.assertEqual([p["label"] for p in ext], ["A", "B"])
+        self.assertEqual([p["label"] for p in ext], ["9router"])
         self.assertEqual(ext[0]["api_key"], "sk-aaa")     # KEEP kept the secret
-        self.assertEqual(ext[1]["api_key"], "sk-bbb")
-        self.assertEqual(os.environ["EXTRACTION_ACTIVE"], "B")
+        self.assertEqual(ext[0]["model"], "m-a2")
+        self.assertEqual(os.environ["EXTRACTION_ACTIVE"], "9router")
         rev = json.loads(os.environ["REVISION_PROVIDERS"])
-        self.assertEqual([p["label"] for p in rev], ["R"])
+        self.assertEqual([p["label"] for p in rev], ["9router"])
+        self.assertEqual(rev[0]["api_key"], "sk-rrr")
         view = c.get("/api/credentials").json()
         self.assertEqual([p["label"] for p in view["extraction_providers"]],
-                         ["A", "B"])
+                         ["9router"])
         self.assertEqual([p["label"] for p in view["revision_providers"]],
-                         ["R"])
+                         ["9router"])
 
     def test_postgres_fields_persist_across_reload(self):
         res = self.client().post("/api/credentials", json={
@@ -165,22 +207,69 @@ class CredentialsSaveTest(EndpointCase):
         res = self.client().post("/api/credentials", json={
             **self.base(),
             "extraction_providers": [
-                {"label": "A", "base_url": "http://a/v1",
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
                  "api_key": "sk", "model": "m"}],
             "extraction_active": "ghost"})
         self.assertEqual(res.status_code, 400, res.text)
 
+    def test_omitting_gemini_keys_is_a_wipe_not_a_keep(self):
+        """WHY the pipeline-tab selector resends every stored key as a
+        KEEP sentinel: a body without gemini_keys blanks
+        GEMINI_API_KEYS — there is no empty-list-means-keep fallback."""
+        os.environ["GEMINI_API_KEYS"] = "AIzaKeepMe"
+        main.cfg = main.load_config()
+        self.assertEqual(main.cfg.gemini_key_pool, ("AIzaKeepMe",))
+        res = self.client().post("/api/credentials", json={
+            **self.base(),                      # gemini_keys: []
+            "extraction_providers": [
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
+                 "api_key": "sk-aaa", "model": "m"}],
+            "extraction_active": "9router"})
+        self.assertEqual(res.status_code, 200, res.text)
+        # the wipe the design must avoid — documented, not hidden
+        self.assertEqual(os.environ["GEMINI_API_KEYS"], "")
+        self.assertEqual(main.cfg.gemini_key_pool, ())
+
+    def test_keep_sentinels_and_the_ladder_survive_a_selection_change(self):
+        """The payload the toolbar actually sends: every stored key as
+        __KEEP__:<i>, the ladder, and only extraction_active changed."""
+        c = self.client()
+        r1 = c.post("/api/credentials", json={
+            "gemini_keys": ["AIzaKeepMe"], "gemini_names": ["main"],
+            "model_ladder": ["gemini-3.5-flash"],
+            "extraction_providers": [
+                {"label": "9router", "base_url": "http://127.0.0.1:20128",
+                 "api_key": "sk-aaa", "model": "m"}],
+            "extraction_active": "9router"})
+        self.assertEqual(r1.status_code, 200, r1.text)
+        self.assertEqual(os.environ["GEMINI_API_KEYS"], "AIzaKeepMe")
+        r2 = c.post("/api/credentials", json={
+            "gemini_keys": [KEEP + ":0"], "gemini_names": ["main"],
+            "model_ladder": ["gemini-3.5-flash"],
+            "extraction_active": ""})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(os.environ["EXTRACTION_ACTIVE"], "")
+        self.assertEqual(os.environ["GEMINI_API_KEYS"], "AIzaKeepMe")
+        self.assertEqual(main.cfg.gemini_key_pool, ("AIzaKeepMe",))
+        self.assertEqual(main.cfg.ocr_provider, "gemini")
+        # omitted lists are kept, not cleared
+        self.assertEqual(json.loads(os.environ["EXTRACTION_PROVIDERS"])[0]["api_key"], "sk-aaa")
+        self.assertEqual(list(main.cfg.gemini_model_ladder), ["gemini-3.5-flash"])
+        # the view the toolbar builds its payload from carries the keys
+        view = c.get("/api/credentials").json()
+        self.assertEqual(len(view["keys"]), 1)
+
 
 class ChatTestEndpoint(EndpointCase):
     def test_chat_endpoint_returns_snippet_and_latency(self):
-        main.vision.test_chat = lambda *a, **k: ("pong", 12.5)
+        main.vision.test_chat = lambda *a, **k: ("ping", 12.5)
         res = self.client().post("/api/credentials/test", json={
             "section": "extraction", "base_url": "http://localhost:20128/v1",
             "api_key": "sk", "model": "qwen2.5-vl"})
         self.assertEqual(res.status_code, 200, res.text)
         d = res.json()
         self.assertTrue(d["ok"])
-        self.assertEqual(d["snippet"], "pong")
+        self.assertEqual(d["snippet"], "ping")
         self.assertEqual(d["model"], "qwen2.5-vl")
         self.assertIsInstance(d["latency_ms"], float)
 
@@ -220,7 +309,7 @@ class ChatTestEndpoint(EndpointCase):
         self.assertTrue(d["ok"])
         self.assertEqual(d["model"], "gemini-test-flash")
         self.assertEqual(called.get("model"), "gemini-test-flash")
-        self.assertEqual(called.get("prompt"), 'Reply with exactly: {"pong": true}')
+        self.assertEqual(called.get("prompt"), 'Reply with exactly: {"ping": true}')
 
     def test_gemini_test_without_a_key_is_a_clean_400(self):
         res = self.client().post("/api/credentials/test",

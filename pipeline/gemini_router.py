@@ -46,7 +46,7 @@ import json
 import os
 import threading
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 
 from . import faults
 from .gemini import call_gemini, gateway_probe, list_models
@@ -90,6 +90,30 @@ LATENCY_WINDOW = 1.2
 USAGE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     ".gemini-usage.json")
+# Per-call history beside the usage gauge (Q4: no schema change). Local-only,
+# never committed — feeds the credentials usage reports + period stats.
+# Derived from USAGE_PATH at call time (not import time) so tests that
+# redirect USAGE_PATH to a tmp dir automatically isolate history too.
+CALLS_PATH = os.path.join(os.path.dirname(USAGE_PATH), ".gemini-calls.json")
+
+
+def _calls_path():
+    return os.path.join(os.path.dirname(USAGE_PATH), ".gemini-calls.json")
+# History growth bound: oldest entries are dropped past this.
+CALLS_CAP = 20000
+# Preset report windows (Q11) in hours; "all" means no cutoff.
+PERIOD_HOURS = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30}
+
+
+def _next_utc_midnight_ts(now=None):
+    """Epoch seconds of the next UTC midnight — the quota refill moment (Q7).
+
+    A free-quota-exhausted model is parked until exactly then (Q6), never
+    retried the same day, so one exhausted model cannot chain errors."""
+    now = now if now is not None else time.time()
+    day = datetime.fromtimestamp(now, timezone.utc).date()
+    midnight = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+    return midnight.timestamp() + 24 * 3600
 
 # Faults that mean "this key/pair is the problem" → rotate.
 ROTATE_KINDS = {"bad_key", "quota", "rate_limit", "model_unavailable"}
@@ -178,7 +202,9 @@ class GeminiRouter:
 
     # ------------------------------------------------------ daily send count
     def _today(self):
-        return date.today().isoformat()
+        # UTC midnight tracks Google's quota refill exactly (Q7) — never the
+        # server's local date, and never reset by refresh or errors.
+        return datetime.now(timezone.utc).date().isoformat()
 
     def _key_hash(self, key):
         """Identity for the usage file — a hash, never the secret itself."""
@@ -220,12 +246,14 @@ class GeminiRouter:
         except OSError:
             pass          # counters are a gauge, never worth breaking a run
 
-    def _count_send(self, key, model):
+    def _count_send(self, key, model, tokens_in=0, tokens_out=0,
+                     ms=0.0, key_name="", ok=True):
         """Record one COMPLETED (successful) send for today.
 
         Failures never touch this gauge — it counts calls that actually
         finished, so it can never read N/N for a key that did not
-        complete N."""
+        complete N. Every completed call is also appended to the local
+        per-call history (CALLS_PATH) backing the usage reports (Q4)."""
         self._usage_load()
         with self._lock:
             today = self._today()
@@ -234,6 +262,61 @@ class GeminiRouter:
             per = self._usage.setdefault(self._key_hash(key), {})
             per[model] = per.get(model, 0) + 1
             self._usage_save()
+        self._calls_append(key, model, tokens_in=tokens_in,
+                           tokens_out=tokens_out, ms=ms,
+                           key_name=key_name, ok=ok)
+
+    def _calls_load(self):
+        """Per-call history rows (newest last), tolerant of corruption."""
+        try:
+            with open(_calls_path(), encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _calls_append(self, key, model, tokens_in=0, tokens_out=0,
+                      ms=0.0, key_name="", ok=True):
+        """Append one history row atomically; failures are swallowed
+        (history is a gauge, never worth breaking a run)."""
+        try:
+            rows = self._calls_load()
+            rows.append({
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+                "ts": time.time(),
+                "key_hash": self._key_hash(key),
+                "key_name": key_name,
+                "key_masked": mask(key),
+                "model": model,
+                "tokens_in": int(tokens_in or 0),
+                "tokens_out": int(tokens_out or 0),
+                "ms": round(float(ms or 0.0), 1),
+                "ok": bool(ok),
+            })
+            del rows[:-CALLS_CAP]
+            path = _calls_path()
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def usage_report(self, period="all"):
+        """Per-call rows filtered to 24h/7d/30d/all-time chips (Q11).
+
+        Returns {"period":…, "calls":[…], "totals": {calls, tokens_in,
+        tokens_out, ms}}. Unknown periods fall back to all-time."""
+        hours = PERIOD_HOURS.get(period)
+        rows = self._calls_load()
+        if hours is not None:
+            cutoff = time.time() - hours * 3600
+            rows = [r for r in rows if r.get("ts", 0) >= cutoff]
+        totals = {"calls": len(rows),
+                  "tokens_in": sum(r.get("tokens_in", 0) for r in rows),
+                  "tokens_out": sum(r.get("tokens_out", 0) for r in rows),
+                  "ms": round(sum(r.get("ms", 0.0) for r in rows), 1)}
+        return {"period": period, "calls": rows, "totals": totals}
 
     def _usage_of(self, key):
         self._usage_load()
@@ -327,9 +410,15 @@ class GeminiRouter:
             st["last_fault"] = kind
             st["probes"] += 1
             if model:
-                st["blocked"][model] = now + KEY_COOLDOWN.get(
-                    kind, MODEL_COOLDOWN if kind == "model_unavailable"
-                    else RATE_LIMIT_COOLDOWN)
+                if kind == "quota":
+                    # Q6: a free-quota-exhausted model is NOT retried until
+                    # the next UTC midnight reset — skip the rest of the day
+                    # instead of chaining errors every KEY_COOLDOWN["quota"].
+                    st["blocked"][model] = _next_utc_midnight_ts(now)
+                else:
+                    st["blocked"][model] = now + KEY_COOLDOWN.get(
+                        kind, MODEL_COOLDOWN if kind == "model_unavailable"
+                        else RATE_LIMIT_COOLDOWN)
                 st["penalty_until"] = now + PENALTY_WINDOW
             elif kind == "rate_limit":
                 st["dead"] = True
@@ -357,7 +446,17 @@ class GeminiRouter:
                 st["latency"] = (LATENCY_ALPHA * elapsed_ms
                                  + (1.0 - LATENCY_ALPHA) * old) \
                     if old else elapsed_ms
-        self._count_send(key, model)
+        self._count_send(key, model, ms=elapsed_ms or 0.0)
+        # Criterion 10: the 0/20 bars update on EVERY call, not just
+        # health-checks. main.py sets router.on_usage to a hub.emit
+        # closure; the router itself stays UI-agnostic (no hub import,
+        # which would be circular — runner imports this module).
+        emit_usage = getattr(self, "on_usage", None)
+        if emit_usage is not None:
+            try:
+                emit_usage(key, model, self._usage_of(key))
+            except Exception:
+                pass
 
     # ---------------------------------------------------------- main call
     def call(self, cfg, prompt, data_b64, mime_type,

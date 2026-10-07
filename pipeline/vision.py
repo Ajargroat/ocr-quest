@@ -72,7 +72,7 @@ def call_ocr_openai(cfg, prompt, data_b64, mime_type,
     endpoint, so a route event always means "retrying this one"."""
     if retries is None:
         retries = max(1, int(os.getenv("NET_RETRIES", "3")))
-    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "8")))
+    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
     url = cfg.ocr_base_url.rstrip("/") + "/chat/completions"
     content = [{"type": "text", "text": prompt}]
     if data_b64:
@@ -121,7 +121,7 @@ def call_ocr_openai(cfg, prompt, data_b64, mime_type,
             raise faults.FaultError(
                 last, f"{last['label']} — {last['hint']} · {last['raw'][:200]}")
         if attempt < retries:
-            wait = base_wait * attempt
+            wait = faults.backoff_wait(attempt, base_wait)
             if on_route:
                 on_route(provider_label(cfg), "", cfg.ocr_model, attempt)
             if on_problem:
@@ -193,7 +193,7 @@ def test_chat(base_url, api_key, model, timeout=(8, 40)):
             json={"model": model, "stream": False, "temperature": 0,
                   "max_tokens": 24,
                   "messages": [{"role": "user",
-                                "content": "Reply with exactly: pong"}]},
+                                "content": "Reply with exactly: ping"}]},
             headers=({"Content-Type": "application/json",
                       "Authorization": "Bearer " + api_key} if api_key
                      else {"Content-Type": "application/json"}),

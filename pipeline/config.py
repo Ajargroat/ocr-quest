@@ -115,6 +115,39 @@ def _resolve(providers, active):
     return {}
 
 
+# The ONE built-in non-Gemini provider (Q2): fixed loopback URL, editable
+# API key, own model list for the model ring. The generic custom-provider
+# kind is deleted — anything stored that is not this entry is discarded.
+NINEROUTER_URL = "http://127.0.0.1:20128/v1"
+
+
+def _migrate_ninerouter(stored):
+    """Coerce one section's stored providers to the single 9router entry.
+
+    Keeps the stored entry that already points at the 9router loopback
+    service (either loopback spelling, or labelled 9router) with the URL
+    pinned to NINEROUTER_URL; every other custom entry is dropped by
+    design (Q2) and named on stdout so the loss is visible, not silent.
+    """
+    kept = {}
+    for p in stored or ():
+        if not isinstance(p, dict):
+            continue
+        url = p.get("base_url") or ""
+        if ("127.0.0.1:20128" in url or "localhost:20128" in url
+                or p.get("label") == "9router"):
+            if not kept:
+                models = p.get("models")
+                kept = {"label": "9router", "base_url": NINEROUTER_URL,
+                        "api_key": p.get("api_key", ""),
+                        "model": p.get("model", ""),
+                        "models": list(models) if isinstance(models, list) else []}
+        else:
+            print(f"[config] dropping non-9router provider "
+                  f"'{p.get('label', '')}' ({url}) — custom kind removed (Q2)")
+    return (kept,) if kept else ()
+
+
 def _legacy_proxy_url():
     """One-time upgrade path for the old single proxy URL (Q5).
 
@@ -183,25 +216,43 @@ class Config:
     revision_batch_limit: int
     revision_chunk_size: int
     revision_scan_chunk: int
+    converter_enabled: bool = True
 
 
 def load_config() -> Config:
-    # Extraction: the Gemini pool unless a saved custom provider is selected.
-    ext_providers = _providers("EXTRACTION_PROVIDERS", "OCR_BASE_URL",
-                               "OCR_API_KEY", "OCR_MODEL",
-                               "OCR_PROVIDER", ("openai", "local"))
+    # Extraction: the Gemini pool unless the built-in 9router is selected.
+    # The generic custom-provider kind is gone (Q2) — whatever is stored is
+    # coerced to the single 9router entry, other entries discarded.
+    ext_providers = _migrate_ninerouter(_providers(
+        "EXTRACTION_PROVIDERS", "OCR_BASE_URL",
+        "OCR_API_KEY", "OCR_MODEL",
+        "OCR_PROVIDER", ("openai", "local")))
     ext_active = _active("EXTRACTION_ACTIVE", ext_providers)
-    # Revision: always had an endpoint — the legacy default keeps that true.
-    rev_providers = _providers("REVISION_PROVIDERS", "ROUTER_BASE_URL",
-                               "ROUTER_API_KEY", "ROUTER_MODEL",
-                               "ROUTER_PROVIDER", ("local", "openai", ""),
-                               legacy_default="http://localhost:20128/v1")
+    # Revision: same single-kind model; the legacy default (the 9router
+    # loopback service) still keeps an endpoint selected for old .env files.
+    rev_providers = _migrate_ninerouter(_providers(
+        "REVISION_PROVIDERS", "ROUTER_BASE_URL",
+        "ROUTER_API_KEY", "ROUTER_MODEL",
+        "ROUTER_PROVIDER", ("local", "openai", ""),
+        legacy_default="http://localhost:20128/v1"))
     rev_active = _active("REVISION_ACTIVE", rev_providers)
+    # Q2 self-heal: migration may have dropped the entry the stored active
+    # label pointed at (or an old "default" legacy label). A truthy-but-unknown
+    # label can never resolve, so fall back to the kept entry (usually the
+    # migrated 9router) or "" — never leave a dangling pointer that 400s
+    # every credentials save. A deliberate "" (Gemini pool / no endpoint)
+    # is meaningful and stays untouched.
+    _ext_labels = {p.get("label", "") for p in ext_providers}
+    if ext_active and ext_active not in _ext_labels:
+        ext_active = ext_providers[0].get("label", "") if ext_providers else ""
+    _rev_labels = {p.get("label", "") for p in rev_providers}
+    if rev_active and rev_active not in _rev_labels:
+        rev_active = rev_providers[0].get("label", "") if rev_providers else ""
     ext = _resolve(ext_providers, ext_active)
     rev = _resolve(rev_providers, rev_active)
     return Config(
         input_root=os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT),
-        min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "60")),
+        min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
         supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
         supabase_key=os.getenv("SUPABASE_SERVICE_KEY", ""),
         supabase_bucket=os.getenv("SUPABASE_BUCKET", "konkour-pages"),
@@ -238,4 +289,6 @@ def load_config() -> Config:
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),
         revision_chunk_size=int(os.getenv("REVISION_CHUNK_SIZE", "8")),
         revision_scan_chunk=int(os.getenv("REVISION_SCAN_CHUNK", "50")),
+        converter_enabled=os.getenv("CONVERTER_ENABLED", "1").strip().lower()
+        not in ("", "0", "false", "no", "off"),
     )

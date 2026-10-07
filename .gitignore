@@ -5,6 +5,10 @@ backups/
 # key ids only, but it is machine-local telemetry — never worth committing)
 .gemini-usage.json
 
+# Per-call usage history (ts, model, tokens, ms, masked key) behind the
+# credentials usage reports — same machine-local telemetry, never committed
+.gemini-calls.json
+
 # Pipeline write-cache: extracted results that Postgres could not accept yet,
 # re-imported automatically at the end of the next run
 .pending-deferrals.json
@@ -23,6 +27,5 @@ __pycache__/
 
 # Agent workflow state (local-only per checkout, same convention as Sapienstech)
 /.agent
-/prompts
 /AGENTS.md
 /.claude
