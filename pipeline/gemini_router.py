@@ -122,10 +122,12 @@ def _next_utc_midnight_ts(now=None):
     return midnight.timestamp() + 24 * 3600
 
 # Faults that mean "this key/pair is the problem" → rotate.
-ROTATE_KINDS = {"bad_key", "quota", "rate_limit", "model_unavailable"}
+ROTATE_KINDS = {"bad_key", "quota", "rate_limit", "model_unavailable",
+                "geo_block"}
 # Which of those are per MODEL (free-tier day quota is per model, and so is
-# a 404 rollout gap) → step up the ladder. The rest are per key → next key.
-MODEL_LEVEL_ROTATIONS = {"quota", "model_unavailable"}
+# a 404 rollout gap, and so is a per-key region refusal) → park the PAIR and
+# step up the ladder. The rest are per key → next key.
+MODEL_LEVEL_ROTATIONS = {"quota", "model_unavailable", "geo_block"}
 # Faults that mean "the whole path is the problem" → abort, rotating only
 # multiplies the timeout we already waited.
 GLOBAL_KINDS = {"tunnel_down", "send_blocked", "recv_dropped", "overload",
@@ -152,6 +154,59 @@ def mask(key: str, keep: int = 4) -> str:
     if len(key) <= keep * 2:
         return key[0] + "…"
     return f"{key[:keep]}…{key[-keep:]}"
+
+
+def usage_chart(rows, group="model", y="calls"):
+    """Day × series buckets for the Usage tab curve (Q2/Q3).
+
+    group: 'model' | 'key'  — what one colour stands for.
+    y:     'calls' | 'tokens' | 'ms' | 'avg_ms' — what the bar height
+           counts (tokens = tokens_in + tokens_out of the call; ms = summed
+           per-call delay in the cell; avg_ms = delay ÷ calls in the cell).
+    Days are UTC, matching the "Time (UTC)" column of the table.
+    Returns {"group", "y", "days": [iso…], "series": [label…],
+             "cells": [[value, …], …]} where cells[day][series]."""
+    group = group if group in ("model", "key") else "model"
+    y = y if y in ("calls", "tokens", "ms", "avg_ms") else "calls"
+    days, series, counts, calls_n = [], [], {}, {}
+    for r in rows or []:
+        day = datetime.fromtimestamp(r.get("ts") or 0,
+                                     timezone.utc).strftime("%Y-%m-%d")
+        if group == "model":
+            label = r.get("model") or "unknown"
+        else:
+            label = (r.get("key_name") or r.get("key_masked")
+                     or r.get("key_hash") or "unknown")
+        if y == "calls":
+            value = 1
+        elif y == "tokens":
+            value = int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
+        else:
+            value = float(r.get("ms") or 0.0)
+        if day not in counts:
+            counts[day] = {}
+            days.append(day)
+        if label not in counts[day]:
+            counts[day][label] = 0
+            if label not in series:
+                series.append(label)
+        counts[day][label] += value
+        if y == "avg_ms":
+            calls_n.setdefault(day, {})
+            calls_n[day][label] = calls_n[day].get(label, 0) + 1
+    days.sort()
+    totals = {s: sum(counts[d].get(s, 0) for d in days) for s in series}
+    series.sort(key=lambda s: (-totals[s], s))     # biggest series first
+    if y == "avg_ms":
+        # divide each day×series cell by its own call count (never 0 → no div
+        # error); round to 1 decimal so the axis stays readable.
+        cells = [[round(counts[d].get(s, 0) / calls_n.get(d, {}).get(s, 1), 1)
+                  for s in series] for d in days]
+    else:
+        cells = [[counts[d].get(s, 0) for s in series] for d in days]
+    return {"group": group, "y": y, "days": days, "series": series,
+            "cells": cells}
+
 
 class GeminiRouter:
     """Thread-safe router over the key pool and model ladder in a Config."""
@@ -308,29 +363,34 @@ class GeminiRouter:
     def _calls_append(self, key, model, tokens_in=0, tokens_out=0,
                       ms=0.0, key_name="", ok=True):
         """Append one history row atomically; failures are swallowed
-        (history is a gauge, never worth breaking a run)."""
-        try:
-            rows = self._calls_load()
-            rows.append({
-                "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "ts": time.time(),
-                "key_hash": self._key_hash(key),
-                "key_name": key_name,
-                "key_masked": mask(key),
-                "model": model,
-                "tokens_in": int(tokens_in or 0),
-                "tokens_out": int(tokens_out or 0),
-                "ms": round(float(ms or 0.0), 1),
-                "ok": bool(ok),
-            })
-            del rows[:-CALLS_CAP]
-            path = _calls_path()
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(rows, fh)
-            os.replace(tmp, path)
-        except OSError:
-            pass
+        (history is a gauge, never worth breaking a run).
+
+        The read-modify-write of the shared JSON file is serialized under
+        the router lock: parallel lanes each call this from their own
+        thread, and two unlocked read→append→write cycles would drop rows."""
+        with self._lock:
+            try:
+                rows = self._calls_load()
+                rows.append({
+                    "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    "ts": time.time(),
+                    "key_hash": self._key_hash(key),
+                    "key_name": key_name,
+                    "key_masked": mask(key),
+                    "model": model,
+                    "tokens_in": int(tokens_in or 0),
+                    "tokens_out": int(tokens_out or 0),
+                    "ms": round(float(ms or 0.0), 1),
+                    "ok": bool(ok),
+                })
+                del rows[:-CALLS_CAP]
+                path = _calls_path()
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(rows, fh)
+                os.replace(tmp, path)
+            except OSError:
+                pass
 
     def usage_report(self, period="all"):
         """Per-call rows filtered to 24h/7d/30d/all-time chips (Q11).
@@ -343,6 +403,7 @@ class GeminiRouter:
             cutoff = time.time() - hours * 3600
             rows = [r for r in rows if r.get("ts", 0) >= cutoff]
         totals = {"calls": len(rows),
+                  "errors": sum(1 for r in rows if not r.get("ok")),
                   "tokens_in": sum(r.get("tokens_in", 0) for r in rows),
                   "tokens_out": sum(r.get("tokens_out", 0) for r in rows),
                   "ms": round(sum(r.get("ms", 0.0) for r in rows), 1)}
@@ -363,11 +424,16 @@ class GeminiRouter:
         return u["models"].get(model, 0) >= u["limit"]
 
     # ------------------------------------------------------------- selection
-    def _plan(self, cfg, now):
+    def _plan(self, cfg, now, keys=None):
         """Ordered [(index, key, [models…])] of what is worth trying.
 
         Skips keys in cooldown and models already known-unavailable (or
         with today's sends spent) for a key, so nothing is paid for twice.
+
+        `keys` narrows the pool to a subset (the parallel engine's enabled
+        keys) while keeping the returned index relative to that subset; a
+        None `keys` is the whole `cfg.gemini_key_pool`, so the serial path
+        is unchanged.
 
         The ORDER is the wise part: eligible keys are split into
         unpenalized and softly-penalized tiers, and each tier starts
@@ -379,7 +445,11 @@ class GeminiRouter:
         rotation only decides WHO is tried first."""
         eligible = []
         with self._lock:
-            for i, key in enumerate(cfg.gemini_key_pool):
+            pool = list(cfg.gemini_key_pool)
+            allowed = None if keys is None else set(keys)
+            for i, key in enumerate(pool):
+                if allowed is not None and key not in allowed:
+                    continue
                 st = self._state.get(key) or {}
                 if st.get("dead") and now < st.get("unavailable_until", 0.0):
                     continue
@@ -397,8 +467,7 @@ class GeminiRouter:
                     ladder.insert(0, last)
                 eligible.append((i, key, ladder, st.get("latency") or 0.0,
                                  st.get("penalty_until") or 0.0))
-            rotate = self._rotate % len(cfg.gemini_key_pool) \
-                if cfg.gemini_key_pool else 0
+            rotate = self._rotate % len(pool) if pool else 0
 
         def order(tier):
             def rank(entry):
@@ -408,7 +477,7 @@ class GeminiRouter:
                 # fastest in its tier is pushed back up to
                 # LATENCY_WINDOW slots — enough to be demoted within
                 # the rotation, never enough to dominate it.
-                pos = float((entry[0] - rotate) % len(cfg.gemini_key_pool))
+                pos = float((entry[0] - rotate) % len(pool))
                 lat = entry[3]
                 if lat and len(tier) > 1:
                     fastest = min(
@@ -459,7 +528,8 @@ class GeminiRouter:
                 st["unavailable_until"] = now + KEY_COOLDOWN.get(kind, 900)
                 st["penalty_until"] = now + PENALTY_WINDOW
 
-    def _mark_ok(self, key, model, now=None, elapsed_ms=None):
+    def _mark_ok(self, key, model, now=None, elapsed_ms=None,
+                 tokens_in=0, tokens_out=0, key_name=""):
         now = now if now is not None else time.time()
         st = self._entry(key)
         with self._lock:
@@ -476,7 +546,8 @@ class GeminiRouter:
                 st["latency"] = (LATENCY_ALPHA * elapsed_ms
                                  + (1.0 - LATENCY_ALPHA) * old) \
                     if old else elapsed_ms
-        self._count_send(key, model, ms=elapsed_ms or 0.0)
+        self._count_send(key, model, tokens_in=tokens_in, tokens_out=tokens_out,
+                         ms=elapsed_ms or 0.0, key_name=key_name)
         # Criterion 10: the 0/20 bars update on EVERY call, not just
         # health-checks. main.py sets router.on_usage to a hub.emit
         # closure; the router itself stays UI-agnostic (no hub import,
@@ -516,13 +587,17 @@ class GeminiRouter:
                     if (self._state.get(k) or {}).get("dead")
                     and now < (self._state.get(k) or {}).get("unavailable_until", 0.0))
             if cooling == len(pool):
+                flt = faults.fault("quota", "all keys cooling down")
+                flt["exhausted"] = True          # the runner stops on this
                 raise faults.FaultError(
-                    faults.fault("quota", "all keys cooling down"),
+                    flt,
                     "Every Gemini key is cooling down from a recent failure. "
                     "Open the Credentials tab and run a health check, or wait "
                     "for the cooldown to expire.")
+            flt = faults.fault("model_unavailable", "every ladder model is blocked")
+            flt["exhausted"] = True
             raise faults.FaultError(
-                faults.fault("model_unavailable", "every ladder model is blocked"),
+                flt,
                 "Every model version is unavailable or out of daily sends for "
                 "every key — check the Credentials bars; the cap resets with "
                 "Google's daily window, or add more keys.")
@@ -538,7 +613,7 @@ class GeminiRouter:
                     on_route(label, mask(key), model, tried)
                 try:
                     started = time.monotonic()
-                    parsed, text = call_gemini(
+                    parsed, text, usage = call_gemini(
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries,
@@ -565,8 +640,18 @@ class GeminiRouter:
                         self._log(f"↪ {label} · {model} replied badly "
                                   f"({flt['label']}); trying the next model")
                         continue
-                    raise               # nothing rotation can fix
-                self._mark_ok(key, model, elapsed_ms=elapsed_ms)
+                    # Not a global fault and not a cached kind (only
+                    # `unknown` reaches here): park the pair so the next
+                    # file cannot re-select the exact key×model that just
+                    # failed, then step up the ladder instead of aborting.
+                    self._mark(key, kind, model)
+                    self._log(f"↪ {label} · {model} → {flt['label']}; "
+                              f"parking this key/model pair")
+                    continue
+                self._mark_ok(key, model, elapsed_ms=elapsed_ms,
+                              tokens_in=(usage or {}).get("tokens_in", 0),
+                              tokens_out=(usage or {}).get("tokens_out", 0),
+                              key_name=label)
                 # This key just succeeded: start the NEXT call from
                 # the following pool position, so healthy keys share
                 # the files instead of key #1 taking them all.
@@ -576,9 +661,95 @@ class GeminiRouter:
                 return parsed, text, {"key": mask(key), "label": label,
                                       "model": model, "attempts": tried}
 
+        # Every pair in the plan failed inside this one call. If nothing is
+        # left to try, say so now — otherwise the next file pays for the
+        # same walk and the run keeps failing files one by one.
+        if not self._plan(cfg, time.time()):
+            last_flt = dict(last_flt)
+            last_flt["exhausted"] = True
         raise faults.FaultError(
             last_flt, f"{last_flt['label']} — no working key/model pair after "
                       f"{tried} attempt(s): {last_flt['hint']}")
+
+    def call_pinned(self, cfg, key, prompt, data_b64, mime_type,
+                    temperature=0.1, max_tokens=16384, retries=None,
+                    on_problem=None, on_route=None):
+        """Same contract as call(), but PINNED to one key: it walks only that
+        key's own ladder (blocked models / spent day caps / sticky model all
+        honoured) and never rotates to another key. Does NOT touch
+        self._rotate — a parallel lane must not steal the serial rotation.
+
+        Raises a FaultError whose fault["exhausted"] is True when the pinned
+        key has no usable model left (every rung blocked or capped), so the
+        parallel runner treats the file like the serial "blocked" case: leave
+        it for the next run (Q3=B)."""
+        if not cfg.gemini_model_ladder:
+            raise faults.FaultError(
+                faults.fault("unknown"), "GEMINI_MODEL_LADDER is empty.")
+        plan = self._plan(cfg, time.time(), keys=[key])
+        if not plan:
+            flt = faults.fault("model_unavailable",
+                               "pinned key has no usable model")
+            flt["exhausted"] = True
+            raise faults.FaultError(
+                flt, f"Key {mask(key)} has no usable model left today — "
+                     "every model is blocked or capped.")
+        pool = list(cfg.gemini_key_pool)
+        label = self._label(cfg, pool.index(key) if key in pool else 0, key)
+        quality_retried = set()
+        tried = 0
+        last_flt = faults.fault("unknown")
+        for _index, _key, models, _latency, _penalty in plan:
+            for model in models:
+                tried += 1
+                if on_route:
+                    on_route(label, mask(key), model, tried)
+                try:
+                    started = time.monotonic()
+                    parsed, text, usage = call_gemini(
+                        key, model, prompt, data_b64, mime_type,
+                        temperature=temperature, max_tokens=max_tokens,
+                        retries=retries,
+                        on_problem=self._problem_cb(on_problem, label, model))
+                    elapsed_ms = (time.monotonic() - started) * 1000.0
+                except faults.FaultError as exc:
+                    flt = exc.fault
+                    kind = flt["kind"]
+                    last_flt = flt
+                    if kind in GLOBAL_KINDS:
+                        # Not the key's fault — abort this file, don't burn
+                        # the other models on the same timeout.
+                        raise
+                    if kind in ROTATE_KINDS:
+                        self._mark(key, kind, model)
+                        self._log(f"↪ {label} · {model} → {flt['label']}; "
+                                  f"{'next model' if kind in MODEL_LEVEL_ROTATIONS else 'key done'}")
+                        if kind in MODEL_LEVEL_ROTATIONS:
+                            continue          # next rung, same key
+                        break                 # key-level: this key is done
+                    if kind in MODEL_RETRY_KINDS and model not in quality_retried:
+                        quality_retried.add(model)
+                        self._log(f"↪ {label} · {model} replied badly "
+                                  f"({flt['label']}); trying the next model")
+                        continue
+                    # `unknown`: park the pair, step up the ladder.
+                    self._mark(key, kind, model)
+                    continue
+                self._mark_ok(key, model, elapsed_ms=elapsed_ms,
+                              tokens_in=(usage or {}).get("tokens_in", 0),
+                              tokens_out=(usage or {}).get("tokens_out", 0),
+                              key_name=label)
+                return parsed, text, {"key": mask(key), "label": label,
+                                      "model": model, "attempts": tried}
+        # The pinned key's whole ladder failed for this file. If the key still
+        # has a usable rung the failure is per-file (retried next run); if it
+        # has none, flag it so the runner parks the lane.
+        if not self._plan(cfg, time.time(), keys=[key]):
+            last_flt = dict(last_flt)
+            last_flt["exhausted"] = True
+        raise faults.FaultError(
+            last_flt, f"{last_flt['label']} — pinned key {mask(key)} exhausted "
+                      f"after {tried} attempt(s): {last_flt['hint']}")
 
     def _problem_cb(self, on_problem, label, model):
         if not on_problem:

@@ -61,7 +61,7 @@ class ScaleTokenTests(unittest.TestCase):
     def test_named_structural_rules_use_scale_tokens(self):
         css = _read("styles.css")
         wants = {
-            "header": "--sp-6",
+            ".side-footer": "--sp-3",
             "h1": "--fs-5",
             ".panel-head": "--sp-5",
             ".usage-table": "--fs-2",
@@ -131,6 +131,13 @@ class ScaleTokenTests(unittest.TestCase):
             body = _rule(css, sel)
             self.assertIsNotNone(body, sel)
             self.assertIn("min-height:300px", body, sel)
+
+
+    def test_usage_scroll_fits_twenty_rows(self):
+        css = _read("styles.css")
+        body = _rule(css, ".usage-scroll")
+        self.assertIsNotNone(body, ".usage-scroll")
+        self.assertIn("max-height:min(740px", body)
 
 
 if __name__ == "__main__":

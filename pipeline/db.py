@@ -738,3 +738,23 @@ class Database:
             WHERE id = %s
         """
         self._execute(sql, (json.dumps(bbox), question_id))
+
+    def clear_zero_bboxes(self, limit=100):
+        """Backfill: NULL the most recent `limit` question bboxes that are
+        still the all-zero placeholder ([0,0,0,0]) Gemini used to emit for
+        figure-less questions. Re-runnable — once clean it updates 0 rows."""
+        sql = """
+        WITH z AS (
+            SELECT id FROM public.questions
+            WHERE replace(diagram_bbox::text, ' ', '') = '[0,0,0,0]'
+            ORDER BY created_at DESC
+            LIMIT %s
+        )
+        UPDATE public.questions q
+           SET diagram_bbox = NULL
+          FROM z
+         WHERE q.id = z.id
+        RETURNING q.id
+        """
+        rows = self._execute(sql, (int(limit),), fetch=True) or []
+        return len(rows)

@@ -251,6 +251,20 @@ class CredentialsCoherenceTests(unittest.TestCase):
         self.assertNotIn("usageGemini", html)
         self.assertNotIn("usageRouter", html)
 
+    def test_usage_tab_has_group_and_y_mode_controls(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn('id="usageGroup"', html)
+        self.assertIn('id="usageYMode"', html)
+        self.assertIn('data-ymode="calls"', html)
+        self.assertIn('data-ymode="tokens"', html)
+        # the renderer consumes the server-side chart and both new controls
+        self.assertIn("function usagePlot(", js)
+        self.assertIn("usageGroup", js)
+        self.assertIn("d.chart", js)
+        self.assertIn(".usage-legend{", css)
+
     def test_profile_buttons_live_in_credentials(self):
         html = _read("index.html")
         cred = _view(html, "viewCredentials")
@@ -293,6 +307,162 @@ class CredentialsCoherenceTests(unittest.TestCase):
         missing = sorted(i for i in bound
                          if i not in js_created and 'id="%s"' % i not in html)
         self.assertEqual(missing, [], "ids app.js binds but html lacks: %s" % missing)
+
+
+class PeriodStatsLiveRailTests(unittest.TestCase):
+    def test_period_stats_file_cards_read_the_live_rail(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        view = _view(html, "viewPipeline")
+        # three file cells declare the live rail source...
+        rail = re.findall(r'data-live="rail"><span[^>]*id="(psSucceeded|psErrors|psTotal)"', view)
+        self.assertEqual(sorted(rail), ["psErrors", "psSucceeded", "psTotal"])
+        db = re.findall(r'data-live="db"><span[^>]*id="(psQuestions|psAnswers)"', view)
+        self.assertEqual(sorted(db), ["psAnswers", "psQuestions"])
+        # ...and the DB path no longer paints them (statsPaint does)
+        self.assertIn("function statsPaint()", js)
+        load = js.split("async function statsLoad(period){", 1)[1].split("\n}\n", 1)[0]
+        for gone in ("set('psSucceeded'", "set('psErrors'", "set('psTotal'"):
+            self.assertNotIn(gone, load, gone)
+        self.assertIn("set('psQuestions'", load)
+        self.assertIn("set('psAnswers'", load)
+
+
+class StageNowDetailTests(unittest.TestCase):
+    def test_stage_now_detail_tracks_the_live_file(self):
+        js = _read("app.js")
+        self.assertIn("by_id: {}", js)
+        self.assertIn("RAIL.by_id = {}", js)
+        case = js.split("case 'file': {", 1)[1].split("case 'snapshot':", 1)[0]
+        self.assertIn("RAIL.by_id[ev.id]", case)
+        self.assertIn("const meta = RAIL.by_id[ev.id] || {};", case)
+        self.assertIn("name: ev.name || meta.name || ''", case)
+        self.assertNotIn("RAIL.cur && RAIL.cur.name", case)
+
+
+class UploadEnqueueTests(unittest.TestCase):
+    def test_upload_selection_enqueues_directly(self):
+        js = _read("app.js")
+        self.assertIn("async function upQueue(){", js)
+        self.assertIn("$('upAdd').onclick = upQueue;", js)
+        onchange = js.split("$('upFiles').onchange", 1)[1].split("\n", 1)[0]
+        self.assertIn("upQueue", onchange)
+        self.assertNotIn("file(s) selected", js)
+
+
+class UsageTabTests(unittest.TestCase):
+    def test_usage_table_shows_delay_in_seconds(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn('<select class="cred-in" id="usageGroup">', html)
+        self.assertIn("Delay (seconds)", js)
+        self.assertNotIn("<th>ms</th>", js)
+        self.assertIn(".usage-table th.num{text-align:right", css)
+        self.assertIn("t.errors || 0", js)
+
+
+class PanelBackgroundTests(unittest.TestCase):
+    def test_panels_carry_no_filled_background(self):
+        css = _read("styles.css")
+        for sel in (".panel{", ".panel,.cred-card{", ".cred-section{"):
+            body = css.split(sel, 1)[1].split("}", 1)[0]
+            self.assertIn("background:transparent", body, sel)
+        # scope guard: the content cards keep their fill
+        qcard = css.split(".qcard{", 1)[1].split("}", 1)[0]
+        self.assertIn("background:var(--panel)", qcard)
+
+
+class ParallelModeTests(unittest.TestCase):
+    def test_pipeline_mode_toggle_present(self):
+        """The pipeline toolbar carries a two-way Run mode control; the
+        one-by-one button is active by default (parallel is opt-in)."""
+        html = _read("index.html")
+        view = _view(html, "viewPipeline")
+        self.assertIn('id="pipeMode"', view)
+        self.assertIn('data-mode="one"', view)
+        self.assertIn('data-mode="parallel"', view)
+        seg = view.split('id="pipeMode"', 1)[1].split("</div>", 1)[0]
+        self.assertIn('data-mode="one" class="active"', seg)
+        js = _read("app.js")
+        self.assertIn("PipeRun", js)
+        self.assertIn("enabled_keys", js)
+
+
+class CredKeyToggleTests(unittest.TestCase):
+    def test_per_key_toggle_lives_on_the_lane_surface(self):
+        """Cycle 3: the session-only on/off toggle wears the house `.sw`+`.tr`
+        switch (not the old `.cred-btn keyon` button); flipping it never writes
+        .env, and the Run mask contract is unchanged."""
+        js = _read("app.js")
+        self.assertEqual(js.count('data-keyon="${i}"'), 1)   # one construction site
+        self.assertEqual(js.count("querySelector('.keyon')"), 0)  # gone from credRowEl
+        self.assertIn("r.on = box.checked", js)
+        self.assertIn("function activeKeyMask", js)
+        handler = js.split("data-keyon]').forEach(box => {", 1)[1].split("};", 1)[0]
+        self.assertNotIn("/api/credentials", handler)
+        self.assertIn("loadCredentials()", js.split("function pipeModePaint", 1)[1])
+        # The house switch, and no trace of the old button:
+        self.assertNotIn("cred-btn keyon", js)
+        self.assertIn('class="sw lane-sw"', js)
+        self.assertIn('<span class="tr" aria-hidden="true"></span>', js)
+        self.assertIn('type="checkbox" data-keyon=', js)
+        css = _read("styles.css")
+        self.assertNotIn(".cred-btn.keyon", css)
+        self.assertIn(".lane .lane-sw", css)
+
+
+class LaneSurfaceTests(unittest.TestCase):
+    def test_pipeline_view_carries_a_lane_surface_swapped_by_mode(self):
+        """The pipeline view carries the per-key lane surface; Parallel mode
+        swaps it in for the 5-stage rail and seeds it from the hub snapshot."""
+        html = _read("index.html")
+        view = _view(html, "viewPipeline")
+        self.assertIn('id="lanes"', view)
+        self.assertIn('id="laneList"', view)
+        self.assertIn('id="laneNow"', view)
+        js = _read("app.js")
+        self.assertIn("case 'lane'", js)
+        self.assertIn("case 'round'", js)
+        self.assertIn("ev.lanes", js)
+        paint = js.split("function pipeModePaint()", 1)[1].split("}", 1)[0]
+        self.assertIn("$('stages').hidden", paint)
+        self.assertIn("$('lanes').hidden", paint)
+
+    def test_lane_chip_reads_the_live_phase(self):
+        """Cycle 3: the lane chip renders the server-computed `phase`
+        (uploading / ocr / waiting Ns / importing / imported) and the `wait`
+        state has a house-colour accent."""
+        js = _read("app.js")
+        self.assertIn("s.phase === 'uploading'", js)
+        self.assertIn("state === 'wait'", js)
+        self.assertIn("s.phase === 'imported'", js)
+        self.assertIn('.lane[data-state="wait"]', _read("styles.css"))
+
+
+class SidebarLayoutTests(unittest.TestCase):
+    def test_sidebar_header_removed_and_footer_added(self):
+        """The top <header> is gone; the theme toggle + connection pill live
+        in a sidebar footer, and the collapse control is the first button."""
+        html = _read("index.html")
+        self.assertNotIn("<header", html)
+        side = html.split('id="side"', 1)[1].split("</nav>", 1)[0]
+        self.assertIn('id="sideFooter"', side)
+        self.assertIn('id="conn"', side)
+        self.assertIn('id="themeToggle"', side)
+        first_btn = side.split("<button", 1)[1].split(">", 1)[0]
+        self.assertIn('id="sideToggle"', first_btn)
+
+
+class UsageDelayOptionsTests(unittest.TestCase):
+    def test_usage_y_mode_has_delay_options(self):
+        """Q5: beside Calls/Tokens the Y toggle offers both a cumulative and
+        an average delay metric."""
+        html = _read("index.html")
+        self.assertIn('data-ymode="ms"', html)
+        self.assertIn('data-ymode="avg_ms"', html)
+        js = _read("app.js")
+        self.assertIn("s/call", js)
 
 
 if __name__ == "__main__":

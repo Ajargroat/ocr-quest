@@ -26,24 +26,12 @@ window.MathJax = {
 <body>
 <canvas id="meshBg" class="mesh-bg" aria-hidden="true"></canvas>
 
-<header>
-  <div class="actions">
-    <div class="conn" id="conn" title="Gemini pool">
-      <span class="conn-sig">
-        <span class="conn-bars" id="connBars"><b></b><b></b><b></b></span>
-        <em id="connPing">—</em>
-      </span>
-      <em id="connText">connecting…</em>
-    </div>
-    <button class="theme-toggle" id="themeToggle" type="button"
-            title="Switch to light theme" aria-label="Toggle light and dark theme">
-      <i class="fa fa-moon" aria-hidden="true"></i>
-    </button>
-  </div>
-</header>
-
-<!-- collapsible left sidebar — one button per view (P3) -->
+<!-- collapsible left sidebar — one button per view (P3); the collapse control
+     is a top-left icon, the theme + connection pill live in a bottom footer -->
 <nav id="side" aria-label="Views">
+  <button class="side-btn side-collapse" id="sideToggle" type="button"
+          title="Collapse the sidebar to icons">
+    <i class="fa fa-bars-staggered" aria-hidden="true"></i><span>Collapse</span></button>
   <button class="side-btn active" data-view="pipeline" title="Pipeline">
     <i class="fa fa-play" aria-hidden="true"></i><span>Pipeline</span></button>
   <button class="side-btn" data-view="review" title="QBank">
@@ -56,9 +44,19 @@ window.MathJax = {
     <i class="fa fa-chart-line" aria-hidden="true"></i><span>Usage</span></button>
   <button class="side-btn" data-view="credentials" title="Credentials">
     <i class="fa fa-key" aria-hidden="true"></i><span>Credentials</span></button>
-  <button class="side-btn side-collapse" id="sideToggle" type="button"
-          title="Collapse the sidebar to icons">
-    <i class="fa fa-angles-left" aria-hidden="true"></i><span>Collapse</span></button>
+  <div id="sideFooter" class="side-footer">
+    <div class="conn" id="conn" title="Gemini pool">
+      <span class="conn-sig">
+        <span class="conn-bars" id="connBars"><b></b><b></b><b></b></span>
+        <em id="connPing">—</em>
+      </span>
+      <em id="connText">connecting…</em>
+    </div>
+    <button class="theme-toggle" id="themeToggle" type="button"
+            title="Switch to light theme" aria-label="Toggle light and dark theme">
+      <i class="fa fa-moon" aria-hidden="true"></i>
+    </button>
+  </div>
 </nav>
 
 <!-- ════════════ VIEW 1 · PIPELINE ════════════ -->
@@ -75,11 +73,11 @@ window.MathJax = {
       </div>
     </div>
     <div class="ps-grid">
-      <div class="ps-cell"><span class="k ok" id="psSucceeded">—</span><label>Succeeded</label></div>
-      <div class="ps-cell"><span class="k err" id="psErrors">—</span><label>Errors</label></div>
-      <div class="ps-cell"><span class="k" id="psTotal">—</span><label>Total files</label></div>
-      <div class="ps-cell"><span class="k q" id="psQuestions">—</span><label>Questions</label></div>
-      <div class="ps-cell"><span class="k a" id="psAnswers">—</span><label>Answers</label></div>
+      <div class="ps-cell" data-live="rail"><span class="k ok" id="psSucceeded">—</span><label>Succeeded · files</label></div>
+      <div class="ps-cell" data-live="rail"><span class="k err" id="psErrors">—</span><label>Errors · files</label></div>
+      <div class="ps-cell" data-live="rail"><span class="k" id="psTotal">—</span><label>Total files</label></div>
+      <div class="ps-cell" data-live="db"><span class="k q" id="psQuestions">—</span><label>Questions</label></div>
+      <div class="ps-cell" data-live="db"><span class="k a" id="psAnswers">—</span><label>Answers</label></div>
       <div class="ps-cell ps-note"><span class="k ps-err" id="psError" hidden></span>
         <label id="psCaption">from existing DB rows</label></div>
     </div>
@@ -120,6 +118,16 @@ window.MathJax = {
     </div>
   </section>
 
+  <!-- lanes · Parallel mode's per-key readout — same house surface as the rail -->
+  <section class="stages lanes" id="lanes" hidden dir="ltr">
+    <div class="lane-list" id="laneList"></div>
+    <div class="stage-now" id="laneNow" data-state="idle">
+      <span class="beacon"></span>
+      <b id="laneNowName">idle</b>
+      <em id="laneNowDetail"></em>
+    </div>
+  </section>
+
   <div class="progress" dir="ltr">
     <div class="track"><div class="fill" id="barFill"></div></div>
     <span id="barLabel">idle</span>
@@ -131,6 +139,13 @@ window.MathJax = {
       <i class="fa fa-power-off" aria-hidden="true"></i>
     </button>
     <div class="tb-context">
+      <div class="tb-field">
+        <label class="cred-label">Run mode</label>
+        <div class="seg" id="pipeMode" role="group" aria-label="Run mode">
+          <button type="button" data-mode="one" class="active">One-by-one</button>
+          <button type="button" data-mode="parallel">Parallel</button>
+        </div>
+      </div>
       <div class="tb-field">
         <label class="cred-label" for="pipeProvSel">OCR provider</label>
         <select id="pipeProvSel" class="cred-in"></select>
@@ -459,10 +474,22 @@ window.MathJax = {
       <h2>Usage</h2>
       <div class="head-tools">
         <div class="ps-chips usage-chips" id="usagePeriods" role="tablist" aria-label="Usage period"></div>
+        <label class="usage-ctl" for="usageGroup"><span>Group by</span>
+          <select class="cred-in" id="usageGroup">
+            <option value="model">Model</option>
+            <option value="key">Key</option>
+          </select>
+        </label>
+        <div class="seg" id="usageYMode" role="group" aria-label="Count">
+          <button type="button" data-ymode="calls" class="active">Calls</button>
+          <button type="button" data-ymode="tokens">Tokens</button>
+          <button type="button" data-ymode="ms">Delay (total)</button>
+          <button type="button" data-ymode="avg_ms">Delay (avg)</button>
+        </div>
       </div>
     </div>
     <div class="usage-totals" id="usageTotals"></div>
-    <div class="usage-plot" id="usagePlot" aria-label="Tokens over time"></div>
+    <div class="usage-plot" id="usagePlot" aria-label="Usage per day"></div>
     <div class="usage-scroll"><table class="usage-table" id="usageTable"></table></div>
   </div>
 </section>

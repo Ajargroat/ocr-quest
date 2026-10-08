@@ -122,6 +122,12 @@ class TestQuestionRows(unittest.TestCase):
         self.assertIsNone(normalize_bbox("garbage"))
         self.assertIsNone(normalize_bbox(None))
 
+    def test_normalize_bbox_treats_all_zero_as_no_picture(self):
+        self.assertIsNone(normalize_bbox([0, 0, 0, 0]))
+        self.assertIsNone(normalize_bbox("[0,0,0,0]"))
+        self.assertIsNone(normalize_bbox("[0, 0, 0, 0]"))
+        self.assertEqual(normalize_bbox([0, 1, 2, 3]), [0, 1, 2, 3])
+
 
 class TestAnswerLinking(unittest.TestCase):
     def setUp(self):

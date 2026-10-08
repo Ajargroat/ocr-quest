@@ -54,7 +54,9 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 temperature=0.1, max_tokens=16384, retries=None,
                 on_problem=None):
     """Sends one image/PDF plus the prompt to Gemini.
-    Returns (parsed_json, raw_text).
+    Returns (parsed_json, raw_text, usage) where usage is
+    ``{"tokens_in": int, "tokens_out": int}`` (zeros when the response
+    carries no ``usageMetadata``).
 
     ``on_problem(fault, attempt, retries, wait)`` is called before every
     back-off sleep so the caller can log tunnel hiccups live."""
@@ -87,7 +89,9 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
         else:
             outcome = _outcome(resp)
             if "result" in outcome:
-                return outcome["result"]
+                parsed, text = outcome["result"]
+                usage = outcome.get("usage") or {}
+                return parsed, text, usage
             last = outcome
         if not last["retryable"]:
             raise faults.FaultError(
@@ -206,7 +210,25 @@ def _outcome(resp):
         parsed = extract_json(text)
     except ValueError as exc:
         return faults.fault("model_garbage", str(exc))
-    return {"result": (parsed, text)}
+    tokens_in, tokens_out = _extract_usage(body)
+    return {"result": (parsed, text),
+            "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
+
+
+def _extract_usage(body):
+    """(tokens_in, tokens_out) from Gemini's usageMetadata — (0, 0) when the
+    response omits it (text-only probes, older gateways, stubbed responses)."""
+    meta = body.get("usageMetadata") if isinstance(body, dict) else None
+    if not isinstance(meta, dict):
+        return 0, 0
+
+    def _int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return _int(meta.get("promptTokenCount")), _int(meta.get("candidatesTokenCount"))
 
 
 def _extract_text(body) -> str:

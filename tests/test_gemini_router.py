@@ -57,7 +57,7 @@ class ScriptedGemini:
         seq = self.outcomes.get(f"{api_key}|{model}", ["ok"])
         outcome = seq.pop(0) if len(seq) > 1 else seq[0]
         if outcome == "ok":
-            return {"answer": 1}, "raw json text"
+            return {"answer": 1}, "raw json text", {"tokens_in": 0, "tokens_out": 0}
         raise fault_error(outcome)
 
 
@@ -228,6 +228,25 @@ class RouterTest(unittest.TestCase):
             r.call(make_cfg(), "p", "b", "image/jpeg")
         self.assertEqual(fake.calls, [])
 
+    def test_exhausted_pool_raises_with_the_exhausted_flag(self):
+        """When every pair is dead, the raised fault carries exhausted=True
+        so the runner stops the whole run instead of re-queueing files (Q4)."""
+        dead = {f"{k}|{m}": "model_unavailable"
+                for k in ("k1111111111", "k2222222222")
+                for m in DEFAULT_MODEL_LADDER}
+        fake = self._use(dead)
+        r = GeminiRouter()
+        with self.assertRaises(faults.FaultError) as ctx:
+            r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertTrue(ctx.exception.fault["exhausted"])
+        self.assertEqual(ctx.exception.fault["kind"], "model_unavailable")
+        # the empty-plan exit is flagged too, and costs no new calls
+        fake.calls.clear()
+        with self.assertRaises(faults.FaultError) as ctx2:
+            r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertTrue(ctx2.exception.fault["exhausted"])
+        self.assertEqual(fake.calls, [])
+
     # ---------------------------------------------------- wise rotation
     def test_first_call_starts_at_pool_head(self):
         """No history → the pointer sits at 0, so a healthy pool
@@ -309,14 +328,35 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(ctx.exception.fault["kind"], "tunnel_down")
         self.assertEqual(len(fake.calls), 1)   # key #2 untouched, same exit IP
 
-    def test_geo_block_aborts_and_does_not_kill_the_key(self):
+    def test_geo_block_parks_the_pair_and_the_ladder_keeps_serving(self):
+        """A Gemini 403 (permission denied → geo_block) is a per-pair fault:
+        the rung is parked and the ladder steps up instead of aborting the
+        whole call (Q4). The key itself must never die."""
         fake = self._use({"k1111111111|gemini-3.5-flash": "geo_block"})
         r = GeminiRouter()
-        with self.assertRaises(faults.FaultError):
-            r.call(make_cfg(), "p", "b", "image/jpeg")
+        _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertEqual(route["model"], "gemini-3.6-flash")
         st = r._entry("k1111111111")
-        self.assertFalse(st["dead"])           # the KEY is fine — the IP isn't
-        self.assertEqual(len(fake.calls), 1)
+        self.assertFalse(st["dead"])           # the KEY is fine — the pair isn't
+        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        # the parked pair is never offered to this key again
+        fake.calls.clear()
+        r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertTrue(fake.calls)            # the pool is still working
+
+    def test_unknown_fault_parks_the_pair_and_steps_the_ladder(self):
+        """`unknown` is neither global nor cached — it must park the pair and
+        step the ladder, not abort the call (the old bare-raise fall-through)."""
+        fake = self._use({"k1111111111|gemini-3.5-flash": "unknown"})
+        r = GeminiRouter()
+        _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertEqual(route["model"], "gemini-3.6-flash")
+        st = r._entry("k1111111111")
+        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        fake.calls.clear()
+        r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
 
     def test_missing_pool_raises_immediately(self):
         r = GeminiRouter()
@@ -332,7 +372,7 @@ class RouterTest(unittest.TestCase):
 
         def fake_call(*a, **k):
             gen.append(a)
-            return {"x": 1}, "ok"
+            return {"x": 1}, "ok", {}
 
         def fake_list(key):
             if key == "k1111111111":

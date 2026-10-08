@@ -263,14 +263,14 @@ const RAIL = {
   names: ['Scan','Upload','Gemini OCR','Save','Archive'],
   statuses: ['queued','uploading','ocr','saving'],          // stage 0..3
   stageOf: {queued:0, uploading:1, ocr:2, saving:3},
-  counts: null, last: null, cur: null,
+  counts: null, last: null, cur: null, by_id: {},
   running: false, total: 0, processed: 0, errors: 0,
   wait: null,                            // {until,total,attempt,tries,where} · Q8
 };
 const railBox   = $('stages');
 const railStages= railBox.querySelectorAll('.stage');
 const railWires = railBox.querySelectorAll('.wire');
-function railReset(){ RAIL.counts = {queued:0, uploading:0, ocr:0, saving:0}; RAIL.last = {}; RAIL.cur = null; }
+function railReset(){ RAIL.counts = {queued:0, uploading:0, ocr:0, saving:0}; RAIL.last = {}; RAIL.cur = null; RAIL.by_id = {}; }
 railReset();
 function railFlash(idx, cls, ms){
   const el = railStages[idx];
@@ -298,13 +298,14 @@ function stageFeed(ev){
       if (prev && prev !== ev.status && RAIL.counts[prev] !== undefined) RAIL.counts[prev]--;
       RAIL.last[ev.id] = ev.status;
       if (prev !== ev.status && RAIL.counts[ev.status] !== undefined) RAIL.counts[ev.status]++;
-      if (ev.name || ev.kind || ev.detail)
-        RAIL.cur = {
-          name: ev.name || (RAIL.cur && RAIL.cur.name) || '',
-          kind: ev.kind || (RAIL.cur && RAIL.cur.kind) || '',
-          detail: ev.detail || (RAIL.cur && RAIL.cur.detail) || '',
-          status: ev.status,
-        };
+      if (ev.name || ev.kind) RAIL.by_id[ev.id] = {name: ev.name || '', kind: ev.kind || ''};
+      const meta = RAIL.by_id[ev.id] || {};
+      RAIL.cur = {
+        name: ev.name || meta.name || '',
+        kind: ev.kind || meta.kind || '',
+        detail: ev.detail || (RAIL.cur && RAIL.cur.detail) || '',
+        status: ev.status,
+      };
       if (ev.status === 'failed') railFlash(RAIL.stageOf[prev] !== undefined ? RAIL.stageOf[prev] : 1, 'err', 1400);
       if (ev.status === 'done') railFlash(4, 'passed', 900);
       break;
@@ -320,6 +321,7 @@ function stageFeed(ev){
         const f = files[id];
         if (RAIL.counts[f.status] !== undefined) RAIL.counts[f.status]++;
         RAIL.last[id] = f.status;
+        if (f.name) RAIL.by_id[id] = {name: f.name, kind: f.kind || ''};
       });
       const f = files[ids[ids.length - 1]];          // insertion order → most recent activity
       if (f) RAIL.cur = {name: f.name || '', kind: f.kind || '', detail: f.detail || '', status: f.status};
@@ -327,6 +329,7 @@ function stageFeed(ev){
     }
   }
   renderRail();
+  statsPaint();
 }
 function renderRail(){
   const doneN = RAIL.processed + RAIL.errors;
@@ -420,13 +423,16 @@ function handle(ev){
         else if (e.type === 'error') diagLine(e, true);
       });
       revSeedLogs(ev.rev_log || [], true);
+      if (ev.lanes) LANES.states = Object.assign({}, ev.lanes);
       if (ev.running) setRunning(true);
       break;
     case 'log': logLine(ev); break;
     case 'file': fileCard(ev); break;
+    case 'lane': laneFeed(ev); break;
+    case 'round': LANES.round = ev.no || 0; laneNowPaint(); break;
     case 'error': diagLine(ev); break;
     case 'stats': applyStats(ev.stats || {}); break;
-    case 'run_started': PIPE_STOPPING = false; setRunning(true); DIAG.counts = {}; updateDiagCount(); break;
+    case 'run_started': PIPE_STOPPING = false; setRunning(true); DIAG.counts = {}; updateDiagCount(); LANES.states = {}; LANES.round = 0; break;
     case 'run_finished': PIPE_STOPPING = false; setRunning(false); break;
     case 'wait': waitCountdown(ev); break;
     case 'upload': upApplyEvent(ev); break;
@@ -461,6 +467,118 @@ function connect(){
 }
 connect();
 pingProvider();
+
+/* Run mode — page-level, session-only (PREFERENCE §3): sent with Run.
+   'one' = today's serial loop, 'parallel' = round-based key-pinned lanes. */
+const PipeRun = { mode: 'one' };
+const pipeModeEl = $('pipeMode');
+if (pipeModeEl){
+  pipeModeEl.querySelectorAll('button[data-mode]').forEach(b => {
+    b.onclick = () => {
+      PipeRun.mode = b.dataset.mode;
+      pipeModeEl.querySelectorAll('button').forEach(x =>
+        x.classList.toggle('active', x === b));
+      pipeModePaint();
+    };
+  });
+}
+
+/* ═══════════ PARALLEL LANES ═══════════
+   One row per Gemini key — Parallel mode's counterpart of the 5-stage rail.
+   Defined here, never CALLED at top level before CredState (2069) / credEsc
+   (2077) are initialised: every call site is a click, a WS message or
+   credRender(), all of which run after the script has parsed. */
+const LANES = { states: {}, round: 0, list: null };
+
+function laneRows(){
+  // Same filter activeKeyMask() uses: saved, not removed.
+  return (CredState.rows || []).map((r, i) => ({r, i}))
+    .filter(({r}) => r.keep !== null && r.keep !== undefined && !r.removed);
+}
+function laneChipText(state, s){
+  if (state === 'off') return 'idle';            // row is dimmed anyway
+  if (s.phase === 'uploading') return 'uploading';
+  if (state === 'wait') return s.phase || 'waiting';   // "waiting 12s"
+  if (state === 'failed') return s.phase || 'failed';
+  if (state === 'done') return s.phase || 'importing';
+  const tag = s.model ? credModelTag(s.model)
+                      : (s.phase === 'ocr' ? 'OCR' : 'working');
+  return tag + (s.attempt > 1 ? ' · try ' + s.attempt : '');
+}
+function lanesRender(){
+  const box = LANES.list || (LANES.list = $('laneList'));
+  if (!box) return;
+  box.innerHTML = laneRows().map(({r, i}) => {
+    const s = LANES.states[r.keep] || {};
+    const on = r.on !== false;
+    const st = on ? (s.state || 'idle') : 'off';
+    const where = s.file ? '#' + (s.index || '?') + ' ' + s.file : '';
+    return `<div class="lane" data-key="${r.keep}" data-state="${st}">` +
+      `<div class="hub">${fi('key')}<em class="dot"></em></div>` +
+      `<label class="lane-name">${credEsc(r.name || ('Key ' + (r.keep + 1)))}` +
+        `<em>${credEsc(r.masked)}</em></label>` +
+      `<span class="chip lane-chip">${credEsc(laneChipText(st, s))}</span>` +
+      `<em class="lane-file">${credEsc(where)}</em>` +
+      `<label class="sw lane-sw" title="${on ? 'ON - this key can take a parallel lane'
+                                             : 'OFF - kept in .env, no lane in a parallel run'}">` +
+        `<input type="checkbox" data-keyon="${i}"${on ? ' checked' : ''}` +
+        ` aria-label="${credEsc(r.name || ('Key ' + (i + 1)))} — parallel lane">` +
+        `<span class="tr" aria-hidden="true"></span>` +
+      `</label>` +
+      `</div>`;
+  }).join('');
+  box.querySelectorAll('input[data-keyon]').forEach(box => {
+    box.onchange = () => {
+      const r = CredState.rows[+box.dataset.keyon];
+      if (!r) return;
+      r.on = box.checked;               // session-only — never written to .env
+      lanesRender();
+    };
+  });
+  laneNowPaint();
+}
+function laneNowPaint(){
+  const now = $('laneNow');
+  if (!now) return;
+  const vals = Object.values(LANES.states);
+  const busy = vals.filter(s => s.state === 'start' || s.state === 'route' ||
+                                s.state === 'wait').length;
+  const done = vals.filter(s => s.state === 'done').length;   // importing or imported
+  const imported = vals.filter(s => s.phase === 'imported').length;
+  const bad  = vals.filter(s => s.state === 'failed').length;
+  now.dataset.state = bad ? 'err' : (busy ? 'live' : (done ? 'done' : 'idle'));
+  $('laneNowName').textContent = busy ? ('Round ' + LANES.round) : 'lanes';
+  $('laneNowDetail').textContent = busy
+    ? busy + ' lane(s) working · ' + imported + ' imported'
+    : imported + ' imported · ' + bad + ' failed · ' + laneRows().length + ' lane(s)';
+}
+function laneFeed(ev){
+  if (ev.key === null || ev.key === undefined) return;
+  const s = {state: ev.state};
+  ['index', 'file', 'model', 'attempt', 'reason', 'phase'].forEach(f => {
+    if (ev[f] !== undefined) s[f] = ev[f];
+  });
+  LANES.states[ev.key] = Object.assign({}, LANES.states[ev.key] || {}, s);
+  lanesRender();
+}
+function pipeModePaint(){
+  const par = PipeRun.mode === 'parallel';
+  $('stages').hidden = par;
+  $('lanes').hidden = !par;
+  if (par && !CredState.loaded) loadCredentials();   // the rows ARE the lane list
+  lanesRender();
+}
+
+/* The session on/off selection sent with Run: pool INDICES of the rows that
+   are saved, not removed and still ON (row i ↔ gemini_key_pool[i] — the same
+   contract /api/credentials uses). null = every key is on (Q4=A). */
+function activeKeyMask(){
+  const rows = (CredState.rows || []).filter(
+    r => r.keep !== null && !r.removed && r.on !== false);
+  const idx = rows.map(r => r.keep);
+  return idx.length ? idx : null;
+}
+
 $('runBtn').onclick = async () => {
   if (PIPE_RUNNING){
     if (PIPE_STOPPING) return;                  // already asked — one wish is enough
@@ -473,7 +591,11 @@ $('runBtn').onclick = async () => {
     return;
   }
   PIPE_STOPPING = false;
-  const r = await fetch('/api/run', {method: 'POST'});
+  const r = await fetch('/api/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({mode: PipeRun.mode, enabled_keys: activeKeyMask()}),
+  });
   const j = await r.json();
   if (!j.started) logLine({type:'log', level:'warn', ts:'',
     message:'A run is already in progress.'});
@@ -519,7 +641,7 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
 $('sideToggle').onclick = () => {
   const min = document.body.classList.toggle('side-min');
   $('sideToggle').querySelector('i').className =
-    'fa ' + (min ? 'fa-angles-right' : 'fa-angles-left');
+    'fa ' + (min ? 'fa-angles-right' : 'fa-bars-staggered');
   $('sideToggle').title = min ? 'Expand the sidebar' : 'Collapse the sidebar';
 };
 
@@ -2051,6 +2173,7 @@ function credModelTag(m){
 }
 
 function credRowEl(r, i){
+  if (r.on === undefined) r.on = true;   // session-only per-key enable (Q4=A)
   const wrap = document.createElement('div');
   const state = r.removed ? 'removed' : (r.checking ? 'checking'
     : (r.state || (r.keep === null ? 'new' : 'unknown')));
@@ -2171,6 +2294,7 @@ function credRender(){
     `${stored.length + CredState.rows.filter(r => r.keep === null && !r.removed).length} key(s) · ${live} verified`;
   credGatewayBar();
   cred9rRow();
+  lanesRender();
 }
 
 function credGatewayBar(){
@@ -2969,6 +3093,19 @@ async function loadPipeProviders(){
       sel.appendChild(o);
     });
     sel.value = ProvState.active;
+    // Parallel mode needs the Gemini key pool: a custom (9router) provider has
+    // no key to pin a lane to, so disable Parallel and fall back to one-by-one.
+    const pm = $('pipeMode');
+    if (pm){
+      const par = pm.querySelector('button[data-mode="parallel"]');
+      const gemini = !ProvState.active;      // "" == the Gemini pool
+      if (par) par.disabled = !gemini;
+      if (!gemini && PipeRun.mode === 'parallel'){
+        PipeRun.mode = 'one';
+        pm.querySelectorAll('button').forEach(x =>
+          x.classList.toggle('active', x.dataset.mode === 'one'));
+      }
+    }
     paintConn();
   }catch(e){ /* first paint before the server is up */ }
 }
@@ -3518,13 +3655,16 @@ function credUsageLive(ev){
 }
 
 /* ── 3 · usage tab: a plot + per-call table (criterion 6) ── */
-const UsageState = { period: 'all', data: null, busy: false, loaded: false };
+const UsageState = { period: 'all', group: 'model', ymode: 'calls',
+                     data: null, busy: false, loaded: false };
 
 async function usageRefresh(){
   if (UsageState.busy) return;
   UsageState.busy = true;
   try{
-    const res = await fetch('/api/usage?period=' + encodeURIComponent(UsageState.period));
+    const res = await fetch('/api/usage?period=' + encodeURIComponent(UsageState.period) +
+      '&group=' + encodeURIComponent(UsageState.group) +
+      '&y=' + encodeURIComponent(UsageState.ymode));
     UsageState.data = await res.json();
   }catch(e){ UsageState.data = null; }
   UsageState.busy = false;
@@ -3549,59 +3689,93 @@ function usageRender(data){
   }
   const t = d.totals || {};
   const rows = (d.calls || []).slice(-40).reverse();
+  const fmtSecs = ms => ((Number(ms) || 0) / 1000).toLocaleString(undefined, {maximumFractionDigits: 2});
   if (totals) totals.innerHTML =
     `<span><b>${t.calls || 0}</b> calls</span>` +
+    `<span><b>${t.errors || 0}</b> errors</span>` +
     `<span><b>${(t.tokens_in || 0).toLocaleString()}</b> in</span>` +
     `<span><b>${(t.tokens_out || 0).toLocaleString()}</b> out</span>` +
-    `<span><b>${(t.ms || 0).toLocaleString()}</b> ms total</span>` +
+    `<span><b>${fmtSecs(t.ms)}</b> s delay</span>` +
+    `<span class="hint">avg ${fmtSecs(t.calls ? (t.ms / t.calls) : 0)} s/call</span>` +
     `<span class="hint">${PERIOD_LABEL[UsageState.period] || 'all time'}</span>`;
-  usagePlot(d.calls || []);
+  usagePlot(d.chart);
   const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
       <td>${credEsc((r.ts_utc || '').slice(0, 19).replace('T', ' '))}</td>
       <td class="mono">${credEsc(r.model || '—')}</td>
       <td>${credEsc(r.key_name || '—')}</td>
       <td class="mono">${credEsc(r.key_masked || '—')}</td>
       <td class="num">${(r.tokens_in || 0).toLocaleString()} / ${(r.tokens_out || 0).toLocaleString()}</td>
-      <td class="num">${(r.ms || 0).toLocaleString()}</td>
+      <td class="num">${fmtSecs(r.ms)}</td>
     </tr>`).join('')
     : '<tr><td colspan="6" class="hint">No calls recorded in this period.</td></tr>';
   if (table) table.innerHTML = `<thead><tr><th>Time (UTC)</th><th>Model</th><th>Key name</th><th>Key</th>
-      <th>Tokens in / out</th><th>ms</th></tr></thead><tbody>${body}</tbody>`;
+      <th class="num">Tokens in / out</th><th class="num">Delay (seconds)</th></tr></thead><tbody>${body}</tbody>`;
   usageWire();
 }
 
-/* one curve: tokens_out per time bucket, for the selected period (no chart lib) */
-function usagePlot(rows){
+/* grouped bars: one bar-group per day, one colour per series (no chart lib) */
+function usagePlot(chart){
   const box = $('usagePlot');
   if (!box) return;
-  const data = (rows || []).slice().sort((a, b) => (a.ts || 0) - (b.ts || 0));
-  if (!data.length){ box.innerHTML = '<p class="hint">No calls in this period.</p>'; return; }
-  const W = 760, H = 220, PAD = 34, N = 32;
-  const t0 = data[0].ts || 0, t1 = data[data.length - 1].ts || t0;
-  const span = Math.max(1, t1 - t0);
-  const buckets = new Array(N).fill(0);
-  data.forEach(r => {
-    const i = Math.min(N - 1, Math.floor((((r.ts || t0) - t0) / span) * (N - 1)));
-    buckets[i] += (r.tokens_out || 0);
+  const days = (chart && chart.days) || [];
+  const series = (chart && chart.series) || [];
+  const cells = (chart && chart.cells) || [];
+  if (!days.length || !series.length){
+    box.innerHTML = '<p class="hint">No calls in this period.</p>';
+    return;
+  }
+  const W = 760, H = 220, PAD = 34, GAP = 10;
+  const plotW = W - PAD * 2, plotH = H - PAD * 2;
+  let max = 0;
+  cells.forEach(row => row.forEach(v => { if (v > max) max = v; }));
+  max = max || 1;
+  const groupW = plotW / days.length;
+  const barW = Math.max(3, (groupW - GAP - 2) / series.length);
+  const labelEvery = Math.max(1, Math.ceil(days.length / 7));
+  let bars = '', labels = '';
+  days.forEach((day, di) => {
+    const x0 = PAD + di * groupW + (groupW - barW * series.length) / 2;
+    series.forEach((s, si) => {
+      const v = cells[di][si] || 0;
+      const h = (v / max) * plotH;
+      if (h > 0){
+        bars += `<rect class="s${si % 6}" x="${(x0 + si * barW).toFixed(1)}" ` +
+                `y="${(H - PAD - h).toFixed(1)}" width="${(barW - 2).toFixed(1)}" ` +
+                `height="${h.toFixed(1)}" rx="2"><title>${credEsc(day)} · ` +
+                `${credEsc(s)}: ${v.toLocaleString()}</title></rect>`;
+      }
+    });
+    if (di % labelEvery === 0){
+      labels += `<text class="usage-max" x="${(PAD + di * groupW + groupW / 2).toFixed(1)}" ` +
+                `y="${H - PAD + 16}" text-anchor="middle">${day.slice(5)}</text>`;
+    }
   });
-  const max = Math.max.apply(null, buckets) || 1;
-  const x = i => PAD + (i * (W - PAD * 2)) / (N - 1);
-  const y = v => H - PAD - (v / max) * (H - PAD * 2);
-  const line = buckets.map((v, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join(' ');
-  const area = line + ` L ${x(N - 1).toFixed(1)} ${H - PAD} L ${PAD} ${H - PAD} Z`;
-  box.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" ` +
-    `aria-label="tokens out over the selected period">` +
-    `<path class="usage-area" d="${area}"/>` +
-    `<path class="usage-line" d="${line}"/>` +
+  const legend = series.map((s, i) =>
+    `<span class="usage-legend-item"><i class="usage-swatch s${i % 6}"></i>` +
+    `${credEsc(s)}</span>`).join('');
+  box.innerHTML =
+    `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="usage per day">` +
     `<line class="usage-axis" x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}"/>` +
-    `<text class="usage-max" x="${PAD}" y="${PAD - 8}">${max.toLocaleString()} tokens out</text>` +
-    `</svg>`;
+    `<text class="usage-max" x="${PAD}" y="${PAD - 8}">max ${max.toLocaleString()} ` +
+    `${chart.y === 'tokens' ? 'tokens'
+        : (chart.y === 'ms' || chart.y === 'avg_ms') ? 'ms' : 'calls'}/day</text>` +
+    bars + labels + `</svg>` +
+    `<div class="usage-legend">${legend}</div>`;
 }
 function usageWire(){
   const chips = $('usagePeriods');
-  if (!chips) return;
-  chips.querySelectorAll('button[data-uperiod]').forEach(b => {
+  if (chips) chips.querySelectorAll('button[data-uperiod]').forEach(b => {
     b.onclick = () => { UsageState.period = b.dataset.uperiod; usageRefresh(); };
+  });
+  const group = $('usageGroup');
+  if (group){
+    group.value = UsageState.group;
+    group.onchange = () => { UsageState.group = group.value; usageRefresh(); };
+  }
+  const ym = $('usageYMode');
+  if (ym) ym.querySelectorAll('button[data-ymode]').forEach(b => {
+    b.classList.toggle('active', b.dataset.ymode === UsageState.ymode);
+    b.onclick = () => { UsageState.ymode = b.dataset.ymode; usageRefresh(); };
   });
 }
 
@@ -3706,11 +3880,8 @@ function upRender(){
 }
 
 $('upRefresh').onclick = upLoad;
-$('upFiles').onchange = () => {
-  const n = $('upFiles').files.length;
-  $('upPickText').textContent = n ? n + ' file(s) selected' : 'Add PDF files…';
-};
-$('upAdd').onclick = async () => {
+
+async function upQueue(){
   const files = Array.from($('upFiles').files || []);
   if (!files.length){ toast('Pick at least one PDF first'); return; }
   const s = upDds.subject.value, g = upDds.grade.value, t = upDds.topic.value;
@@ -3732,10 +3903,30 @@ $('upAdd').onclick = async () => {
   $('upPickText').textContent = 'Add PDF files…';
   if (ok) toast(ok + ' file(s) queued for ' + dest);
   await upLoad();
-};
+}
 
-/* ── 5 · period stats — existing DB data only (Q4, criterion 11) ── */
+/* choosing a file enqueues it straight away — selection is the add action */
+$('upFiles').onchange = () => { if ($('upFiles').files.length) upQueue(); };
+$('upAdd').onclick = upQueue;
+
+/* ── 5 · period stats — file cards mirror the run, Q/A cards the DB ── */
 const StatsState = { period: '24h' };
+
+function fileRunLabel(){
+  if (RAIL.running) return 'this run';
+  return (RAIL.total || RAIL.processed || RAIL.errors) ? 'last run' : 'no run yet';
+}
+
+function statsPaint(){
+  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  const live = fileRunLabel() !== 'no run yet';
+  set('psSucceeded', live ? RAIL.processed.toLocaleString() : '—');
+  set('psErrors',    live ? RAIL.errors.toLocaleString()    : '—');
+  set('psTotal',     live ? RAIL.total.toLocaleString()     : '—');
+  set('psCaption', 'files: ' + fileRunLabel() +
+                   ' · questions & answers: last ' +
+                   (PERIOD_LABEL[StatsState.period] || 'all time'));
+}
 
 async function statsLoad(period){
   StatsState.period = period || '24h';
@@ -3746,12 +3937,9 @@ async function statsLoad(period){
   try{
     const d = await (await fetch('/api/stats?period=' + encodeURIComponent(StatsState.period))).json();
     if (!d.ok) throw new Error(d.error || 'request failed');
-    set('psSucceeded', (d.succeeded || 0).toLocaleString());
-    set('psErrors', (d.errors || 0).toLocaleString());
-    set('psTotal', (d.total || d.files || 0).toLocaleString());
     set('psQuestions', (d.questions || 0).toLocaleString());
     set('psAnswers', (d.answers || 0).toLocaleString());
-    set('psCaption', 'last ' + (PERIOD_LABEL[StatsState.period] || 'all time') + ' · from existing DB rows');
+    statsPaint();                       // file cards never touch /api/stats
   }catch(e){
     const el = $('psError');
     if (el){ el.hidden = false; el.textContent = String(e.message || e); }

@@ -21,7 +21,7 @@ from pipeline.dataconsole import DataConsole, GuardError
 from pipeline.revision import runner as revision_runner
 from pipeline.config import load_config, ENV_PATH, seed_proxy_profile
 from pipeline.db import Database
-from pipeline.gemini_router import router
+from pipeline.gemini_router import router, usage_chart
 from pipeline.gemini_router import mask as mask_key
 from pipeline.runner import Hub, start_run
 from dotenv import load_dotenv
@@ -106,9 +106,28 @@ async def state():
     return JSONResponse(hub.snapshot())
 
 
+class RunOptions(BaseModel):
+    """Body of POST /api/run — page-level, never persisted (PREFERENCE §3).
+
+    `mode` is "one" (one-by-one, today's serial loop) or "parallel".
+    `enabled_keys` is the Credentials tab's session on/off selection, sent as
+    pool INDICES (row i ↔ gemini_key_pool[i], the same contract /api/credentials
+    uses at :717); None means every key is on."""
+    mode: str = "one"
+    enabled_keys: list[int] | None = None
+
+
 @app.post("/api/run")
-async def run():
-    started = start_run(hub, cfg, db)
+async def run(opts: RunOptions | None = None):
+    mode = "parallel" if (opts and opts.mode == "parallel") else "serial"
+    enabled = None
+    if mode == "parallel" and opts and opts.enabled_keys:
+        pool = list(cfg.gemini_key_pool)
+        enabled = [pool[i] for i in opts.enabled_keys
+                   if isinstance(i, int) and 0 <= i < len(pool)]
+        if not enabled:
+            enabled = None          # nothing usable selected -> every key
+    started = start_run(hub, cfg, db, mode=mode, enabled_keys=enabled)
     return JSONResponse({"started": started}, status_code=200 if started else 409)
 
 @app.post("/api/stop")
@@ -196,10 +215,11 @@ async def period_stats(period: str = "all"):
 
 
 @app.get("/api/usage")
-async def usage_report(period: str = "all"):
+async def usage_report(period: str = "all", group: str = "model", y: str = "calls"):
     """Per-call usage history for the credentials reports (Q4/Q11)."""
     report = router.usage_report(period if period in ("24h", "7d", "30d", "all") else "all")
     report["ok"] = True
+    report["chart"] = usage_chart(report.get("calls") or [], group=group, y=y)
     return JSONResponse(report)
 
 class StatusUpdate(BaseModel):
@@ -912,7 +932,7 @@ async def credentials_test(body: ProviderTest):
                 pool[0], model, 'Reply with exactly: {"ping": true}', "",
                 "text/plain", max_tokens=16, retries=1)
         try:
-            parsed, _raw = await asyncio.to_thread(_one)
+            parsed, _raw, _usage = await asyncio.to_thread(_one)
         except Exception as exc:                       # pragma: no cover
             flt = getattr(exc, "fault", None)
             return JSONResponse(

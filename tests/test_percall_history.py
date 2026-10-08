@@ -20,11 +20,12 @@ from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline import faults, gemini_router
+from pipeline import faults, gemini, gemini_router
 from pipeline.gemini_router import (
     GeminiRouter,
     _next_utc_midnight_ts,
     PERIOD_HOURS,
+    usage_chart,
 )
 from pipeline.db import Database
 
@@ -129,6 +130,130 @@ class PerCallHistoryTests(unittest.TestCase):
         self.assertEqual(PERIOD_HOURS, {"24h": 24, "7d": 24 * 7,
                                         "30d": 24 * 30})
 
+    def test_mark_ok_records_tokens_and_key_name(self):
+        """A successful Gemini call threads its usageMetadata (and the key
+        label) into the persisted history row (Change 3)."""
+        r = GeminiRouter()
+        r._mark_ok("supersecretkey", "gemini-3.5-flash",
+                   elapsed_ms=10.0, tokens_in=7, tokens_out=5, key_name="Key 1")
+        with open(self._calls_file(), encoding="utf-8") as fh:
+            row = json.load(fh)[0]
+        self.assertEqual(row["tokens_in"], 7)
+        self.assertEqual(row["tokens_out"], 5)
+        self.assertEqual(row["key_name"], "Key 1")
+        totals = r.usage_report("all")["totals"]
+        self.assertEqual(totals["tokens_in"], 7)
+        self.assertEqual(totals["tokens_out"], 5)
+
+
+class UsageChartTests(unittest.TestCase):
+    """The server-side day × series bucketing behind the Usage curve (Q2/Q3)."""
+
+    @staticmethod
+    def _ts(day, hour=9):
+        return datetime(2026, 10, day, hour, tzinfo=timezone.utc).timestamp()
+
+    def test_chart_groups_by_day_and_model(self):
+        rows = [
+            {"ts": self._ts(7, 9), "model": "m1"},
+            {"ts": self._ts(7, 10), "model": "m1"},
+            {"ts": self._ts(8, 9), "model": "m2"},
+        ]
+        chart = usage_chart(rows)
+        self.assertEqual(chart["days"], ["2026-10-07", "2026-10-08"])
+        self.assertEqual(chart["series"], ["m1", "m2"])   # biggest total first
+        self.assertEqual(chart["cells"], [[2, 0], [0, 1]])
+
+    def test_chart_switches_series_to_key_and_y_to_tokens(self):
+        rows = [
+            {"ts": self._ts(7), "model": "m1", "key_name": "Key 1",
+             "tokens_in": 5, "tokens_out": 7},
+            {"ts": self._ts(7), "model": "m1", "key_name": "",
+             "key_masked": "AIza…cdef", "tokens_in": 1, "tokens_out": 1},
+        ]
+        chart = usage_chart(rows, group="key", y="tokens")
+        self.assertEqual(chart["group"], "key")
+        self.assertEqual(chart["y"], "tokens")
+        self.assertCountEqual(chart["series"], ["Key 1", "AIza…cdef"])
+        totals = {s: chart["cells"][0][i] for i, s in enumerate(chart["series"])}
+        self.assertEqual(totals["Key 1"], 12)          # 5 + 7 tokens
+        self.assertEqual(totals["AIza…cdef"], 2)       # masked fallback
+        # an unknown group/y falls back to the whitelist defaults
+        fb = usage_chart(rows, group="nope", y="nope")
+        self.assertEqual((fb["group"], fb["y"]), ("model", "calls"))
+
+    def test_y_tokens_is_zero_until_a_call_records_tokens(self):
+        """The regression that made the old curve invisible: history rows
+        written without tokens show 0 on Y=tokens but a real Y=calls."""
+        rows = [{"ts": self._ts(7), "model": "m1",
+                 "tokens_in": 0, "tokens_out": 0}]
+        self.assertEqual(usage_chart(rows, y="tokens")["cells"], [[0]])
+        self.assertEqual(usage_chart(rows, y="calls")["cells"], [[1]])
+
+    def test_usage_chart_y_ms_sums_delay_per_day(self):
+        """Y=ms: the cell is the summed per-call delay (Q5 cumulative)."""
+        rows = [{"ts": self._ts(7, 9), "model": "m1", "ms": 1000.0},
+                {"ts": self._ts(7, 10), "model": "m1", "ms": 3000.0}]
+        chart = usage_chart(rows, y="ms")
+        self.assertEqual(chart["y"], "ms")
+        self.assertEqual(chart["cells"], [[4000.0]])
+
+    def test_usage_chart_y_avg_ms_divides_by_call_count(self):
+        """Y=avg_ms: the same cell divided by its call count (Q5 average)."""
+        rows = [{"ts": self._ts(7, 9), "model": "m1", "ms": 1000.0},
+                {"ts": self._ts(7, 10), "model": "m1", "ms": 3000.0}]
+        self.assertEqual(usage_chart(rows, y="avg_ms")["cells"], [[2000.0]])
+
+    def test_usage_chart_delay_whitelist_and_fallback(self):
+        """Both delay modes survive the whitelist; an unknown y still falls
+        back to calls."""
+        rows = [{"ts": self._ts(7), "model": "m1", "ms": 500.0}]
+        self.assertEqual(usage_chart(rows, y="ms")["y"], "ms")
+        self.assertEqual(usage_chart(rows, y="avg_ms")["y"], "avg_ms")
+        self.assertEqual(usage_chart(rows, y="delay")["y"], "calls")
+
+
+class GeminiUsageCaptureTests(unittest.TestCase):
+    """call_gemini surfaces Gemini's usageMetadata as a third return value."""
+
+    class Resp:
+        def __init__(self, status, json_body=None):
+            self.status_code = status
+            self.text = ""
+            self._json = json_body
+
+        def json(self):
+            if self._json is None:
+                raise ValueError("no json")
+            return self._json
+
+    def setUp(self):
+        self._real_post = gemini.requests.post
+        self.addCleanup(setattr, gemini.requests, "post", self._real_post)
+
+    def _use(self, resp):
+        gemini.requests.post = lambda *a, **k: resp
+
+    @staticmethod
+    def _body(with_usage=True):
+        body = {"candidates": [{"content": {"parts": [{"text": '{"answer": 1}'}]}}]}
+        if with_usage:
+            body["usageMetadata"] = {"promptTokenCount": 120,
+                                     "candidatesTokenCount": 34}
+        return body
+
+    def test_call_gemini_returns_usage_metadata(self):
+        self._use(self.Resp(200, json_body=self._body(True)))
+        parsed, _text, usage = gemini.call_gemini(
+            "k", "gemini-3.5-flash", "p", "", "text/plain", retries=1)
+        self.assertEqual(parsed, {"answer": 1})
+        self.assertEqual(usage, {"tokens_in": 120, "tokens_out": 34})
+        # a response without usageMetadata degrades to zeros, not a crash
+        self._use(self.Resp(200, json_body=self._body(False)))
+        _p, _t, usage = gemini.call_gemini(
+            "k", "gemini-3.5-flash", "p", "", "text/plain", retries=1)
+        self.assertEqual(usage, {"tokens_in": 0, "tokens_out": 0})
+
 
 class BackoffTests(unittest.TestCase):
     def test_sequence_doubles_from_base_to_cap(self):
@@ -188,6 +313,75 @@ class PeriodCountsTests(unittest.TestCase):
         got = db.fetch_period_counts()
         self.assertEqual(got, {"questions": 0, "answers": 0, "errors": 0,
                                "files": 0, "total": 0, "succeeded": 0})
+
+
+class ClearZeroBboxTests(unittest.TestCase):
+    def _db(self, rows):
+        db = Database(SimpleNamespace(
+            postgres_host="", postgres_port=0, postgres_db="",
+            postgres_user="", postgres_password="", postgres_sslmode=""))
+        captured = {}
+
+        def fake_execute(sql, params=None, fetch=False):
+            captured["sql"] = sql
+            captured["params"] = params
+            return rows
+
+        db._execute = fake_execute
+        db.captured = captured
+        return db
+
+    def test_clear_zero_bboxes_passes_limit_and_counts_rows(self):
+        db = self._db([("q1",), ("q2",)])
+        self.assertEqual(db.clear_zero_bboxes(), 2)
+        self.assertIn("'[0,0,0,0]'", db.captured["sql"])
+        self.assertIn("LIMIT", db.captured["sql"])
+        self.assertEqual(db.captured["params"], (100,))
+
+    def test_clear_zero_bboxes_defaults_to_last_100(self):
+        self.assertEqual(Database.clear_zero_bboxes.__defaults__, (100,))
+
+
+class UsageTotalsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._real_usage = gemini_router.USAGE_PATH
+        gemini_router.USAGE_PATH = os.path.join(self._tmp.name, "usage.json")
+
+    def tearDown(self):
+        gemini_router.USAGE_PATH = self._real_usage
+        self._tmp.cleanup()
+
+    def test_report_totals_count_errors(self):
+        r = GeminiRouter()
+        now = time.time()
+        rows = [
+            {"ts": now, "model": "m1", "tokens_in": 1, "tokens_out": 2,
+             "ms": 10.0, "ok": True},
+            {"ts": now, "model": "m1", "tokens_in": 0, "tokens_out": 0,
+             "ms": 5.0, "ok": False},
+        ]
+        with open(os.path.join(self._tmp.name, ".gemini-calls.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(rows, fh)
+        totals = r.usage_report("all")["totals"]
+        self.assertEqual(totals["errors"], 1)
+        self.assertEqual(totals["calls"], 2)
+
+    def test_usage_report_totals_carry_ms_and_calls_for_avg(self):
+        """The Usage header divides ms by calls for the average (Q5)."""
+        r = GeminiRouter()
+        now = time.time()
+        rows = [{"ts": now, "model": "m1", "tokens_in": 0, "tokens_out": 0,
+                 "ms": 1000.0, "ok": True},
+                {"ts": now, "model": "m1", "tokens_in": 0, "tokens_out": 0,
+                 "ms": 3000.0, "ok": True}]
+        with open(os.path.join(self._tmp.name, ".gemini-calls.json"),
+                  "w", encoding="utf-8") as fh:
+            json.dump(rows, fh)
+        totals = r.usage_report("all")["totals"]
+        self.assertEqual(totals["calls"], 2)
+        self.assertEqual(totals["ms"], 4000.0)
 
 
 if __name__ == "__main__":

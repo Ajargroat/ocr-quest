@@ -6,22 +6,24 @@ import os
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 
-from . import deferrals, faults
+from . import deferrals, faults, parallel
 from .answers import build_answer_prompt, finalize_answer_rows, prepare_answer_rows
 from .config import Config
 from .db import Database
 from .gemini import set_proxy
-from .gemini_router import router
+from .gemini_router import router, mask
 from .questions import QUESTION_PROMPT, build_question_rows
 from .scanner import scan
 from .storage import upload_file
 from .vision import call_ocr_openai
 
 
-def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
+def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None,
+              key_pin=None):
     """Dispatch one OCR request to the configured engine.
 
     Lives in the runner (not vision.py) on purpose: the Gemini lane is the
@@ -29,7 +31,10 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
     dispatch honours cfg.ocr_provider ('gemini' default | 'custom').
     'custom' is the one OpenAI-compatible provider kind — its endpoint
     never rides the proxy lane (gemini.proxy_proxies only scopes
-    Google-bound calls)."""
+    Google-bound calls).
+
+    `key_pin` (parallel mode) pins the call to ONE key: the router walks
+    only that key's own ladder and never rotates to another key."""
     if cfg is not None and (cfg.ocr_provider or "gemini").lower() != "gemini":
         # Custom lane (the built-in 9router, Q2): time the call and record
         # it into the same per-call JSON history the usage reports read —
@@ -46,6 +51,12 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None):
                 key_name="9router", ok=True)
         except Exception:
             pass
+        return parsed
+    if key_pin:
+        # Parallel lane: one PINNED key, its own ladder, no key rotation.
+        parsed, _raw, _route = router.call_pinned(
+            cfg, key_pin, prompt, data_b64, mime_type,
+            on_problem=on_problem, on_route=on_route)
         return parsed
     parsed, _raw, _route = router.call(
         cfg, prompt, data_b64, mime_type,
@@ -110,6 +121,7 @@ class Hub:
                       "answers": 0, "errors": 0, "deferred": 0}
         self.error_kinds = {}      # fault kind → count, reset each run
         self.db_fail_streak = 0    # consecutive files ending in parked writes
+        self.lanes = {}            # pool index → last lane state (reconnect seed)
 
     def attach_loop(self, loop):
         self.loop = loop
@@ -140,10 +152,18 @@ class Hub:
                     record[key] = event[key]
         elif kind == "stats":
             self.stats.update(event["stats"])
+        elif kind == "lane":
+            k = event.get("key")
+            if k is not None:
+                self.lanes[k] = {f: event[f] for f in
+                                 ("state", "index", "file", "model", "attempt",
+                                  "phase")
+                                 if event.get(f) is not None}
         elif kind == "run_started":
             self.running = True
             self.error_kinds = {}
             self.db_fail_streak = 0
+            self.lanes = {}
         elif kind == "error":
             k = event.get("kind", "unknown")
             self.error_kinds[k] = self.error_kinds.get(k, 0) + 1
@@ -171,20 +191,29 @@ class Hub:
                 "log": list(self.log),
                 "rev_log": list(self.rev_log),
                 "error_kinds": dict(self.error_kinds),
+                "lanes": dict(self.lanes),
             }
 
 
-def start_run(hub: Hub, cfg: Config, db: Database) -> bool:
+def start_run(hub: Hub, cfg: Config, db: Database, mode: str = "serial",
+              enabled_keys=None) -> bool:
+    """Start a run. `mode` is "serial" (one-by-one, today's loop) or
+    "parallel" (round-based, one file per healthy key per round).
+    `enabled_keys` is the session-only per-key on/off selection sent with
+    Run — None means "every key in the pool is on"."""
     with hub.lock:
         if hub.running:
             return False
         hub.running = True
         hub.stop_flag.clear()
-    threading.Thread(target=_run, args=(hub, cfg, db), daemon=True).start()
+    options = {"mode": mode,
+               "enabled_keys": list(enabled_keys) if enabled_keys else None}
+    threading.Thread(target=_run, args=(hub, cfg, db, options), daemon=True).start()
     return True
 
 
-def _run(hub: Hub, cfg: Config, db: Database):
+def _run(hub: Hub, cfg: Config, db: Database, options=None):
+    options = options or {}
     def log(level, message, err=None):
         event = {"type": "log", "level": level, "message": message}
         if err:
@@ -272,44 +301,259 @@ def _run(hub: Hub, cfg: Config, db: Database):
                         "no file was touched.")
             return
 
-        # --- main loop (Loop Over Items) -----------------------------
-        # Circuit breaker: MAX_CONSECUTIVE_DB_FAILURES files in a row whose
-        # Postgres writes had to be parked means the DB is down, not blipping
-        # — stop so we keep neither burning quota nor stacking up cache.
-        limit = deferrals.max_consecutive_failures()
-        stopped = False
-        for index, item in enumerate(items, 1):
-            if hub.stop_flag.is_set():
-                stopped = True
-                log("warn", f"Stop requested — halting after file {index - 1} of "
-                            f"{len(items)}; the remaining files stay for the next run.")
-                break
-            outcome = _process_item(hub, cfg, db, item, index, len(items))
-            if outcome == "clean":
-                hub.db_fail_streak = 0
-            elif outcome in ("deferred", "store_failed"):
-                hub.db_fail_streak += 1
-                if hub.db_fail_streak >= limit:
-                    _major_db_halt(hub, log, limit)
-                    break
-            # a plain "failed" (unreadable file, Google tunnel…) leaves the
-            # streak untouched — it is not a database signal
+        # --- dispatch: serial (one-by-one) or parallel (round-based) -----
+        # Parallel mode only exists for the Gemini key pool; the custom
+        # (9router) lane has no key to pin a lane to, so it falls back.
+        mode = options.get("mode", "serial")
+        if mode == "parallel" and (cfg.ocr_provider or "gemini").lower() == "gemini":
+            _run_parallel(hub, cfg, db, items, options, log)
         else:
-            # Normal end of the queue: come back and import everything parked.
-            _flush_parked(hub, db, log)
-
-        if stopped:
-            # A manual stop still imports parked writes: that work is finished
-            # and must not wait for another run.
-            _flush_parked(hub, db, log)
-            log("warn", "Run stopped on request.")
-        else:
-            log("success", "Run finished.")
+            if mode == "parallel":
+                log("warn", "Parallel mode needs the Gemini key pool — "
+                            "running one-by-one this run.")
+            _run_serial(hub, cfg, db, items, log)
     except Exception as exc:
         flt = getattr(exc, "fault", None) or faults.classify(exc)
         log("error", f"Run aborted — {flt['label']}: {exc}", flt["kind"])
     finally:
         hub.emit({"type": "run_finished"})
+
+
+def _run_serial(hub: Hub, cfg: Config, db: Database, items, log):
+    """Today's strictly-serial loop — one file end to end (the one-by-one
+    system). Behaviour is unchanged; the parallel engine is the alternative."""
+    # Circuit breaker: MAX_CONSECUTIVE_DB_FAILURES files in a row whose
+    # Postgres writes had to be parked means the DB is down, not blipping
+    # — stop so we keep neither burning quota nor stacking up cache.
+    limit = deferrals.max_consecutive_failures()
+    stopped = False
+    blocked = 0
+    for index, item in enumerate(items, 1):
+        if hub.stop_flag.is_set():
+            stopped = True
+            log("warn", f"Stop requested — halting after file {index - 1} of "
+                        f"{len(items)}; the remaining files stay for the next run.")
+            break
+        outcome = _process_item(hub, cfg, db, item, index, len(items))
+        if outcome == "clean":
+            hub.db_fail_streak = 0
+        elif outcome == "blocked":
+            # Q4: every key×model pair is exhausted, so the rest of the
+            # queue would fail identically — stop and say how many files
+            # the run did not process instead of re-queueing them all.
+            blocked = blocked_remaining(len(items), index)
+            break
+        elif outcome in ("deferred", "store_failed"):
+            hub.db_fail_streak += 1
+            if hub.db_fail_streak >= limit:
+                _major_db_halt(hub, log, limit)
+                break
+        # a plain "failed" (unreadable file, Google tunnel…) leaves the
+        # streak untouched — it is not a database signal
+    else:
+        # Normal end of the queue: come back and import everything parked.
+        _flush_parked(hub, db, log)
+
+    if blocked:
+        _flush_parked(hub, db, log)
+        log("error", f"Run stopped — {blocked} file(s) blocked: every "
+                     "Gemini key/model pair is exhausted. See the "
+                     "Credentials tab for the per-key bars.")
+    elif stopped:
+        # A manual stop still imports parked writes: that work is finished
+        # and must not wait for another run.
+        _flush_parked(hub, db, log)
+        log("warn", "Run stopped on request.")
+    else:
+        log("success", "Run finished.")
+
+
+def _lane_event(hub, cfg, bundle, state, **extra):
+    """One `lane` WS event for a parallel lane. Shared by the round worker
+    (`produce`) and the import loop, which owns the terminal state.
+    `hub=None` means no visibility channel (tests)."""
+    if hub is None:
+        return
+    key = bundle.get("key")
+    pool = list(getattr(cfg, "gemini_key_pool", ()) or ())
+    ev = {"type": "lane",
+          "key": pool.index(key) if key in pool else None,   # pool index
+          "masked": mask(key),                               # display + fallback
+          "state": state,
+          "index": bundle["index0"] + 1,
+          "file": getattr(bundle.get("item"), "rel_path", "")}
+    ev.update(extra)
+    hub.emit(ev)
+
+
+def _produce_round(cfg, db, assignments, hub=None):
+    """Phase A+B of one parallel round.
+
+    Phase A (this thread, file order): read each file's bytes and build its
+    OCR prompt — the answer branch reads its DB context here, so the single
+    Postgres connection is never touched off-thread.
+
+    Phase B (small thread pool): the slow part — Supabase upload + OCR with
+    the lane's PINNED key. No DB write happens here.
+
+    `hub` (parallel runs) receives `lane` events WHILE the pool works — the
+    dashboard's parallel readout draws from these, not from the import phase
+    that runs after the OCR wait. None keeps the unit-test/serial paths quiet.
+
+    Returns {index0: bundle}; a bundle carries the produced values, or the
+    exception to replay in the import phase. The pool's workers never raise,
+    so one file's failure cannot abort its round."""
+    prepared = []
+    for index0, item, key in assignments:
+        bundle = {"item": item, "index0": index0, "key": key}
+        try:
+            with open(item.file_path, "rb") as fh:
+                raw = fh.read()
+            bundle["raw"] = raw
+            bundle["data_b64"] = base64.b64encode(raw).decode()
+            if item.type == "سوال":
+                bundle["prompt"] = QUESTION_PROMPT
+                bundle["candidates"] = None
+            else:
+                candidates = db.fetch_context_questions(
+                    item.subject, item.topic, item.grade)
+                bundle["candidates"] = candidates
+                bundle["prompt"] = build_answer_prompt(candidates)
+        except Exception as exc:
+            bundle["error"] = exc
+        prepared.append(bundle)
+
+    def lane(state, bundle, **extra):
+        _lane_event(hub, cfg, bundle, state, **extra)
+
+    def produce(bundle):
+        def lane_problem(flt, attempt, tries, wait, where=""):
+            # Backoff → the lane says what it is waiting on. `where` defaults so
+            # the 4-arg callers (gemini.py / storage.py / vision.py) work too.
+            lane("wait", bundle, phase=f"waiting {int(wait)}s")
+
+        lane("start", bundle, phase="uploading")  # the lane picked this file up
+        if bundle.get("error"):
+            lane("failed", bundle, phase="failed",
+                 reason=str(bundle["error"])[:160])
+            return bundle
+        try:
+            item = bundle["item"]
+            bundle["storage_url"] = upload_file(
+                cfg, item.source_id, bundle["raw"], item.mime_type)
+            lane("start", bundle, phase="ocr")     # upload done — now OCR
+            bundle["parsed"] = _call_ocr(
+                cfg, bundle["prompt"], bundle["data_b64"], item.mime_type,
+                on_problem=lane_problem,
+                on_route=lambda label, masked, model, attempt: lane(
+                    "route", bundle, model=model, attempt=attempt,
+                    phase="ocr"),
+                key_pin=bundle["key"])
+        except Exception as exc:
+            bundle["error"] = exc
+            lane("failed", bundle, phase="failed", reason=str(exc)[:160])
+            return bundle
+        lane("done", bundle, phase="importing")
+        return bundle
+
+    with ThreadPoolExecutor(max_workers=max(1, len(prepared))) as pool:
+        futures = [pool.submit(produce, b) for b in prepared]
+        for fut in as_completed(futures):
+            fut.result()          # produce() never raises — it stores errors
+    return {b["index0"]: b for b in prepared}
+
+
+def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
+    """Round-based parallel run.
+
+    Q1=A: N lanes, each PINNED to one healthy key (one file per lane per
+    round, a round barrier before the next round). Q2=B: a round's results
+    are imported in ORIGINAL FILE ORDER, on this thread — the DB connection
+    is single, so nothing writes it from a lane. Q3=B: a file whose lane has
+    no usable model left stays for the next run (its lane is dropped for the
+    rest of the run)."""
+    plan = router._plan(cfg, time.time())
+    lanes = parallel.lane_keys(cfg, options.get("enabled_keys"), plan=plan)
+    if not lanes:
+        log("warn", "Parallel mode: no healthy key has a free lane — "
+                    "running one-by-one this run.")
+        _run_serial(hub, cfg, db, items, log)
+        return
+    log("info", f"Parallel mode: {len(lanes)} lane(s) — one file per key per "
+                f"round over {len(items)} file(s); results import in file order.")
+
+    limit = deferrals.max_consecutive_failures()
+    stopped = False
+    blocked = 0
+    base = 0
+    round_no = 0
+    for segment in parallel.type_segments(items):
+        remaining = list(segment)
+        while remaining and lanes and not stopped and not blocked:
+            if hub.stop_flag.is_set():
+                stopped = True
+                log("warn", f"Stop requested — halting before file {base + 1} of "
+                            f"{len(items)}; the remaining files stay for the next run.")
+                break
+            # One round = one file per surviving lane, in file order.
+            _round_no, chunk = parallel.round_plan(remaining, lanes)[0]
+            round_no += 1
+            assignments = [(base + idx, item, key) for idx, item, key in chunk]
+            hub.emit({"type": "round", "no": round_no,
+                      "lanes": len(lanes), "files": len(assignments)})
+            bundles = _produce_round(cfg, db, assignments, hub=hub)
+
+            exhausted = set()
+            imported = 0
+            for _index0, bundle in parallel.import_order(
+                    [(b["index0"], b) for b in bundles.values()]):
+                index = bundle["index0"] + 1
+                pre = {"storage_url": bundle.get("storage_url"),
+                       "parsed": bundle.get("parsed"),
+                       "candidates": bundle.get("candidates"),
+                       "error": bundle.get("error")}
+                outcome = _process_item(hub, cfg, db, bundle["item"], index,
+                                        len(items), pre=pre)
+                ok = outcome in ("clean", "deferred")   # both reach done/
+                extra = {"phase": "imported" if ok else "not imported"}
+                if not ok and bundle.get("error"):
+                    extra["reason"] = str(bundle["error"])[:160]
+                _lane_event(hub, cfg, bundle, "done" if ok else "failed",
+                            **extra)
+                imported += 1
+                if outcome == "clean":
+                    hub.db_fail_streak = 0
+                elif outcome == "blocked":
+                    # This lane's pinned key is out of usable models — the
+                    # file stays for the next run (Q3=B); drop the lane.
+                    exhausted.add(bundle["key"])
+                elif outcome in ("deferred", "store_failed"):
+                    hub.db_fail_streak += 1
+                    if hub.db_fail_streak >= limit:
+                        _major_db_halt(hub, log, limit)
+                        stopped = True
+                        break
+
+            remaining = remaining[imported:]
+            base += imported
+            if exhausted:
+                lanes = [k for k in lanes if k not in exhausted]
+                if not lanes:
+                    blocked = len(items) - base
+                    break
+                log("warn", f"Parallel: {len(exhausted)} key(s) out of usable "
+                            f"models — {len(lanes)} lane(s) continue.")
+
+    if blocked:
+        _flush_parked(hub, db, log)
+        log("error", f"Run stopped — {blocked} file(s) blocked: no key has a "
+                     "usable model left. See the Credentials tab.")
+    elif stopped:
+        _flush_parked(hub, db, log)
+        log("warn", "Run stopped on request.")
+    else:
+        _flush_parked(hub, db, log)
+        log("success", "Run finished.")
 
 
 def _major_db_halt(hub: Hub, log, limit):
@@ -347,9 +591,16 @@ def _flush_parked(hub: Hub, db: Database, log):
                     "at the end of the next run.")
 
 
-def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
+def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
+                  pre=None):
     """Runs one file end to end and returns an outcome for the circuit
-    breaker: 'clean', 'deferred' (parked writes), 'store_failed' or 'failed'."""
+    breaker: 'clean', 'deferred' (parked writes), 'store_failed', 'failed'
+    or 'blocked' (every Gemini key/model pair exhausted — stop the run).
+
+    `pre` (parallel mode only) carries the slow steps a lane already did —
+    {"storage_url", "parsed", "candidates", "error"} — so this call performs
+    only the ordered DB import + archive on the run thread. None (the serial
+    path) reads, uploads and OCRs here exactly as before."""
     provider = (getattr(cfg, "ocr_provider", "gemini") if cfg else None) or "gemini"
     ocr_label = "Gemini" if provider.lower() == "gemini" \
         else (getattr(cfg, "ocr_model", "") or "OCR model")
@@ -446,16 +697,25 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
     try:
         log("info", f"[{index}/{total}] {branch}: {item.rel_path}")
 
-        with open(item.file_path, "rb") as fh:
-            raw = fh.read()
-        data_b64 = base64.b64encode(raw).decode()
+        if pre is not None:
+            # Parallel lane already read the file + uploaded it + OCR'd it.
+            storage_url = pre.get("storage_url")
+            parsed = pre.get("parsed")
+            candidates = pre.get("candidates")
+            if storage_url is None:            # the lane's upload failed
+                raise pre.get("error") or faults.FaultError(
+                    faults.fault("unknown"), "parallel lane produced no upload")
+        else:
+            with open(item.file_path, "rb") as fh:
+                raw = fh.read()
+            data_b64 = base64.b64encode(raw).decode()
 
-        # 1) Upload to Supabase storage (object name = source_id).
-        phase = "Supabase upload"
-        file_event("uploading", "Uploading to Supabase Storage")
-        storage_url = upload_file(cfg, item.source_id, raw, item.mime_type,
-                                  on_problem=on_problem)
-        check_stop("Supabase upload")
+            # 1) Upload to Supabase storage (object name = source_id).
+            phase = "Supabase upload"
+            file_event("uploading", "Uploading to Supabase Storage")
+            storage_url = upload_file(cfg, item.source_id, raw, item.mime_type,
+                                      on_problem=on_problem)
+            check_stop("Supabase upload")
 
         # 2) Upsert the sources row.
         phase = "source upsert"
@@ -469,8 +729,13 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
             phase = "OCR"
             file_event("ocr", f"{ocr_label} is extracting questions")
             check_stop("source upsert")
-            parsed = _call_ocr(cfg, QUESTION_PROMPT, data_b64, item.mime_type,
-                               on_problem=on_problem, on_route=on_route)
+            if pre is not None:
+                if parsed is None:             # the lane's OCR failed
+                    raise pre.get("error") or faults.FaultError(
+                        faults.fault("unknown"), "parallel lane produced no OCR")
+            else:
+                parsed = _call_ocr(cfg, QUESTION_PROMPT, data_b64, item.mime_type,
+                                   on_problem=on_problem, on_route=on_route)
             check_stop("gemini-ocr")
             rows = build_question_rows(item, parsed, storage_url)
             if rows:
@@ -486,14 +751,20 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
             # ---------- ANSWER BRANCH ----------
             phase = "DB context read"
             file_event("ocr", "Fetching related questions from DB")
-            candidates = db.fetch_context_questions(item.subject, item.topic, item.grade)
-            prompt = build_answer_prompt(candidates)
+            if pre is None:
+                candidates = db.fetch_context_questions(item.subject, item.topic, item.grade)
+                prompt = build_answer_prompt(candidates)
 
             phase = "OCR"
             file_event("ocr", f"{ocr_label} is extracting answers")
             check_stop("DB context read")
-            parsed = _call_ocr(cfg, prompt, data_b64, item.mime_type,
-                               on_problem=on_problem, on_route=on_route)
+            if pre is not None:
+                if parsed is None:             # the lane's OCR failed
+                    raise pre.get("error") or faults.FaultError(
+                        faults.fault("unknown"), "parallel lane produced no OCR")
+            else:
+                parsed = _call_ocr(cfg, prompt, data_b64, item.mime_type,
+                                   on_problem=on_problem, on_route=on_route)
             check_stop("gemini-ocr")
 
             prepared = prepare_answer_rows(parsed)
@@ -538,8 +809,18 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total):
                   "file": item.rel_path, "raw": str(raw)[:400]})
         file_event("failed", f"{flt['emoji']} {flt['label']} — {flt['hint']}")
         # Like n8n, the file is NOT moved on failure, so the next run retries it.
+        if flt.get("exhausted"):
+            # The router has no key×model pair left — every later file would
+            # fail the same way, so tell the loop to stop (Q4).
+            return "blocked"
         # A store-group fault (DB or Supabase) feeds the circuit breaker too.
         return "store_failed" if flt.get("group") == "store" else "failed"
+
+
+def blocked_remaining(total, index):
+    """Files the run did not process when it stopped at `index` (1-based):
+    the failing file itself plus the rest of the queue."""
+    return max(0, total - index + 1)
 
 
 def _move_to_done(file_path: str):

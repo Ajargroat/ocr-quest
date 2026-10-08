@@ -32,10 +32,8 @@ body{font-family:'Inter','Vazirmatn',sans-serif;color:var(--text);min-height:100
 /* network-mesh background (drawn by app.js) */
 .mesh-bg{position:fixed;inset:0;width:100vw;height:100vh;z-index:-1;pointer-events:none}
 
-/* header */
-header{display:flex;justify-content:space-between;align-items:center;gap:var(--sp-5);padding:var(--sp-5) var(--sp-6);flex-wrap:wrap;
-  position:sticky;top:0;z-index:50;background:var(--rail);backdrop-filter:blur(18px);
-  border-bottom:1px solid var(--border)}
+/* (the top <header> was removed — theme + connection pill live in the
+   sidebar footer; the collapse control is the sidebar's first button) */
 .brand{display:flex;gap:var(--sp-4);align-items:center}
 .logo{width:44px;height:44px;border-radius:var(--r-3);background:linear-gradient(135deg,var(--violet),var(--cyan));display:grid;place-items:center;box-shadow:0 8px 30px rgba(230,228,223,.4)}
 .logo span{width:12px;height:12px;border-radius:50%;background:#fff;animation:pulse 2s infinite}
@@ -58,7 +56,14 @@ body{padding-left:196px}
 .side-btn:hover{color:var(--text);background:rgba(255,255,255,.06);transform:translateY(-1px)}
 .side-btn.active{color:#14161c;background:linear-gradient(135deg,var(--violet),var(--cyan))}
 :root[data-theme="light"] .side-btn.active{color:#f4f5f7}
-.side-collapse{margin-top:auto;border-top:1px solid var(--border);border-radius:0 0 var(--r-3) var(--r-3);padding-top:14px}
+/* the collapse control sits at the TOP of the sidebar; its glyph reverses
+   when collapsed (app.js) */
+.side-collapse{margin-bottom:var(--sp-2);border-bottom:1px solid var(--border);border-radius:var(--r-3) var(--r-3) 0 0;padding-bottom:14px}
+/* theme toggle + connection pill, pinned to the bottom of the sidebar */
+.side-footer{margin-top:auto;display:flex;align-items:center;gap:var(--sp-2);flex-wrap:wrap;
+  padding:var(--sp-3) var(--sp-3) var(--sp-4);border-top:1px solid var(--border)}
+body.side-min .side-footer #connText{display:none}
+body.side-min .side-footer .conn{padding:var(--sp-2)}
 body.side-min #side{width:66px}
 body.side-min .side-btn span{display:none}
 body.side-min{padding-left:66px}
@@ -150,7 +155,7 @@ body.side-min{padding-left:66px}
 @media(prefers-reduced-motion:reduce){.stages::before,.stage.active .hub::before,.stage.active .hub::after,.wire.live,.wire.live i,.fill,.stage-now[data-state="live"] .beacon,.stage-now[data-state="live"] b,.log.wiping,.ghost-btn.sweeping svg,.ghost-btn.sweeping .fa{animation:none}}
 .grid2{display:grid;grid-template-columns:1.15fr 1fr;gap:var(--sp-4);padding:var(--sp-4) var(--sp-6) var(--sp-6)}
 @media(max-width:980px){.grid2{grid-template-columns:1fr}}
-.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--r-4);backdrop-filter:blur(16px);box-shadow:var(--shadow-black);display:flex;flex-direction:column;min-height:440px;max-height:66vh;overflow:hidden}
+.panel{background:transparent;border:1px solid var(--border);border-radius:var(--r-4);backdrop-filter:blur(16px);box-shadow:var(--shadow-black);display:flex;flex-direction:column;min-height:440px;max-height:66vh;overflow:hidden}
 .panel-head{display:flex;justify-content:space-between;align-items:center;padding:var(--sp-4) var(--sp-5);border-bottom:1px solid var(--border)}
 .panel-head h2{font-size:var(--fs-2);text-transform:uppercase;letter-spacing:1.2px;color:var(--muted);font-weight:700}
 .hint{font-size:var(--fs-2);color:var(--muted)}
@@ -866,7 +871,7 @@ textarea.db-in.tall{min-height:110px}
 
 /* ── credentials · credential-only provider sections (2026-10-07) ── */
 .cred-section{border:1px solid var(--border);border-radius:var(--r-4);
-  background:var(--panel);padding:var(--sp-5);margin-bottom:var(--sp-5)}
+  background:transparent;padding:var(--sp-5);margin-bottom:var(--sp-5)}
 .cred-section:last-child{margin-bottom:0}
 .cred-sec-head{display:flex;align-items:center;gap:var(--sp-4);flex-wrap:wrap;
   padding-bottom:var(--sp-4);margin-bottom:var(--sp-4);border-bottom:1px solid var(--border)}
@@ -892,7 +897,7 @@ textarea.db-in.tall{min-height:110px}
 .usage-chips{margin-bottom:9px}
 .usage-totals{display:flex;flex-wrap:wrap;gap:var(--sp-4);font-size:var(--fs-2);color:var(--muted);margin-bottom:8px}
 .usage-totals b{color:var(--text);font-family:'JetBrains Mono',monospace}
-.usage-scroll{max-height:230px;overflow:auto;border:1px solid var(--border);border-radius:var(--r-3)}
+.usage-scroll{max-height:min(740px,62vh);overflow:auto;border:1px solid var(--border);border-radius:var(--r-3)}
 .usage-table{width:100%;border-collapse:collapse;font-size:var(--fs-2)}
 .usage-table th{position:sticky;top:0;background:var(--surface-2);color:var(--muted);text-align:left;
   font-size:var(--fs-1);letter-spacing:.7px;text-transform:uppercase;padding:var(--sp-2) var(--sp-3);
@@ -900,7 +905,29 @@ textarea.db-in.tall{min-height:110px}
 .usage-table td{padding:var(--sp-2) var(--sp-3);border-bottom:1px solid rgba(255,255,255,.05);color:var(--text)}
 .usage-table tr.bad td{color:var(--red)}
 .usage-table .num{text-align:right;font-family:'JetBrains Mono',monospace}
+.usage-table th.num{text-align:right;font-family:'JetBrains Mono',monospace}
 .usage-table .hint{padding:var(--sp-4) var(--sp-3)}
+
+/* per-series colours for the usage curve (one per series, cycled) */
+:root{
+  --usage-1:#6fb3d2; --usage-2:#e0b86a; --usage-3:#9fcdb4;
+  --usage-4:#b39ddb; --usage-5:#d98a8a; --usage-6:#8a909c;
+}
+:root[data-theme="light"]{
+  --usage-1:#0f6f96; --usage-2:#b45309; --usage-3:#047857;
+  --usage-4:#6d4ab8; --usage-5:#be123c; --usage-6:#5c6270;
+}
+.usage-plot rect.s0,.usage-swatch.s0{fill:var(--usage-1);background:var(--usage-1)}
+.usage-plot rect.s1,.usage-swatch.s1{fill:var(--usage-2);background:var(--usage-2)}
+.usage-plot rect.s2,.usage-swatch.s2{fill:var(--usage-3);background:var(--usage-3)}
+.usage-plot rect.s3,.usage-swatch.s3{fill:var(--usage-4);background:var(--usage-4)}
+.usage-plot rect.s4,.usage-swatch.s4{fill:var(--usage-5);background:var(--usage-5)}
+.usage-plot rect.s5,.usage-swatch.s5{fill:var(--usage-6);background:var(--usage-6)}
+.usage-legend{display:flex;flex-wrap:wrap;gap:var(--sp-4);margin-top:var(--sp-4);
+  font-size:var(--fs-2);color:var(--muted)}
+.usage-legend-item{display:flex;align-items:center;gap:var(--sp-2)}
+.usage-swatch{width:10px;height:10px;border-radius:3px;display:inline-block;flex:0 0 auto}
+.usage-ctl{display:flex;align-items:center;gap:var(--sp-2);font-size:var(--fs-2);color:var(--muted)}
 
 /* ── period stats (Q11 / criterion 11) ── */
 .period-stats{border:1px solid var(--border);border-radius:var(--r-4);background:var(--panel);
@@ -1032,7 +1059,8 @@ select.cred-in option,select.themed-select option{background:var(--surface-2);co
 .hub::before,.hub::after{display:none!important}
 .stage.active .hub{box-shadow:none;background:var(--surface-2);border-color:var(--border);color:var(--text)}
 body{background:var(--bg)}
-.panel,.cred-card,.stats-drop,.qcard{background:var(--panel);border:1px solid var(--border);box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;border-radius:16px}
+.stats-drop,.qcard{background:var(--panel);border:1px solid var(--border);box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;border-radius:16px}
+.panel,.cred-card{background:transparent;border:1px solid var(--border);box-shadow:none;backdrop-filter:none;-webkit-backdrop-filter:none;border-radius:16px}
 .panel{min-height:0;max-height:none}
 .qcard:hover{transform:none;border-color:var(--border);box-shadow:none}
 header{background:var(--rail);backdrop-filter:none;-webkit-backdrop-filter:none;border-bottom:1px solid var(--border)}
@@ -1086,10 +1114,42 @@ header{background:var(--rail);backdrop-filter:none;-webkit-backdrop-filter:none;
 .wire i{display:none}
 .fill{background:var(--brand);animation:none;transition:width .45s cubic-bezier(.22,1,.36,1)}
 
+/* ── 1b · parallel lanes — the rail's per-key counterpart ── */
+.lanes .lane-list{display:flex;flex-direction:column;gap:var(--sp-2)}
+.lane{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-3) var(--sp-4);
+  border:1px solid var(--border);border-radius:var(--r-3);background:rgba(255,255,255,.02)}
+.lane .hub{width:36px;height:36px;flex:0 0 auto;border-radius:var(--r-2)}
+.lane .dot{position:absolute;top:-2px;right:-2px;width:6px;height:6px;
+  border-radius:50%;background:var(--chip)}
+.lane-name{display:flex;flex-direction:column;align-items:flex-start;gap:2px;
+  font-size:var(--fs-2);font-weight:700;letter-spacing:.5px;color:var(--muted);
+  text-transform:none;text-align:left;min-width:0}
+.lane-name em{font-style:normal;font-family:'JetBrains Mono',monospace;
+  font-size:var(--fs-1);color:var(--chip)}
+.lane-chip{margin-left:auto;background:var(--surface-2);border:1px solid var(--border);
+  color:var(--muted)}
+.lane-file{font-style:normal;font-family:'JetBrains Mono',monospace;font-size:var(--fs-1);
+  color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:36ch}
+.lane .lane-sw{margin-left:var(--sp-3);flex:0 0 auto}
+/* state accents — the rail's own tokens, no new palette, no filled hub
+   (the rail's `color:#0c0e12` on --brand does not survive the light theme) */
+.lane[data-state="start"] .hub,.lane[data-state="route"] .hub,
+.lane[data-state="start"] .lane-chip,.lane[data-state="route"] .lane-chip{color:var(--brand)}
+.lane[data-state="start"] .hub,.lane[data-state="route"] .hub{border-color:var(--brand)}
+.lane[data-state="done"] .hub{color:var(--green);border-color:rgba(159,205,180,.5)}
+.lane[data-state="done"] .lane-chip{color:var(--green)}
+.lane[data-state="failed"] .hub{color:var(--red);border-color:rgba(201,168,162,.6)}
+.lane[data-state="failed"] .lane-chip{color:var(--red)}
+.lane[data-state="wait"] .hub{color:var(--amber);border-color:var(--amber)}
+.lane[data-state="wait"] .lane-chip{color:var(--amber)}
+.lane[data-state="off"]{opacity:.55}
+@media(max-width:820px){.lane-file{display:none}}
+
 /* ── 2 · pipeline · toolbar fields (provider / proxy context) ── */
 .tb-field{display:flex;flex-direction:column;gap:var(--sp-1);min-width:0}
 .tb-field .cred-label{margin-top:0}
 .tb-field .cred-in{width:172px}
+.usage-ctl .cred-in{width:auto;min-width:132px}
 .tb-field .hint{font-size:var(--fs-1)}
 
 /* ── 3 · pipeline · content blocks keep the house side gutter ──

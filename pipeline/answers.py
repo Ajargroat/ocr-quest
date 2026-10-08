@@ -2,6 +2,7 @@
 'Prepare Answer Rows' and 'Finalize Answer Rows'."""
 import json
 
+from .questions import is_real_bbox
 from .scanner import SourceItem
 from .utils import norm_text, parse_number, sha1_hex
 
@@ -38,7 +39,7 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
       "difficulty": "string or null",
       "raw_ocr_text": "string",
       "assets": [
-        { "asset_type": "table", "order": 1, "bbox": [0,0,0,0], "caption": "string or null" }
+        { "asset_type": "table", "order": 1, "bbox": null, "caption": "string or null" }
       ]
     }
   ]
@@ -85,7 +86,7 @@ def prepare_answer_rows(gemini_result: dict):
                 assets.append({
                     "asset_type": s.get("asset_type") or "diagram",
                     "order": s.get("order") or (j + 1),
-                    "bbox": bbox if (isinstance(bbox, list) and len(bbox) == 4) else None,
+                    "bbox": bbox if is_real_bbox(bbox) else None,
                     "caption": s.get("caption"),
                 })
         prepared.append({

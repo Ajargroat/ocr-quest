@@ -369,7 +369,7 @@ class ChatTestEndpoint(EndpointCase):
 
         def fake_call(key, model, prompt, *a, **k):
             called.update(key=key, model=model, prompt=prompt)
-            return ({"candidates": []}, "{}")
+            return ({"candidates": []}, "{}", {})
 
         old = main.gemini_mod.call_gemini
         main.gemini_mod.call_gemini = fake_call
