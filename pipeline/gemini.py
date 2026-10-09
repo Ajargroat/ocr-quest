@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import quote
 
 import requests
 
@@ -17,18 +18,69 @@ from . import faults
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
+# The plain HTTP(S)/SOCKS tunnel for Google-bound calls only. Set by the
+# runner / server when the pipeline tab saves a proxy profile; kept here
+# (not in the router) so OCR, health checks and gateway probes ride the
+# same lane. Local providers and Supabase/Postgres never see it.
+_proxy_url = {"url": ""}
+
+
+def _apply_profile(prof):
+    """Point module state at one profile dict (or clear it for None/Direct)."""
+    if not prof or not prof.get("host"):
+        _proxy_url["url"] = ""
+        return
+    scheme = (prof.get("scheme") or "http").lower()
+    auth = (f"{quote(prof['user'], safe='')}:{quote(prof['password'], safe='')}@"
+            if prof.get("user") else "")
+    _proxy_url["url"] = f"{scheme}://{auth}{prof['host']}:{prof.get('port') or ''}"
+
+
+def set_proxy(cfg):
+    """Point module state at the profile (or no profile) a Config selects."""
+    _apply_profile(next((p for p in cfg.proxy_profiles
+                         if p.get("name") == cfg.proxy_active), None))
+
+
+def test_proxy(profile):
+    """Probe googleapis.com through ONE profile (or Direct) — the keyless
+    gateway probe, so no model and no generation tokens are spent. Swaps the
+    live lane for the probe and restores it, so a dashboard 'test' click
+    never disturbs a running pipeline. Returns gateway_probe()'s dict
+    (reachable / google_err / kind / detail). Never raises."""
+    saved = _proxy_url["url"]
+    try:
+        _apply_profile(profile)
+        return gateway_probe()
+    finally:
+        _proxy_url["url"] = saved
+
+
+def proxy_proxies():
+    """requests `proxies=` dict for the lane, or None to keep defaults.
+
+    Only outbound HTTPS is scoped — Supabase/Postgres/local traffic must
+    never ride the tunnel, which is the whole point of a per-call lane
+    instead of a machine-wide VPN."""
+    url = _proxy_url["url"]
+    if not url:
+        return None
+    return {"http": url, "https": url}
+
 
 def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 temperature=0.1, max_tokens=16384, retries=None,
                 on_problem=None):
     """Sends one image/PDF plus the prompt to Gemini.
-    Returns (parsed_json, raw_text).
+    Returns (parsed_json, raw_text, usage) where usage is
+    ``{"tokens_in": int, "tokens_out": int}`` (zeros when the response
+    carries no ``usageMetadata``).
 
     ``on_problem(fault, attempt, retries, wait)`` is called before every
     back-off sleep so the caller can log tunnel hiccups live."""
     if retries is None:
         retries = max(1, int(os.getenv("NET_RETRIES", "3")))
-    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "8")))
+    base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
     parts = [{"text": prompt}]
     if data_b64:
         # Empty payload = a text-only call (the cheapest possible probe).
@@ -49,19 +101,21 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
     for attempt in range(1, retries + 1):
         try:
             resp = requests.post(url, json=payload, headers=headers,
-                                 timeout=(10, 300))
+                                 timeout=(10, 300), proxies=proxy_proxies())
         except requests.RequestException as exc:
             last = faults.classify(exc)
         else:
             outcome = _outcome(resp)
             if "result" in outcome:
-                return outcome["result"]
+                parsed, text = outcome["result"]
+                usage = outcome.get("usage") or {}
+                return parsed, text, usage
             last = outcome
         if not last["retryable"]:
             raise faults.FaultError(
                 last, f"{last['label']} — {last['hint']} · {last['raw'][:200]}")
         if attempt < retries:
-            wait = base_wait * attempt
+            wait = faults.backoff_wait(attempt, base_wait)
             if on_problem:
                 on_problem(last, attempt, retries, wait)
             time.sleep(wait)
@@ -80,7 +134,8 @@ def list_models(api_key, timeout=(10, 30)):
     raises faults.FaultError (classified) on any failure."""
     try:
         resp = requests.get(LIST_URL, params={"pageSize": 1000},
-                            headers={"x-goog-api-key": api_key}, timeout=timeout)
+                            headers={"x-goog-api-key": api_key},
+                            timeout=timeout, proxies=proxy_proxies())
     except requests.RequestException as exc:
         flt = faults.classify(exc)
         flt["raw"] = str(exc)[:400]
@@ -111,7 +166,8 @@ def gateway_probe(timeout=(8, 12)):
     place (captive portal, proxy), localises the fault to the network or
     the region *before* any key can be blamed for it. Never raises."""
     try:
-        resp = requests.get(LIST_URL, params={"pageSize": 1}, timeout=timeout)
+        resp = requests.get(LIST_URL, params={"pageSize": 1}, timeout=timeout,
+                            proxies=proxy_proxies())
     except requests.RequestException as exc:
         flt = faults.classify(exc)
         return {"reachable": False, "google_err": False, "kind": flt["kind"],
@@ -172,7 +228,25 @@ def _outcome(resp):
         parsed = extract_json(text)
     except ValueError as exc:
         return faults.fault("model_garbage", str(exc))
-    return {"result": (parsed, text)}
+    tokens_in, tokens_out = _extract_usage(body)
+    return {"result": (parsed, text),
+            "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
+
+
+def _extract_usage(body):
+    """(tokens_in, tokens_out) from Gemini's usageMetadata — (0, 0) when the
+    response omits it (text-only probes, older gateways, stubbed responses)."""
+    meta = body.get("usageMetadata") if isinstance(body, dict) else None
+    if not isinstance(meta, dict):
+        return 0, 0
+
+    def _int(value):
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return _int(meta.get("promptTokenCount")), _int(meta.get("candidatesTokenCount"))
 
 
 def _extract_text(body) -> str:

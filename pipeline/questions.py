@@ -22,7 +22,7 @@ Your task:
 8. If there are no questions, return an empty questions array.
 
 DIAGRAM HANDLING:
-9. For ANY visible figure, diagram, or graph on the page, you MUST provide its "diagram_bbox" as [ymin, xmin, ymax, xmax] coordinates normalized to a 0-1000 square, tightly enclosing the figure.
+9. For ANY visible figure, diagram, or graph on the page, you MUST provide its "diagram_bbox" as [ymin, xmin, ymax, xmax] coordinates normalized to a 0-1000 square, tightly enclosing the figure. If the question has NO picture/figure at all, return "diagram_bbox": null — never [0,0,0,0].
 10. Keep question_text as pure text. If the original text says «شکل» or «با توجه به شکل», keep that phrase.
 11. Each question may have a metadata line near the bottom-left or bottom of the question, for example: "ماز ۱۴۰۳-۱۴۰۴ متوسط". The organization/institute name must be returned in "corp", the academic year must be returned in "year" and the difficulty must be returned in "difficulty". DO NOT skip this action.
 
@@ -38,7 +38,7 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
       "year": "string or null",
       "difficulty": "string or null",
       "raw_ocr_text": "string",
-      "diagram_bbox": [0, 0, 0, 0]
+      "diagram_bbox": null
     }
   ]
 }"""
@@ -70,15 +70,23 @@ def normalize_options(raw):
     return out
 
 
+def is_real_bbox(bbox):
+    """A bbox is real only if it encloses something — [0,0,0,0] is Gemini's
+    'no figure here' answer and must not attach the page image."""
+    return (isinstance(bbox, list) and len(bbox) == 4
+            and any(float(v) != 0.0 for v in bbox))
+
+
 def normalize_bbox(raw):
-    """Gemini may return [y,x,y,x] or the string "[y,x,y,x]"."""
+    """Gemini may return [y,x,y,x] or the string "[y,x,y,x]".
+    [0,0,0,0] means "no figure" -> None."""
     if isinstance(raw, list) and len(raw) == 4:
-        return raw
+        return raw if is_real_bbox(raw) else None
     if isinstance(raw, str):
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, list) and len(parsed) == 4:
-                return parsed
+                return parsed if is_real_bbox(parsed) else None
         except Exception:
             pass
     return None

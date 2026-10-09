@@ -196,12 +196,16 @@ class DataConsole:
 
         conn = self._editor_conn
         if conn is None or conn.closed:
-            conn = psycopg2.connect(
-                host=self.cfg.postgres_host, port=self.cfg.postgres_port,
-                dbname=self.cfg.postgres_db, user=self.cfg.postgres_user,
-                password=self.cfg.postgres_password, connect_timeout=10,
-                application_name="konkour-data-console",
-            )
+            kwargs = dict(host=self.cfg.postgres_host,
+                          port=self.cfg.postgres_port,
+                          dbname=self.cfg.postgres_db,
+                          user=self.cfg.postgres_user,
+                          password=self.cfg.postgres_password,
+                          connect_timeout=10,
+                          application_name="konkour-data-console")
+            if self.cfg.postgres_sslmode:
+                kwargs["sslmode"] = self.cfg.postgres_sslmode  # "" → default
+            conn = psycopg2.connect(**kwargs)
             conn.autocommit = True
             with conn.cursor() as cur:
                 cur.execute("SET statement_timeout = %s", (STATEMENT_TIMEOUT,))

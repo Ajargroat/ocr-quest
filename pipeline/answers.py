@@ -2,10 +2,11 @@
 'Prepare Answer Rows' and 'Finalize Answer Rows'."""
 import json
 
+from .questions import is_real_bbox
 from .scanner import SourceItem
 from .utils import norm_text, parse_number, sha1_hex
 
-# __CANDIDATES__ is replaced at runtime (avoids brace-escaping issues).
+# __CANDIDATES__ is replaced at runtime (avoids brace-escaping issues) by ajargroat.
 ANSWER_TEMPLATE = """You are a precise OCR and answer-extraction system for Iranian Konkour and textbook answer keys.
 You will receive one file (image) containing answer explanations for one or more questions.
 
@@ -38,29 +39,59 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
       "difficulty": "string or null",
       "raw_ocr_text": "string",
       "assets": [
-        { "asset_type": "table", "order": 1, "bbox": [0,0,0,0], "caption": "string or null" }
+        { "asset_type": "table", "order": 1, "bbox": null, "caption": "string or null" }
       ]
     }
   ]
 }"""
 
 
+# The candidate bank can hold EVERY question of a topic, and the answer
+# branch re-sends it on each answer call. A count cap alone still let a
+# 60-question bank reach ~15k input tokens (the whole topic bank embedded),
+# so the bank is bounded by BOTH a count and a total character budget — one
+# answer call stays a plausible few thousand tokens, comparable to the
+# question branch. Linking (finalize_answer_rows) still sees the full bank,
+# and its option-text fallback recovers a label the model could not name.
+MAX_PROMPT_CANDIDATES = 60
+MAX_CANDIDATE_TEXT = 160
+MAX_OPTION_TEXT = 120
+MAX_BANK_CHARS = 6000
+
+
+def _clip(value, limit):
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def build_answer_prompt(candidates) -> str:
     slim = []
-    for q in candidates:
+    used = 0
+    for q in candidates[:MAX_PROMPT_CANDIDATES]:
         options = q.get("options")
         if isinstance(options, str):
             try:
                 options = json.loads(options)
             except Exception:
                 options = []
-        slim.append({
+        if isinstance(options, list):
+            options = [
+                {"label": o.get("label"),
+                 "text": _clip(o.get("text"), MAX_OPTION_TEXT)}
+                if isinstance(o, dict) else o
+                for o in options
+            ]
+        entry = {
             "question_number": q.get("question_number"),
-            "question_text": q.get("question_text"),
+            "question_text": _clip(q.get("question_text"), MAX_CANDIDATE_TEXT),
             "options": options,
             "corp": q.get("corp"),
             "year": q.get("year"),
-        })
+        }
+        used += len(json.dumps(entry, ensure_ascii=False))
+        if slim and used > MAX_BANK_CHARS:      # always embed at least one
+            break
+        slim.append(entry)
     return ANSWER_TEMPLATE.replace(
         "__CANDIDATES__", json.dumps(slim, ensure_ascii=False))
 
@@ -85,7 +116,7 @@ def prepare_answer_rows(gemini_result: dict):
                 assets.append({
                     "asset_type": s.get("asset_type") or "diagram",
                     "order": s.get("order") or (j + 1),
-                    "bbox": bbox if (isinstance(bbox, list) and len(bbox) == 4) else None,
+                    "bbox": bbox if is_real_bbox(bbox) else None,
                     "caption": s.get("caption"),
                 })
         prepared.append({

@@ -39,18 +39,20 @@ def _env_int(var, default):
 
 
 def interval_days():
-    return _env_int("BACKUP_INTERVAL_DAYS", 7)
+    return _env_int("BACKUP_INTERVAL_DAYS", 1)
 
 
 def keep_sets():
-    return _env_int("BACKUP_KEEP", 12)
+    return _env_int("BACKUP_KEEP", 1)
 
 
 def _connect(cfg):
-    conn = psycopg2.connect(
-        host=cfg.postgres_host, port=cfg.postgres_port, dbname=cfg.postgres_db,
-        user=cfg.postgres_user, password=cfg.postgres_password, connect_timeout=10,
-    )
+    kwargs = dict(host=cfg.postgres_host, port=cfg.postgres_port,
+                  dbname=cfg.postgres_db, user=cfg.postgres_user,
+                  password=cfg.postgres_password, connect_timeout=10)
+    if cfg.postgres_sslmode:
+        kwargs["sslmode"] = cfg.postgres_sslmode   # "" → libpq default
+    conn = psycopg2.connect(**kwargs)
     conn.autocommit = True
     return conn
 
@@ -181,7 +183,8 @@ def due():
 
 
 def rotate():
-    """Delete all but the newest KEEP backup sets."""
+    """Delete all but the newest KEEP backup sets (KEEP defaults to 1 → only
+    the newest snapshot survives, so every backup deletes the older ones)."""
     sets = list_sets()
     for stale in sets[keep_sets():]:
         path = os.path.join(BACKUP_ROOT, stale["dir"])

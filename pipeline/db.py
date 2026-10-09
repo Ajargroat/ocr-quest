@@ -14,14 +14,15 @@ class Database:
 
     # ── connection handling ────────────────────────────────────────
     def _connect(self):
-        self._conn = psycopg2.connect(
-            host=self.cfg.postgres_host,
-            port=self.cfg.postgres_port,
-            dbname=self.cfg.postgres_db,
-            user=self.cfg.postgres_user,
-            password=self.cfg.postgres_password,
-            connect_timeout=10,
-        )
+        kwargs = dict(host=self.cfg.postgres_host,
+                      port=self.cfg.postgres_port,
+                      dbname=self.cfg.postgres_db,
+                      user=self.cfg.postgres_user,
+                      password=self.cfg.postgres_password,
+                      connect_timeout=10)
+        if self.cfg.postgres_sslmode:
+            kwargs["sslmode"] = self.cfg.postgres_sslmode   # "" → libpq default
+        self._conn = psycopg2.connect(**kwargs)
         self._conn.autocommit = True
 
     def _execute(self, sql, params=None, fetch=False):
@@ -44,6 +45,46 @@ class Database:
 
     def ping(self):
         self._execute("SELECT 1")
+
+    def fetch_period_counts(self, date_from=None, date_to=None):
+        """Pipeline period stats from data the DB already stores (Q4).
+
+        No schema change: counts over created_at on questions/answers plus
+        the live sources total. date_from/date_to are ISO date strings or
+        None (all-time). Returns {questions, answers, errors, files}.
+        "errors" counts rows flagged 'rejected' in review; "files" is the
+        sources total (the run's file unit).
+        """
+        def _count(table, extra="", params=()):
+            sql = f"SELECT COUNT(*) FROM public.{table} WHERE 1=1"
+            args = []
+            if date_from:
+                sql += f" AND created_at::date >= %s::date"
+                args.append(str(date_from))
+            if date_to:
+                sql += f" AND created_at::date <= %s::date"
+                args.append(str(date_to))
+            if extra:
+                sql += " " + extra
+                args.extend(params)          # extra's placeholders come last
+            try:
+                rows = self._execute(sql, tuple(args), fetch=True) or [(0,)]
+            except Exception:
+                return 0
+            return int(rows[0][0] or 0)
+
+        questions = _count("questions")
+        answers = _count("answers")
+        errors = _count("questions", "AND review_status = 'rejected'")
+        files = _count("sources")
+        # Question/Answer *file* counts come from sources.type ("سوال"/"پاسخ" —
+        # scanner.TYPE_DIRS), so all five period cards are DB-sourced (D3).
+        question_files = _count("sources", "AND type = %s", ("سوال",))
+        answer_files = _count("sources", "AND type = %s", ("پاسخ",))
+        return {"questions": questions, "answers": answers,
+                "errors": errors, "files": files, "total": files,
+                "question_files": question_files, "answer_files": answer_files,
+                "succeeded": questions + answers}
 
     # ── sources ────────────────────────────────────────────────────
     def upsert_source(self, item: SourceItem, storage_url: str):
@@ -98,6 +139,41 @@ class Database:
                 r["review_status"], r["raw_ocr_text"], r["diagram_url"],
                 r["diagram_bbox"], r["grade"], r["corp"], r["year"],
             ))
+
+    # ── one bucket object's DB context (bucket drawer, item 12) ─────
+    def fetch_source_detail(self, source_id):
+        """The source row plus its linked questions and answers, for the
+        Database tab's bucket drawer. `source_id` is the storage object name
+        (storage.list_objects returns those as `name`)."""
+        src = self._execute(
+            "SELECT id, file_name, mime_type, file_size_bytes, storage_url, "
+            "subject, grade, topic, type FROM public.sources WHERE id = %s",
+            (source_id,), fetch=True) or []
+        source = None
+        if src:
+            r = src[0]
+            source = {"id": r[0], "file_name": r[1], "mime_type": r[2],
+                      "file_size_bytes": r[3], "storage_url": r[4],
+                      "subject": r[5],
+                      "grade": str(r[6]) if r[6] is not None else None,
+                      "topic": r[7], "type": r[8]}
+        qs = self._execute(
+            "SELECT id, question_number, question_text, review_status "
+            "FROM public.questions WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        ans = self._execute(
+            "SELECT id, question_number, answer_explanation, review_status "
+            "FROM public.answers WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        return {
+            "source": source,
+            "questions": [{"id": r[0], "question_number": r[1],
+                           "question_text": r[2], "review_status": r[3]}
+                          for r in qs],
+            "answers": [{"id": r[0], "question_number": r[1],
+                         "answer_explanation": r[2], "review_status": r[3]}
+                        for r in ans],
+        }
 
     # ── context for the answer branch ('Fetch Questions' node) ─────
     def fetch_context_questions(self, subject, topic, grade):
@@ -703,3 +779,23 @@ class Database:
             WHERE id = %s
         """
         self._execute(sql, (json.dumps(bbox), question_id))
+
+    def clear_zero_bboxes(self, limit=100):
+        """Backfill: NULL the most recent `limit` question bboxes that are
+        still the all-zero placeholder ([0,0,0,0]) Gemini used to emit for
+        figure-less questions. Re-runnable — once clean it updates 0 rows."""
+        sql = """
+        WITH z AS (
+            SELECT id FROM public.questions
+            WHERE replace(diagram_bbox::text, ' ', '') = '[0,0,0,0]'
+            ORDER BY created_at DESC
+            LIMIT %s
+        )
+        UPDATE public.questions q
+           SET diagram_bbox = NULL
+          FROM z
+         WHERE q.id = z.id
+        RETURNING q.id
+        """
+        rows = self._execute(sql, (int(limit),), fetch=True) or []
+        return len(rows)
