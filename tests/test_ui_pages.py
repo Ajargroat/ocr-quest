@@ -58,7 +58,7 @@ class PipelineCoherenceTests(unittest.TestCase):
         self.assertLess(view.index('id="periodStats"'),
                         view.index('class="stages"'),
                         "period stats must sit at the very top of the pipeline")
-        for need in ('id="psSucceeded"', 'id="psCaption"'):
+        for need in ('id="psTotal"',):
             self.assertIn(need, view, need)
 
     def test_period_stats_single_set_and_24h_default(self):
@@ -66,7 +66,7 @@ class PipelineCoherenceTests(unittest.TestCase):
         default chip is 24h (markup + JS agree)."""
         html = _read("index.html")
         view = _view(html, "viewPipeline")
-        for kept in ('id="psSucceeded"', 'id="psCaption"'):
+        for kept in ('id="psTotal"',):
             self.assertIn(kept, view, kept)
         for gone in ('id="stTotal"', 'id="stProcessed"', 'id="stQuestions"',
                      'id="stAnswers"', 'id="stErrors"'):
@@ -142,25 +142,17 @@ class PipelineCoherenceTests(unittest.TestCase):
         self.assertIn("$('upEmpty')", js)
         self.assertIn("empty.hidden", js)
 
-    def test_conn_is_a_signal_bars_indicator(self):
-        """The connection pill is a signal-bars widget: three bars, a ping
-        readout and a provider tooltip, fed by the provider check fetch."""
+    def test_connection_pill_is_removed(self):
+        """Rework item 10: the connection pill (signal bars + ping readout)
+        is gone — no markup and no ping/provider-check wiring in the JS."""
         html = _read("index.html")
-        m = re.search(r'<div class="conn" id="conn"[^>]*>(.*?)</div>',
-                      html, re.S)
-        self.assertIsNotNone(m, "conn pill not found")
-        pill = m.group(1)
-        self.assertIn('id="connBars"', pill)
-        bars = re.search(r'id="connBars"[^>]*>(.*?)</span>', pill, re.S)
-        self.assertIsNotNone(bars, "connBars wrapper not found")
-        self.assertEqual(bars.group(1).count("<b>"), 3, "want 3 signal bars")
-        self.assertIn('id="connPing"', pill)
-        self.assertIn('id="connText"', pill)
-        self.assertRegex(m.group(0), r"title=")
         js = _read("app.js")
-        for need in ("pingProvider", "connBars", "connPing",
-                     "'/api/credentials/check/provider'"):
-            self.assertIn(need, js, need)
+        for gone in ('id="conn"', 'id="connBars"', 'id="connPing"',
+                     'id="connText"'):
+            self.assertNotIn(gone, html, gone)
+        for gone in ("pingProvider", "connBars", "connPing", "setConn",
+                     "paintConn"):
+            self.assertNotIn(gone, js, gone)
 
     def test_dd_caption_swap_is_scoped_to_the_upload_form(self):
         """Only the four up-form dropdowns trade their caption for the chosen
@@ -190,13 +182,13 @@ class CredentialsCoherenceTests(unittest.TestCase):
     def test_rail_is_a_service_switcher(self):
         html = _read("index.html")
         rail = html.split('id="credRail"', 1)[1].split("</div>", 1)[0]
-        self.assertEqual(rail.count('class="rail-btn'), 3, "3 services")
-        for svc in ("ocr", "revision", "database"):
+        self.assertEqual(rail.count('class="rail-btn'), 4, "4 services")
+        for svc in ("ocr", "revision", "database", "proxy"):
             self.assertIn('data-cred="%s"' % svc, rail, svc)
 
     def test_one_detail_pane_per_service(self):
         html = _read("index.html")
-        for svc in ("ocr", "revision", "database"):
+        for svc in ("ocr", "revision", "database", "proxy"):
             self.assertIn('class="panel cred-card" data-cred="%s"' % svc, html, svc)
 
     def test_no_ring_or_live_routing_surface(self):
@@ -256,9 +248,10 @@ class CredentialsCoherenceTests(unittest.TestCase):
         js = _read("app.js")
         css = _read("styles.css")
         self.assertIn('id="usageGroup"', html)
+        self.assertIn('id="usagePeriod"', html)
         self.assertIn('id="usageYMode"', html)
-        self.assertIn('data-ymode="calls"', html)
-        self.assertIn('data-ymode="tokens"', html)
+        self.assertIn('<option value="calls">', html)
+        self.assertIn('<option value="tokens">', html)
         # the renderer consumes the server-side chart and both new controls
         self.assertIn("function usagePlot(", js)
         self.assertIn("usageGroup", js)
@@ -269,11 +262,9 @@ class CredentialsCoherenceTests(unittest.TestCase):
         html = _read("index.html")
         cred = _view(html, "viewCredentials")
         pipe = _view(html, "viewPipeline")
-        # the profile add/delete buttons sit in Credentials, not the pipeline
+        # the profile ADD button sits in Credentials, not the pipeline
         self.assertIn('id="pipeProxyNew"', cred)
-        self.assertIn('id="pipeProxyDel"', cred)
         self.assertNotIn('id="pipeProxyNew"', pipe)
-        self.assertNotIn('id="pipeProxyDel"', pipe)
 
     def test_css_ships_the_house_layer(self):
         css = _read("styles.css")
@@ -286,7 +277,8 @@ class CredentialsCoherenceTests(unittest.TestCase):
         # house rules the pages now reuse: a top switcher, side gutters
         self.assertIn(".cred-toolbar{", css)
         self.assertIn(".cred-panels{min-width:0;margin:var(--sp-4) 34px 0}", css)
-        self.assertIn(".cred-savebar{margin:var(--sp-4) 34px", css)
+        self.assertIn(".cred-head{", css)
+        self.assertNotIn(".cred-savebar{", css)
         self.assertIn("#viewPipeline > .panel", css)
 
     def test_active_sidebar_state_has_no_glow(self):
@@ -309,23 +301,25 @@ class CredentialsCoherenceTests(unittest.TestCase):
         self.assertEqual(missing, [], "ids app.js binds but html lacks: %s" % missing)
 
 
-class PeriodStatsLiveRailTests(unittest.TestCase):
-    def test_period_stats_file_cards_read_the_live_rail(self):
+class PeriodStatsDbTests(unittest.TestCase):
+    def test_all_five_cards_are_db_sourced(self):
+        """Item 2.1: five DB-sourced cards (total/question/answer files +
+        questions + answers); Succeeded/Errors and the live rail are gone."""
         html = _read("index.html")
         js = _read("app.js")
         view = _view(html, "viewPipeline")
-        # three file cells declare the live rail source...
-        rail = re.findall(r'data-live="rail"><span[^>]*id="(psSucceeded|psErrors|psTotal)"', view)
-        self.assertEqual(sorted(rail), ["psErrors", "psSucceeded", "psTotal"])
-        db = re.findall(r'data-live="db"><span[^>]*id="(psQuestions|psAnswers)"', view)
-        self.assertEqual(sorted(db), ["psAnswers", "psQuestions"])
-        # ...and the DB path no longer paints them (statsPaint does)
-        self.assertIn("function statsPaint()", js)
+        for cid in ("psTotal", "psQFiles", "psAFiles", "psQuestions", "psAnswers"):
+            self.assertIn('id="%s"' % cid, view, cid)
+        self.assertNotIn('data-live="rail"', view)
+        self.assertNotIn('data-live="db"', view)
+        self.assertNotIn('id="psSucceeded"', view)
+        self.assertNotIn('id="psErrors"', view)
+        # statsLoad is the only writer of the cards; statsPaint is caption-only
+        self.assertNotIn("set('psSucceeded'", js)
+        self.assertNotIn("set('psErrors'", js)
         load = js.split("async function statsLoad(period){", 1)[1].split("\n}\n", 1)[0]
-        for gone in ("set('psSucceeded'", "set('psErrors'", "set('psTotal'"):
-            self.assertNotIn(gone, load, gone)
-        self.assertIn("set('psQuestions'", load)
-        self.assertIn("set('psAnswers'", load)
+        for cid in ("psTotal", "psQFiles", "psAFiles", "psQuestions", "psAnswers"):
+            self.assertIn("set('%s'" % cid, load, cid)
 
 
 class StageNowDetailTests(unittest.TestCase):
@@ -341,13 +335,18 @@ class StageNowDetailTests(unittest.TestCase):
 
 
 class UploadEnqueueTests(unittest.TestCase):
-    def test_upload_selection_enqueues_directly(self):
+    def test_add_opens_the_picker(self):
+        """Item 2.2: #upAdd (now "ADD") opens the file picker; selection still
+        enqueues straight away."""
         js = _read("app.js")
+        html = _read("index.html")
         self.assertIn("async function upQueue(){", js)
-        self.assertIn("$('upAdd').onclick = upQueue;", js)
+        self.assertIn("$('upAdd').onclick = () => $('upFiles').click();", js)
+        self.assertNotIn("$('upAdd').onclick = upQueue;", js)
         onchange = js.split("$('upFiles').onchange", 1)[1].split("\n", 1)[0]
         self.assertIn("upQueue", onchange)
         self.assertNotIn("file(s) selected", js)
+        self.assertIn(">ADD<", html)
 
 
 class UsageTabTests(unittest.TestCase):
@@ -359,7 +358,6 @@ class UsageTabTests(unittest.TestCase):
         self.assertIn("Delay (seconds)", js)
         self.assertNotIn("<th>ms</th>", js)
         self.assertIn(".usage-table th.num{text-align:right", css)
-        self.assertIn("t.errors || 0", js)
 
 
 class PanelBackgroundTests(unittest.TestCase):
@@ -374,19 +372,20 @@ class PanelBackgroundTests(unittest.TestCase):
 
 
 class ParallelModeTests(unittest.TestCase):
-    def test_pipeline_mode_toggle_present(self):
-        """The pipeline toolbar carries a two-way Run mode control; the
-        one-by-one button is active by default (parallel is opt-in)."""
+    def test_pipeline_mode_is_a_select(self):
+        """Item 1.5: Run mode is a dropdown like its siblings; one-by-one is
+        the default (parallel is opt-in)."""
         html = _read("index.html")
         view = _view(html, "viewPipeline")
         self.assertIn('id="pipeMode"', view)
-        self.assertIn('data-mode="one"', view)
-        self.assertIn('data-mode="parallel"', view)
-        seg = view.split('id="pipeMode"', 1)[1].split("</div>", 1)[0]
-        self.assertIn('data-mode="one" class="active"', seg)
+        self.assertIn('<select id="pipeMode" class="cred-in">', view)
+        self.assertIn('<option value="one">', view)
+        self.assertIn('<option value="parallel">', view)
+        self.assertNotIn('data-mode="one"', view)
         js = _read("app.js")
         self.assertIn("PipeRun", js)
         self.assertIn("enabled_keys", js)
+        self.assertIn("PipeRun.mode = pipeModeEl.value", js)
 
 
 class CredKeyToggleTests(unittest.TestCase):
@@ -410,6 +409,15 @@ class CredKeyToggleTests(unittest.TestCase):
         css = _read("styles.css")
         self.assertNotIn(".cred-btn.keyon", css)
         self.assertIn(".lane .lane-sw", css)
+
+    def test_toggle_persists_to_localstorage(self):
+        """Item 1.2: the per-key choice is remembered per-browser in
+        localStorage (non-secret UI state) — never in .env."""
+        js = _read("app.js")
+        self.assertIn("LANE_OFF_KEY", js)
+        self.assertIn("localStorage.getItem(LANE_OFF_KEY", js)
+        self.assertIn("localStorage.setItem(LANE_OFF_KEY", js)
+        self.assertIn("laneOffSave(set)", js)
 
 
 class LaneSurfaceTests(unittest.TestCase):
@@ -439,30 +447,184 @@ class LaneSurfaceTests(unittest.TestCase):
         self.assertIn("s.phase === 'imported'", js)
         self.assertIn('.lane[data-state="wait"]', _read("styles.css"))
 
+    def test_lane_hub_icon_follows_the_stage(self):
+        """Item 1.3: the lane's .hub icon IS the current stage icon (key when
+        idle, then the stage glyph); the old .lane-rail strip is gone."""
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn("fi(laneHubIcon(", js)
+        self.assertIn("const LANE_HUB_ICON", js)
+        for icon in ("cloud-arrow-up", "eye", "database"):
+            self.assertIn(icon, js, icon)
+        self.assertNotIn('class="lane-rail"', js)
+        self.assertNotIn(".lane-rail{", css)
+        self.assertNotIn(".lane-step{", css)
+
+    def test_lane_ring_and_eye_colour(self):
+        """Item 1.4: the hub icon's colour carries the state, and a countdown
+        ring circles it during a retry — the text chip is gone."""
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn('class="ring"', js)
+        self.assertNotIn("laneChipText", js)
+        self.assertIn('.lane[data-state="wait"] .hub .ring', css)
+        self.assertIn('.lane[data-state="done"] .hub .fa{color:var(--green)}', css)
+        self.assertIn('.lane[data-state="wait"] .hub .fa{color:var(--amber)}', css)
+        self.assertIn('.lane[data-state="failed"] .hub .fa{color:var(--red)}', css)
+
+    def test_lane_file_sits_beside_the_name(self):
+        """Item 1.6: .lane-file renders next to .lane-name, with its own gap."""
+        js = _read("app.js")
+        css = _read("styles.css")
+        seg = js.split("function lanesRender(){", 1)[1].split("box.querySelectorAll", 1)[0]
+        self.assertLess(seg.index('class="lane-name"'), seg.index('class="lane-file"'))
+        self.assertIn(".lane-file{", css)
+        self.assertIn("margin-left:var(--sp-2)", css)
+
 
 class SidebarLayoutTests(unittest.TestCase):
     def test_sidebar_header_removed_and_footer_added(self):
         """The top <header> is gone; the theme toggle + connection pill live
-        in a sidebar footer, and the collapse control is the first button."""
+        in a sidebar footer; the sidebar's top slot is the brand, not a
+        collapse control (Q1/Q2 — the sidebar no longer collapses)."""
         html = _read("index.html")
         self.assertNotIn("<header", html)
         side = html.split('id="side"', 1)[1].split("</nav>", 1)[0]
-        self.assertIn('id="sideFooter"', side)
-        self.assertIn('id="conn"', side)
-        self.assertIn('id="themeToggle"', side)
-        first_btn = side.split("<button", 1)[1].split(">", 1)[0]
-        self.assertIn('id="sideToggle"', first_btn)
+        self.assertNotIn('id="sideFooter"', side)
+        self.assertNotIn('id="conn"', side)
+        self.assertNotIn('id="themeToggle"', side)
+        self.assertIn('class="side-brand"', side)
+        self.assertNotIn('id="sideToggle"', html)
 
 
 class UsageDelayOptionsTests(unittest.TestCase):
-    def test_usage_y_mode_has_delay_options(self):
-        """Q5: beside Calls/Tokens the Y toggle offers both a cumulative and
-        an average delay metric."""
+    def test_usage_y_mode_has_avg_delay_option(self):
+        """Item 4.1: the Y control is a dropdown; it offers the average-delay
+        metric but not the useless cumulative "Delay (s)"."""
         html = _read("index.html")
-        self.assertIn('data-ymode="ms"', html)
-        self.assertIn('data-ymode="avg_ms"', html)
+        self.assertIn('<option value="avg_sec">', html)
+        self.assertNotIn('data-ymode="sec"', html)
+        self.assertNotIn('data-ymode="ms"', html)
+
+
+class SidebarIdentityTests(unittest.TestCase):
+    def test_sidebar_brand_replaces_the_collapse_control(self):
+        """Q1/Q2: the sidebar no longer collapses — the brand takes the top
+        slot; no #sideToggle / .side-collapse / body.side-min survives."""
+        html = _read("index.html")
         js = _read("app.js")
-        self.assertIn("s/call", js)
+        css = _read("styles.css")
+        for gone in ("sideToggle", "side-collapse", "side-min"):
+            self.assertNotIn(gone, html, gone)
+            self.assertNotIn(gone, js, gone)
+            self.assertNotIn(gone, css, gone)
+        self.assertIn('class="side-brand"', html)
+        self.assertIn("fa-qrcode", html)
+        self.assertIn("OCR hub", html)
+
+
+class IconPolishTests(unittest.TestCase):
+    def test_icon_hover_has_no_3d_and_borders_are_circular(self):
+        """Item 8/12: icon hover is a size bump only (no 3-D rotation), every
+        bordered icon is round, and the flat-green toggle loses glow/gradient."""
+        css = _read("styles.css")
+        # hover is a size bump only — the rotate hover rules are gone
+        self.assertIn(".icon-btn:hover svg,.icon-btn:hover .fa{transform:scale(1.06)}", css)
+        self.assertIn(".ghost-btn:hover svg,.ghost-btn:hover .fa{transform:scale(1.06)}", css)
+        self.assertNotIn("transform:rotate(-7deg)", css)
+        self.assertNotIn("transform:rotate(-12deg)", css)
+        # the spinner keyframes are load-bearing — they must survive
+        self.assertIn("@keyframes rot{", css)
+        self.assertIn(".icon-btn{position:relative;display:grid;place-items:center;"
+                      "width:42px;height:42px;border:1px solid var(--border);"
+                      "border-radius:50%;", css)
+        checked = css.split(".sw input:checked + .tr{", 1)[1].split("}", 1)[0]
+        self.assertIn("background:var(--green)", checked)
+        self.assertNotIn("gradient", checked)
+        self.assertIn("box-shadow:none", checked)
+
+    def test_cred_row_icons_are_flask_trash_and_updown(self):
+        """Item 3: close/delete rows wear a trash can, the health-check is a
+        flask, the drag grip is up/down arrows — the QBank reject row keeps
+        its x-mark (it is not a close/delete control)."""
+        js = _read("app.js")
+        self.assertIn("fi('flask')", js)
+        self.assertEqual(js.count("fi('trash')"), 3)
+        self.assertIn("fi('up-down')", js)
+        self.assertIn("fi('xmark')", js)
+
+
+class CredentialLayoutTests(unittest.TestCase):
+    def test_proxy_is_a_rail_tab_and_save_sits_on_its_header(self):
+        """Q3: Proxy joins the rail as a 4th service; Save lives on the proxy
+        pane's header and the old savebar is gone."""
+        html = _read("index.html")
+        js = _read("app.js")
+        rail = html.split('id="credRail"', 1)[1].split("</div>", 1)[0]
+        self.assertIn('data-cred="proxy"', rail)
+        pane = _pane(html, "proxy")
+        self.assertIn('id="pipeProxyNew"', pane)      # the ADD button (item 6/7)
+        self.assertIn('id="credProxyList"', pane)
+        self.assertIn('class="cred-head"', pane)
+        self.assertIn('id="credSaveBtn"', html)       # Save lives in the toolbar
+        self.assertIn("'proxy'", js)
+        self.assertNotIn("cred-savebar", html)
+
+    def test_mbar_ramps_green_to_red_over_20(self):
+        """Item 5: the model usage meter is bigger, always shows a track, and
+        ramps green -> red over the fixed 1–20 range."""
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn("used / 20", js)
+        self.assertIn("height:30px", css)
+        self.assertIn("min-width:104px", css)
+        self.assertNotIn(".mbar.m-untested i{display:none}", css)
+
+
+class UsagePlotTests(unittest.TestCase):
+    def test_usage_controls_dropdown_and_seconds(self):
+        """Items 9/10/11: the period is a 24h-default dropdown, the y-modes
+        are seconds (not ms), the plot animates and shows hover values, and
+        the old `usage-max` tag is gone."""
+        html = _read("index.html")
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn('id="usagePeriod"', html)
+        self.assertIn('<select class="cred-in" id="usageYMode">', html)
+        self.assertIn('<option value="avg_sec">', html)
+        self.assertNotIn('data-ymode=', html)
+        self.assertIn("period: '24h'", js)
+        self.assertIn("usage-tip", js)
+        self.assertNotIn(".usage-max{", css)
+        self.assertIn(".usage-plot rect{transition:", css)
+
+
+class LoadingStateTests(unittest.TestCase):
+    def test_every_data_view_has_a_loading_overlay(self):
+        """Item 13: one loading treatment, wired on the first lazy load of
+        every data-fetching view."""
+        js = _read("app.js")
+        css = _read("styles.css")
+        self.assertIn("function viewLoading(", js)
+        self.assertIn(".load-shell", js)
+        self.assertIn("@keyframes loadWave{", css)
+        for view in ("viewUsage", "viewReview", "viewRevision",
+                     "viewDatabase", "viewCredentials", "viewPipeline"):
+            self.assertIn("viewLoading('%s', true)" % view, js, view)
+
+
+class HintCopyTests(unittest.TestCase):
+    def test_descriptive_hints_are_gone_but_live_counters_stay(self):
+        """Item 14: the descriptive hint texts (and their writers) are gone;
+        the live count labels survive."""
+        html = _read("index.html")
+        js = _read("app.js")
+        for gone in ("dbBkStatus", "credModelsHint", "upQueueHint", "dbModalHint"):
+            self.assertNotIn(gone, html, gone)
+            self.assertNotIn(gone, js, gone)
+        for kept in ('id="logCount"', 'id="fileCount"', 'id="revLogCount"'):
+            self.assertIn(kept, html, kept)
+        self.assertIn(".hint{", _read("styles.css"))
 
 
 if __name__ == "__main__":

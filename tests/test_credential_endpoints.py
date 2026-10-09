@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main  # noqa: E402  (import is offline-safe: db/console are lazy)
 from pipeline import faults, gemini_router  # noqa: E402
+from pipeline import config as pipeline_config  # noqa: E402
 
 KEEP = "__KEEP__"
 _POOL_KEYS = ("GEMINI_API_KEYS", "GEMINI_API_KEY",
@@ -43,12 +44,14 @@ class EndpointCase(unittest.TestCase):
         self._old_test_chat = main.vision.test_chat
         self._old_check_provider = main.vision.check_provider
         self._old_set_proxy = main.gemini_mod.set_proxy
+        self._old_test_proxy = main.gemini_mod.test_proxy
 
     def tearDown(self):
         main.ENV_PATH = self._old_env_path
         main.vision.test_chat = self._old_test_chat
         main.vision.check_provider = self._old_check_provider
         main.gemini_mod.set_proxy = self._old_set_proxy
+        main.gemini_mod.test_proxy = self._old_test_proxy
         os.environ.clear()
         os.environ.update(self._env)
         try:
@@ -393,6 +396,24 @@ class ChatTestEndpoint(EndpointCase):
 
 
 class ProfileEndpointsTest(EndpointCase):
+    """Rework item 6: profiles persist in a local JSON store (not .env)."""
+
+    def setUp(self):
+        super().setUp()
+        self._tmp = tempfile.TemporaryDirectory(prefix="konkour-proxy-")
+        self._old_store = pipeline_config.PROXY_STORE_PATH
+        pipeline_config.PROXY_STORE_PATH = os.path.join(
+            self._tmp.name, ".proxy-profiles.json")
+
+    def tearDown(self):
+        pipeline_config.PROXY_STORE_PATH = self._old_store
+        self._tmp.cleanup()
+        super().tearDown()
+
+    def _store(self):
+        with open(pipeline_config.PROXY_STORE_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+
     def test_profiles_save_persists_and_masks_the_password(self):
         calls = []
         main.gemini_mod.set_proxy = lambda c: calls.append(c)
@@ -407,9 +428,9 @@ class ProfileEndpointsTest(EndpointCase):
         self.assertEqual(d["active"], "home")
         self.assertTrue(d["profiles"][0]["pass_set"])
         self.assertNotIn("pw-secret", json.dumps(d))
-        stored = json.loads(os.environ["PROXY_PROFILES"])
-        self.assertEqual(stored[0]["password"], "pw-secret")
-        self.assertEqual(os.environ["PROXY_ACTIVE"], "home")
+        stored = self._store()
+        self.assertEqual(stored["profiles"][0]["password"], "pw-secret")
+        self.assertEqual(stored["active"], "home")
         self.assertEqual(len(calls), 1)        # live lane swap happened
         # KEEP keeps the stored password on a re-save
         r2 = self.client().post("/api/profiles", json={
@@ -418,8 +439,7 @@ class ProfileEndpointsTest(EndpointCase):
                           "password": KEEP}],
             "active": "home"})
         self.assertEqual(r2.status_code, 200, r2.text)
-        stored = json.loads(os.environ["PROXY_PROFILES"])
-        self.assertEqual(stored[0]["password"], "pw-secret")
+        self.assertEqual(self._store()["profiles"][0]["password"], "pw-secret")
         # GET (the load path) agrees, still masked
         view = self.client().get("/api/profiles").json()
         self.assertEqual(view["active"], "home")
@@ -430,10 +450,41 @@ class ProfileEndpointsTest(EndpointCase):
         res = self.client().post("/api/profiles",
                                  json={"profiles": [], "active": ""})
         self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(os.environ["PROXY_ACTIVE"], "")
+        self.assertEqual(self._store()["active"], "")
         view = self.client().get("/api/profiles").json()
         self.assertEqual(view["profiles"], [])
         self.assertEqual(view["active"], "")
+
+    def test_proxy_probe_resolves_the_keep_sentinel(self):
+        """POST /api/profiles/test probes through one profile — the masked
+        password (KEEP) is resolved against the stored profile before the
+        keyless gateway probe runs (no model, no tokens)."""
+        calls = []
+        main.gemini_mod.test_proxy = lambda profile: calls.append(profile) or {
+            "reachable": True, "google_err": False, "kind": "ok",
+            "detail": "googleapis.com answered HTTP 403"}
+        self.client().post("/api/profiles", json={
+            "profiles": [{"name": "home", "host": "127.0.0.1",
+                          "port": "10808", "scheme": "socks5", "user": "u",
+                          "password": "pw-secret"}],
+            "active": "home"})
+        res = self.client().post("/api/profiles/test", json={
+            "name": "home", "host": "127.0.0.1", "port": "10808",
+            "scheme": "socks5", "user": "u", "password": KEEP})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertTrue(res.json()["ok"])
+        self.assertEqual(calls[0]["password"], "pw-secret")   # KEEP resolved
+        self.assertEqual(calls[0]["host"], "127.0.0.1")
+
+    def test_proxy_probe_failure_reports_not_ok(self):
+        main.gemini_mod.test_proxy = lambda profile: {
+            "reachable": False, "google_err": False, "kind": "tunnel_down",
+            "detail": "timed out"}
+        res = self.client().post("/api/profiles/test", json={
+            "name": "x", "host": "10.0.0.1", "port": "1080"})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertFalse(res.json()["ok"])
+        self.assertEqual(res.json()["kind"], "tunnel_down")
 
 
 class CheckProviderEndpointTest(EndpointCase):

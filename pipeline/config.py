@@ -72,6 +72,38 @@ def _json_list(name):
     return tuple(v for v in val if isinstance(v, dict)) if isinstance(val, list) else ()
 
 
+# Named proxy profiles live in a git-ignored local JSON store beside .env —
+# NOT in .env itself (a profile carries a proxy password; the user asked for
+# a savable local database, not an .env key).
+PROXY_STORE_PATH = os.path.join(os.path.dirname(ENV_PATH), ".proxy-profiles.json")
+
+
+def load_proxy_store():
+    """{'profiles': tuple[dict], 'active': str} from the local JSON store.
+    Never raises: a missing or corrupt file reads as empty."""
+    try:
+        with open(PROXY_STORE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"profiles": (), "active": ""}
+    if not isinstance(data, dict):
+        return {"profiles": (), "active": ""}
+    profs = data.get("profiles")
+    profs = (tuple(p for p in profs if isinstance(p, dict))
+             if isinstance(profs, list) else ())
+    active = data.get("active")
+    return {"profiles": profs, "active": active if isinstance(active, str) else ""}
+
+
+def save_proxy_store(profiles, active):
+    """Write the local proxy-profile store atomically (tmp file + rename)."""
+    tmp = PROXY_STORE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"profiles": list(profiles), "active": active or ""},
+                  fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROXY_STORE_PATH)
+
+
 def _providers(name, legacy_base, legacy_key, legacy_model,
                legacy_flag, legacy_on, legacy_default=""):
     """Saved custom providers for one section as (label, base_url, api_key,
@@ -169,7 +201,7 @@ def seed_proxy_profile():
     """Q5 one-time upgrade: when the old single proxy URL is set and no
     profile list exists yet, return exactly one profile derived from it.
     Returns () otherwise, so a later profile edit is never overwritten."""
-    if os.getenv("PROXY_PROFILES"):
+    if load_proxy_store()["profiles"]:
         return ()
     raw = _legacy_proxy_url()
     if not raw:
@@ -262,6 +294,7 @@ def load_config() -> Config:
         rev_active = rev_providers[0].get("label", "") if rev_providers else ""
     ext = _resolve(ext_providers, ext_active)
     rev = _resolve(rev_providers, rev_active)
+    _proxy_store = load_proxy_store()
     return Config(
         input_root=os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT),
         min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
@@ -296,8 +329,8 @@ def load_config() -> Config:
         extraction_active=ext_active,
         revision_providers=rev_providers,
         revision_active=rev_active,
-        proxy_profiles=_json_list("PROXY_PROFILES"),
-        proxy_active=os.getenv("PROXY_ACTIVE", "").strip(),
+        proxy_profiles=_proxy_store["profiles"],
+        proxy_active=_proxy_store["active"],
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),
         revision_chunk_size=int(os.getenv("REVISION_CHUNK_SIZE", "8")),
         revision_scan_chunk=int(os.getenv("REVISION_SCAN_CHUNK", "50")),

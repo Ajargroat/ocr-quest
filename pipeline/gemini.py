@@ -25,10 +25,8 @@ LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _proxy_url = {"url": ""}
 
 
-def set_proxy(cfg):
-    """Point module state at the profile (or no profile) a Config selects."""
-    prof = next((p for p in cfg.proxy_profiles
-                 if p.get("name") == cfg.proxy_active), None)
+def _apply_profile(prof):
+    """Point module state at one profile dict (or clear it for None/Direct)."""
     if not prof or not prof.get("host"):
         _proxy_url["url"] = ""
         return
@@ -36,6 +34,26 @@ def set_proxy(cfg):
     auth = (f"{quote(prof['user'], safe='')}:{quote(prof['password'], safe='')}@"
             if prof.get("user") else "")
     _proxy_url["url"] = f"{scheme}://{auth}{prof['host']}:{prof.get('port') or ''}"
+
+
+def set_proxy(cfg):
+    """Point module state at the profile (or no profile) a Config selects."""
+    _apply_profile(next((p for p in cfg.proxy_profiles
+                         if p.get("name") == cfg.proxy_active), None))
+
+
+def test_proxy(profile):
+    """Probe googleapis.com through ONE profile (or Direct) — the keyless
+    gateway probe, so no model and no generation tokens are spent. Swaps the
+    live lane for the probe and restores it, so a dashboard 'test' click
+    never disturbs a running pipeline. Returns gateway_probe()'s dict
+    (reachable / google_err / kind / detail). Never raises."""
+    saved = _proxy_url["url"]
+    try:
+        _apply_profile(profile)
+        return gateway_probe()
+    finally:
+        _proxy_url["url"] = saved
 
 
 def proxy_proxies():

@@ -26,14 +26,14 @@ window.MathJax = {
 <body>
 <canvas id="meshBg" class="mesh-bg" aria-hidden="true"></canvas>
 
-<!-- collapsible left sidebar — one button per view (P3); the collapse control
-     is a top-left icon, the theme + connection pill live in a bottom footer -->
+<!-- project identity at the top of the sidebar; the theme + connection pill
+     live in a bottom footer. The sidebar no longer collapses (PREFERENCE §2). -->
 <nav id="side" aria-label="Views">
-  <button class="side-btn side-collapse" id="sideToggle" type="button"
-          title="Collapse the sidebar to icons">
-    <i class="fa fa-bars-staggered" aria-hidden="true"></i><span>Collapse</span></button>
+  <div class="side-brand">
+    <i class="fa fa-qrcode" aria-hidden="true"></i><span>OCR hub</span>
+  </div>
   <button class="side-btn active" data-view="pipeline" title="Pipeline">
-    <i class="fa fa-play" aria-hidden="true"></i><span>Pipeline</span></button>
+    <i class="fa fa-power-off" aria-hidden="true"></i><span>Pipeline</span></button>
   <button class="side-btn" data-view="review" title="QBank">
     <i class="fa fa-list-check" aria-hidden="true"></i><span>QBank</span></button>
   <button class="side-btn" data-view="revision" title="Revision">
@@ -44,19 +44,6 @@ window.MathJax = {
     <i class="fa fa-chart-line" aria-hidden="true"></i><span>Usage</span></button>
   <button class="side-btn" data-view="credentials" title="Credentials">
     <i class="fa fa-key" aria-hidden="true"></i><span>Credentials</span></button>
-  <div id="sideFooter" class="side-footer">
-    <div class="conn" id="conn" title="Gemini pool">
-      <span class="conn-sig">
-        <span class="conn-bars" id="connBars"><b></b><b></b><b></b></span>
-        <em id="connPing">—</em>
-      </span>
-      <em id="connText">connecting…</em>
-    </div>
-    <button class="theme-toggle" id="themeToggle" type="button"
-            title="Switch to light theme" aria-label="Toggle light and dark theme">
-      <i class="fa fa-moon" aria-hidden="true"></i>
-    </button>
-  </div>
 </nav>
 
 <!-- ════════════ VIEW 1 · PIPELINE ════════════ -->
@@ -73,13 +60,12 @@ window.MathJax = {
       </div>
     </div>
     <div class="ps-grid">
-      <div class="ps-cell" data-live="rail"><span class="k ok" id="psSucceeded">—</span><label>Succeeded · files</label></div>
-      <div class="ps-cell" data-live="rail"><span class="k err" id="psErrors">—</span><label>Errors · files</label></div>
-      <div class="ps-cell" data-live="rail"><span class="k" id="psTotal">—</span><label>Total files</label></div>
-      <div class="ps-cell" data-live="db"><span class="k q" id="psQuestions">—</span><label>Questions</label></div>
-      <div class="ps-cell" data-live="db"><span class="k a" id="psAnswers">—</span><label>Answers</label></div>
-      <div class="ps-cell ps-note"><span class="k ps-err" id="psError" hidden></span>
-        <label id="psCaption">from existing DB rows</label></div>
+      <div class="ps-cell"><span class="k" id="psTotal">—</span><label>Total files</label></div>
+      <div class="ps-cell"><span class="k q" id="psQFiles">—</span><label>Question files</label></div>
+      <div class="ps-cell"><span class="k a" id="psAFiles">—</span><label>Answer files</label></div>
+      <div class="ps-cell"><span class="k q" id="psQuestions">—</span><label>Questions</label></div>
+      <div class="ps-cell"><span class="k a" id="psAnswers">—</span><label>Answers</label></div>
+      <div class="ps-cell ps-note"><span class="k ps-err" id="psError" hidden></span></div>
     </div>
   </section>
 
@@ -135,16 +121,16 @@ window.MathJax = {
 
   <!-- toolbar · the run action + provider / proxy context, pushed to the right -->
   <div class="toolbar" dir="ltr">
-    <button id="runBtn" class="icon-btn run" type="button" title="Start scan — click again to stop it mid-run">
-      <i class="fa fa-power-off" aria-hidden="true"></i>
+    <button id="runBtn" class="ghost-btn neutral" type="button" title="Start scan — click again to stop it mid-run">
+      <i class="fa fa-power-off" aria-hidden="true"></i><span>Run</span>
     </button>
     <div class="tb-context">
       <div class="tb-field">
-        <label class="cred-label">Run mode</label>
-        <div class="seg" id="pipeMode" role="group" aria-label="Run mode">
-          <button type="button" data-mode="one" class="active">One-by-one</button>
-          <button type="button" data-mode="parallel">Parallel</button>
-        </div>
+        <label class="cred-label" for="pipeMode">Run mode</label>
+        <select id="pipeMode" class="cred-in">
+          <option value="one">One-by-one</option>
+          <option value="parallel">Parallel</option>
+        </select>
       </div>
       <div class="tb-field">
         <label class="cred-label" for="pipeProvSel">OCR provider</label>
@@ -163,7 +149,6 @@ window.MathJax = {
     <div class="panel-head">
       <h2>Upload PDFs</h2>
       <div class="head-tools">
-        <span class="hint" id="upQueueHint"></span>
         <button class="ghost-btn neutral sm" id="upRefresh" type="button" title="Reload the queue">
           <i class="fa fa-rotate" aria-hidden="true"></i><span>Refresh</span>
         </button>
@@ -177,7 +162,7 @@ window.MathJax = {
         <div class="dd" id="upType"></div>
       </div>
       <button class="ghost-btn neutral" id="upAdd" type="button">
-        <i class="fa fa-plus" aria-hidden="true"></i><span>Add to queue</span>
+        <i class="fa fa-plus" aria-hidden="true"></i><span>ADD</span>
       </button>
     </div>
     <div class="up-empty" id="upEmpty">
@@ -198,6 +183,10 @@ window.MathJax = {
         <div class="head-tools">
           <span class="hint" id="logCount"></span>
           <span class="diag-count" id="diagCount" hidden></span>
+          <button class="ghost-btn icon-only" id="logCopyBtn" type="button"
+                  title="Copy the whole log to the clipboard">
+            <i class="fa fa-copy" aria-hidden="true"></i>
+          </button>
           <button class="ghost-btn icon-only" id="logClearBtn" type="button"
                   title="Wipe the log view — the server keeps its history">
             <i class="fa fa-trash" aria-hidden="true"></i>
@@ -216,20 +205,20 @@ window.MathJax = {
 
 <!-- ════════════ VIEW 2 · QBANK ════════════ -->
 <section id="viewReview" class="view" dir="rtl">
-  <div class="toolbar">
+  <div class="toolbar" dir="ltr">
     <div class="tb-actions">
-      <button class="icon-btn" id="rvFilterBtn" type="button" title="فیلترها" aria-expanded="false">
-        <i class="fa fa-filter" aria-hidden="true"></i>
+      <button class="ghost-btn neutral" id="rvFilterBtn" type="button" title="Filters" aria-expanded="false">
+        <i class="fa fa-filter" aria-hidden="true"></i><span>Filter</span>
         <span class="badge" id="rvFilterBadge" hidden></span>
       </button>
-      <button class="icon-btn" id="rvRefresh" type="button" title="بروزرسانی">
-        <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
+      <button class="ghost-btn neutral" id="rvRefresh" type="button" title="Refresh">
+        <i class="fa fa-arrows-rotate" aria-hidden="true"></i><span>Refresh</span>
       </button>
-      <button class="icon-btn" id="rvStatsBtn" type="button" title="آمار بانک سؤال" aria-expanded="false">
-        <i class="fa fa-chart-pie" aria-hidden="true"></i>
+      <button class="ghost-btn neutral" id="rvStatsBtn" type="button" title="Question bank stats" aria-expanded="false">
+        <i class="fa fa-chart-pie" aria-hidden="true"></i><span>Stats</span>
       </button>
 
-      <div class="filter-panel" id="rvFilters">
+      <div class="filter-panel" id="rvFilters" dir="rtl">
         <div class="fp-grid">
           <div class="seg fp-mode" id="rvMode">
             <button data-mode="both" class="active">سؤال و کلید</button>
@@ -295,22 +284,22 @@ window.MathJax = {
 
   <div class="rev-stats" id="revStats"></div>
 
-  <div class="toolbar">
-    <button class="icon-btn run" id="revRunBtn" type="button" title="شروع اسکن — هنگام اجرا، برای توقف بزنید">
-      <i class="fa fa-play" aria-hidden="true"></i>
+  <div class="toolbar" dir="ltr">
+    <button class="ghost-btn neutral" id="revRunBtn" type="button" title="Start scan — click again to stop it mid-run">
+      <i class="fa fa-power-off" aria-hidden="true"></i><span>Run</span>
     </button>
-    <div class="seg" id="revEntity">
+    <div class="seg" id="revEntity" dir="rtl">
       <button data-rentity="question" class="active">سؤال‌ها</button>
       <button data-rentity="answer">پاسخ‌ها</button>
     </div>
-    <div class="seg" id="revView">
+    <div class="seg" id="revView" dir="rtl">
       <button data-rview="flagged" class="active">نیازمند بررسی</button>
       <button data-rview="revised">بازبینی‌شده</button>
       <button data-rview="approved">تأییدشده</button>
       <button data-rview="all">همه</button>
     </div>
-    <button class="icon-btn" id="revRefresh" type="button" title="بروزرسانی فهرست و آمار">
-      <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
+    <button class="ghost-btn neutral" id="revRefresh" type="button" title="Refresh list and stats">
+      <i class="fa fa-arrows-rotate" aria-hidden="true"></i><span>Refresh</span>
     </button>
     <span class="count-line" id="revCounts"></span>
   </div>
@@ -347,10 +336,12 @@ window.MathJax = {
       <button class="rail-btn active" data-cred="ocr" type="button">OCR engine</button>
       <button class="rail-btn" data-cred="revision" type="button">Revision</button>
       <button class="rail-btn" data-cred="database" type="button">Database</button>
+      <button class="rail-btn" data-cred="proxy" type="button">Proxy</button>
     </div>
-    <div class="cred-profiles">
-      <button class="ghost-btn neutral sm" id="pipeProxyNew" type="button">New profile</button>
-      <button class="ghost-btn neutral sm" id="pipeProxyDel" type="button">Delete</button>
+    <div class="cred-global">
+      <span class="hint" id="credState" role="status"></span>
+      <button class="ghost-btn neutral sm" id="credReloadBtn" type="button">Reload saved credentials</button>
+      <button class="ghost-btn neutral" id="credSaveBtn" type="button" title="Save everything to .env" disabled>Save</button>
     </div>
   </div>
 
@@ -364,21 +355,17 @@ window.MathJax = {
             <span class="tr" aria-hidden="true"></span><em>Enabled</em>
           </label>
           <div class="head-tools">
-            <span class="hint" id="credKeyHint"></span>
             <button class="ghost-btn neutral" id="credCheckBtn" type="button" title="Checks every key one by one — a keyless googleapis probe plus a free model listing per key. No model is ever called, no generation tokens billed.">
               <i class="fa fa-heart-pulse" aria-hidden="true"></i>
               <span>Check all keys</span>
             </button>
-            <button class="ghost-btn neutral sm" id="credLadderEdit" type="button">Edit ladder</button>
+            <button class="ghost-btn neutral" id="credAddBtn" type="button" title="Add another API key to the pool">
+              <i class="fa fa-plus" aria-hidden="true"></i><span>ADD</span>
+            </button>
           </div>
         </div>
         <div class="cred-body">
-          <div class="cred-models-hint" id="credModelsHint"></div>
-          <div id="credGateway" class="cred-gw" hidden></div>
           <div id="credKeys" class="cred-keys"></div>
-          <button class="icon-btn sm cred-add" id="credAddKey" type="button" dir="ltr" title="Add another API key to the pool">
-            <i class="fa fa-plus" aria-hidden="true"></i>
-          </button>
           <p class="cred-note" id="credIdleNote" hidden>
             ⏸ The Gemini pool is idle — extraction currently runs via a
             built-in 9router provider. Keys and ladder are kept, just unused.
@@ -451,19 +438,23 @@ window.MathJax = {
         </div>
         <div class="cred-body">
           <div id="dbConns" class="cred-keys"></div>
-          <p class="cred-note">Presentation only — the pipeline keeps its one fixed
-            active connection; the enabled flag is stored with each entry.</p>
         </div>
       </div>
     </section>
-  </div>
 
-  <div class="cred-savebar">
-    <span class="hint" id="credState" role="status"></span>
-    <button class="ghost-btn neutral" id="credReloadBtn" type="button">Reload saved credentials</button>
-    <button class="icon-btn" id="credSaveBtn" type="button" title="Save everything to .env" disabled>
-      <i class="fa fa-floppy-disk" aria-hidden="true"></i>
-    </button>
+    <section class="panel cred-card" data-cred="proxy" hidden>
+      <div class="cred-section">
+        <div class="cred-head">
+          <h3>Proxy profiles</h3>
+          <button class="ghost-btn neutral" id="pipeProxyNew" type="button" title="Add a proxy profile">
+            <i class="fa fa-plus" aria-hidden="true"></i><span>ADD</span>
+          </button>
+        </div>
+        <div class="cred-body">
+          <div id="credProxyList" class="cred-keys"></div>
+        </div>
+      </div>
+    </section>
   </div>
 </section>
 
@@ -473,22 +464,29 @@ window.MathJax = {
     <div class="panel-head">
       <h2>Usage</h2>
       <div class="head-tools">
-        <div class="ps-chips usage-chips" id="usagePeriods" role="tablist" aria-label="Usage period"></div>
+        <label class="usage-ctl" for="usagePeriod"><span>Period</span>
+          <select class="cred-in" id="usagePeriod">
+            <option value="24h">24 hours</option>
+            <option value="7d">7 days</option>
+            <option value="30d">30 days</option>
+            <option value="all">All time</option>
+          </select>
+        </label>
         <label class="usage-ctl" for="usageGroup"><span>Group by</span>
           <select class="cred-in" id="usageGroup">
             <option value="model">Model</option>
             <option value="key">Key</option>
           </select>
         </label>
-        <div class="seg" id="usageYMode" role="group" aria-label="Count">
-          <button type="button" data-ymode="calls" class="active">Calls</button>
-          <button type="button" data-ymode="tokens">Tokens</button>
-          <button type="button" data-ymode="ms">Delay (total)</button>
-          <button type="button" data-ymode="avg_ms">Delay (avg)</button>
-        </div>
+        <label class="usage-ctl" for="usageYMode"><span>Count</span>
+          <select class="cred-in" id="usageYMode">
+            <option value="calls">Calls</option>
+            <option value="tokens">Tokens</option>
+            <option value="avg_sec">Delay (avg)</option>
+          </select>
+        </label>
       </div>
     </div>
-    <div class="usage-totals" id="usageTotals"></div>
     <div class="usage-plot" id="usagePlot" aria-label="Usage per day"></div>
     <div class="usage-scroll"><table class="usage-table" id="usageTable"></table></div>
   </div>
@@ -503,6 +501,7 @@ window.MathJax = {
       <button data-dpanel="grid" class="active">Data grid</button>
       <button data-dpanel="sql">SQL editor</button>
       <button data-dpanel="backups">Backups</button>
+      <button data-dpanel="bucket">Bucket</button>
     </div>
     <span class="db-crumb" id="dbCrumb"></span>
   </div>
@@ -517,15 +516,17 @@ window.MathJax = {
         <option value="250">latest 250</option>
         <option value="500">latest 500</option>
       </select>
-      <button class="icon-btn sm" id="dbRefresh" type="button" title="Reload rows">
-        <i class="fa fa-arrows-rotate" aria-hidden="true"></i>
-      </button>
-      <button class="icon-btn sm" id="dbExportBtn" type="button" title="Download current view as CSV">
-        <i class="fa fa-file-arrow-down" aria-hidden="true"></i>
-      </button>
-      <button class="icon-btn sm" id="dbAddBtn" type="button" title="Insert a new row">
-        <i class="fa fa-plus" aria-hidden="true"></i>
-      </button>
+      <div class="db-actions-right">
+        <button class="ghost-btn neutral sm" id="dbRefresh" type="button" title="Reload rows">
+          <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
+        </button>
+        <button class="ghost-btn neutral sm" id="dbExportBtn" type="button" title="Download current view as CSV">
+          <i class="fa fa-download" aria-hidden="true"></i><span>download</span>
+        </button>
+        <button class="ghost-btn neutral sm" id="dbAddBtn" type="button" title="Insert a new row">
+          <i class="fa fa-plus" aria-hidden="true"></i><span>insert</span>
+        </button>
+      </div>
     </div>
     <div class="db-grid-wrap" id="dbGrid"></div>
     <div class="db-pagebar" id="dbPagebar"></div>
@@ -534,19 +535,16 @@ window.MathJax = {
   <!-- ── panel · sql editor ── -->
   <div class="db-panel" id="dbPanelSql" hidden>
     <div class="db-sql-edit">
-      <textarea id="sqlInput" class="db-sql-in" spellcheck="false"
-                placeholder="SELECT * FROM questions ORDER BY created_at DESC LIMIT 20;"></textarea>
       <div class="db-sql-actions">
-        <button class="icon-btn sm db-run" id="sqlRunBtn" type="button" title="Run query (Ctrl + Enter)">
-          <i class="fa fa-play" aria-hidden="true"></i>
+        <button class="icon-btn run" id="sqlRunBtn" type="button" title="Run query (Ctrl + Enter)">
+          <i class="fa fa-power-off" aria-hidden="true"></i>
         </button>
         <select id="sqlSnippets" class="db-limit" title="Example queries">
           <option value="">⚡ examples…</option>
         </select>
-        <button class="icon-btn sm" id="sqlCopyLast" type="button" hidden title="Download the last result as CSV">
-          <i class="fa fa-file-arrow-down" aria-hidden="true"></i>
-        </button>
       </div>
+      <textarea id="sqlInput" class="db-sql-in" rows="10" spellcheck="false"
+                placeholder="SELECT * FROM questions ORDER BY created_at DESC LIMIT 20;"></textarea>
     </div>
     <div class="db-sql-result" id="sqlResult"></div>
   </div>
@@ -556,7 +554,6 @@ window.MathJax = {
     <div class="db-bk-head">
       <div>
         <h3>Weekly snapshots</h3>
-        <p id="dbBkStatus" class="db-bk-sub">…</p>
       </div>
       <button class="icon-btn" id="dbBackupNow" type="button" title="Create a snapshot right now">
         <i class="fa fa-server" aria-hidden="true"></i>
@@ -564,6 +561,35 @@ window.MathJax = {
     </div>
     <div class="db-bk-list" id="dbBackupList"></div>
   </div>
+
+  <!-- ── panel · bucket (read-only browser, item 3.4) ── -->
+  <div class="db-panel" id="dbPanelBucket" hidden>
+    <div class="db-bk-head">
+      <div>
+        <h3>Bucket</h3>
+        <span class="hint" id="dbBucketName"></span>
+      </div>
+      <button class="ghost-btn neutral sm" id="dbBucketReload" type="button" title="Reload the bucket listing">
+        <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
+      </button>
+    </div>
+    <div class="db-bucket" id="dbBucketList"></div>
+  </div>
+
+  <!-- bucket object drawer · slides in from the right (rework item 12) -->
+  <aside class="bucket-drawer" id="bucketDrawer" hidden>
+    <div class="bucket-drawer-head">
+      <h3 id="bucketDrawerName">Object</h3>
+      <button class="ghost-btn neutral icon-only" id="bucketDrawerClose" type="button" title="Close">
+        <i class="fa fa-xmark" aria-hidden="true"></i>
+      </button>
+    </div>
+    <div class="bucket-drawer-body">
+      <img id="bucketDrawerImg" alt="Bucket object preview">
+      <a class="bucket-src" id="bucketDrawerSrc" href="#" target="_blank" rel="noopener" hidden></a>
+      <div class="bucket-links" id="bucketDrawerLinks"></div>
+    </div>
+  </aside>
 </section>
 
 <!-- row editor / insert modal -->
@@ -577,10 +603,7 @@ window.MathJax = {
     </div>
     <div class="db-modal-body" id="dbModalBody"></div>
     <div class="db-modal-foot">
-      <span class="hint" id="dbModalHint"></span>
-      <button class="icon-btn sm" id="dbModalSave" type="button" title="Save row">
-        <i class="fa fa-floppy-disk" aria-hidden="true"></i>
-      </button>
+      <button class="ghost-btn neutral" id="dbModalSave" type="button" title="Save row">Save</button>
     </div>
   </div>
 </div>
@@ -648,7 +671,6 @@ window.MathJax = {
         <label class="cred-label" for="credLadder">Model ladder <span class="cred-sub">oldest first · every key walks the whole ladder, stepping up only on failure</span></label>
         <textarea id="credLadder" class="cred-in mono" rows="2" spellcheck="false"
                   placeholder="gemini-3.5-flash, gemini-3.6-flash, …" dir="ltr"></textarea>
-        <p class="hint">The keys themselves live in the OCR engine pane — this pop-up edits only the ladder.</p>
       </div>
       <div class="cred-form" data-form="supabase" hidden>
         <label class="cred-label" for="credSupaUrl">Project URL</label>
@@ -679,9 +701,7 @@ window.MathJax = {
     </div>
     <div class="db-modal-foot">
       <span class="hint" id="credModalHint"></span>
-      <button class="icon-btn sm" id="credModalSave" type="button" title="Stage and close">
-        <i class="fa fa-floppy-disk" aria-hidden="true"></i>
-      </button>
+      <button class="ghost-btn neutral" id="credModalSave" type="button" title="Stage and close">Save</button>
     </div>
   </div>
 </div>
@@ -690,7 +710,7 @@ window.MathJax = {
 <div class="db-modal" id="proxyModal" hidden>
   <div class="db-modal-card proxy-card">
     <div class="db-modal-head">
-      <h3>New proxy profile</h3>
+      <h3 id="proxyModalTitle">New proxy profile</h3>
       <button class="ghost-btn neutral icon-only" id="proxyModalClose" type="button" title="Close">
         <i class="fa fa-xmark" aria-hidden="true"></i>
       </button>
@@ -723,9 +743,7 @@ window.MathJax = {
     <div class="db-modal-foot">
       <span class="hint" id="proxyModalErr" role="alert"></span>
       <button class="ghost-btn neutral" id="proxyModalCancel" type="button">Cancel</button>
-      <button class="icon-btn sm" id="proxyModalSave" type="button" title="Save profile">
-        <i class="fa fa-floppy-disk" aria-hidden="true"></i>
-      </button>
+      <button class="ghost-btn neutral" id="proxyModalSave" type="button" title="Save profile">Save</button>
     </div>
   </div>
 </div>

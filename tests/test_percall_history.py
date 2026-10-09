@@ -145,6 +145,21 @@ class PerCallHistoryTests(unittest.TestCase):
         self.assertEqual(totals["tokens_in"], 7)
         self.assertEqual(totals["tokens_out"], 5)
 
+    def test_router_rows_are_excluded(self):
+        """C17 (item 4.2): 9router helper rows never reach the usage table or
+        the chart series — they are routing noise, not model usage."""
+        r = GeminiRouter()
+        with open(self._calls_file(), "w", encoding="utf-8") as fh:
+            json.dump([
+                {"ts": time.time(), "model": "gemini-3.5-flash",
+                 "key_name": "Key 1", "ok": True, "ms": 10.0},
+                {"ts": time.time(), "model": "chain-model",
+                 "key_name": "9router", "ok": True, "ms": 20.0},
+            ], fh)
+        rep = r.usage_report("all")
+        self.assertEqual([c["key_name"] for c in rep["calls"]], ["Key 1"])
+        self.assertEqual(rep["totals"]["calls"], 1)
+
 
 class UsageChartTests(unittest.TestCase):
     """The server-side day × series bucketing behind the Usage curve (Q2/Q3)."""
@@ -190,26 +205,28 @@ class UsageChartTests(unittest.TestCase):
         self.assertEqual(usage_chart(rows, y="tokens")["cells"], [[0]])
         self.assertEqual(usage_chart(rows, y="calls")["cells"], [[1]])
 
-    def test_usage_chart_y_ms_sums_delay_per_day(self):
-        """Y=ms: the cell is the summed per-call delay (Q5 cumulative)."""
+    def test_chart_y_sec_sums_delay_in_seconds(self):
+        """Y=sec: the cell is the summed per-call delay, in seconds to match
+        the per-call table."""
         rows = [{"ts": self._ts(7, 9), "model": "m1", "ms": 1000.0},
                 {"ts": self._ts(7, 10), "model": "m1", "ms": 3000.0}]
-        chart = usage_chart(rows, y="ms")
-        self.assertEqual(chart["y"], "ms")
-        self.assertEqual(chart["cells"], [[4000.0]])
+        chart = usage_chart(rows, y="sec")
+        self.assertEqual(chart["y"], "sec")
+        self.assertEqual(chart["cells"], [[4.0]])
 
-    def test_usage_chart_y_avg_ms_divides_by_call_count(self):
-        """Y=avg_ms: the same cell divided by its call count (Q5 average)."""
+    def test_chart_y_avg_sec_divides_by_call_count(self):
+        """Y=avg_sec: the same cell divided by its call count, in seconds."""
         rows = [{"ts": self._ts(7, 9), "model": "m1", "ms": 1000.0},
                 {"ts": self._ts(7, 10), "model": "m1", "ms": 3000.0}]
-        self.assertEqual(usage_chart(rows, y="avg_ms")["cells"], [[2000.0]])
+        self.assertEqual(usage_chart(rows, y="avg_sec")["cells"], [[2.0]])
 
     def test_usage_chart_delay_whitelist_and_fallback(self):
-        """Both delay modes survive the whitelist; an unknown y still falls
-        back to calls."""
+        """The seconds delay modes survive the whitelist; the retired ms modes
+        and an unknown y all fall back to calls."""
         rows = [{"ts": self._ts(7), "model": "m1", "ms": 500.0}]
-        self.assertEqual(usage_chart(rows, y="ms")["y"], "ms")
-        self.assertEqual(usage_chart(rows, y="avg_ms")["y"], "avg_ms")
+        self.assertEqual(usage_chart(rows, y="sec")["y"], "sec")
+        self.assertEqual(usage_chart(rows, y="avg_sec")["y"], "avg_sec")
+        self.assertEqual(usage_chart(rows, y="ms")["y"], "calls")
         self.assertEqual(usage_chart(rows, y="delay")["y"], "calls")
 
 
@@ -291,14 +308,16 @@ class PeriodCountsTests(unittest.TestCase):
         db._execute = fake_execute
         return db
 
-    def test_counts_map_in_order(self):
-        db = self._db([10, 4, 1, 7])
+    def test_counts_include_question_and_answer_files(self):
+        db = self._db([10, 4, 1, 7, 2, 3])
         got = db.fetch_period_counts("2026-09-01", "2026-10-05")
         self.assertEqual(got["questions"], 10)
         self.assertEqual(got["answers"], 4)
         self.assertEqual(got["errors"], 1)
         self.assertEqual(got["files"], 7)
         self.assertEqual(got["total"], 7)
+        self.assertEqual(got["question_files"], 2)
+        self.assertEqual(got["answer_files"], 3)
         self.assertEqual(got["succeeded"], 14)
 
     def test_db_failure_degrades_to_zeros(self):
@@ -312,7 +331,52 @@ class PeriodCountsTests(unittest.TestCase):
         db._execute = boom
         got = db.fetch_period_counts()
         self.assertEqual(got, {"questions": 0, "answers": 0, "errors": 0,
-                               "files": 0, "total": 0, "succeeded": 0})
+                               "files": 0, "total": 0, "succeeded": 0,
+                               "question_files": 0, "answer_files": 0})
+
+
+class SourceDetailTests(unittest.TestCase):
+    """fetch_source_detail feeds the Database tab's bucket drawer (item 12)."""
+
+    def _db(self, source_rows, question_rows, answer_rows):
+        db = Database(SimpleNamespace(
+            postgres_host="", postgres_port=0, postgres_db="",
+            postgres_user="", postgres_password="", postgres_sslmode=""))
+        calls = []
+
+        def fake_execute(sql, params=None, fetch=False):
+            calls.append(sql)
+            if "FROM public.sources" in sql:
+                return source_rows
+            if "FROM public.questions" in sql:
+                return question_rows
+            return answer_rows
+
+        db._execute = fake_execute
+        db.calls = calls
+        return db
+
+    def test_source_detail_shapes_source_questions_and_answers(self):
+        db = self._db(
+            [("sid-1", "f.jpg", "image/jpeg", 100, "http://x/f.jpg",
+              "math", 12, "alg", "سوال")],
+            [("q1", 1, "question text", "pending")],
+            [("a1", 1, "answer text", "pending")])
+        got = db.fetch_source_detail("sid-1")
+        self.assertEqual(got["source"]["id"], "sid-1")
+        self.assertEqual(got["source"]["storage_url"], "http://x/f.jpg")
+        self.assertEqual(got["source"]["grade"], "12")        # cast to text
+        self.assertEqual(got["questions"][0]["question_number"], 1)
+        self.assertEqual(got["questions"][0]["question_text"], "question text")
+        self.assertEqual(got["answers"][0]["answer_explanation"], "answer text")
+        self.assertEqual(len(db.calls), 3)                    # source + q + a
+
+    def test_source_detail_with_no_row_is_none(self):
+        db = self._db([], [], [])
+        got = db.fetch_source_detail("missing")
+        self.assertIsNone(got["source"])
+        self.assertEqual(got["questions"], [])
+        self.assertEqual(got["answers"], [])
 
 
 class ClearZeroBboxTests(unittest.TestCase):

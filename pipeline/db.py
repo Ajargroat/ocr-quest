@@ -57,7 +57,7 @@ class Database:
         """
         def _count(table, extra="", params=()):
             sql = f"SELECT COUNT(*) FROM public.{table} WHERE 1=1"
-            args = list(params)
+            args = []
             if date_from:
                 sql += f" AND created_at::date >= %s::date"
                 args.append(str(date_from))
@@ -66,6 +66,7 @@ class Database:
                 args.append(str(date_to))
             if extra:
                 sql += " " + extra
+                args.extend(params)          # extra's placeholders come last
             try:
                 rows = self._execute(sql, tuple(args), fetch=True) or [(0,)]
             except Exception:
@@ -76,8 +77,13 @@ class Database:
         answers = _count("answers")
         errors = _count("questions", "AND review_status = 'rejected'")
         files = _count("sources")
+        # Question/Answer *file* counts come from sources.type ("سوال"/"پاسخ" —
+        # scanner.TYPE_DIRS), so all five period cards are DB-sourced (D3).
+        question_files = _count("sources", "AND type = %s", ("سوال",))
+        answer_files = _count("sources", "AND type = %s", ("پاسخ",))
         return {"questions": questions, "answers": answers,
                 "errors": errors, "files": files, "total": files,
+                "question_files": question_files, "answer_files": answer_files,
                 "succeeded": questions + answers}
 
     # ── sources ────────────────────────────────────────────────────
@@ -133,6 +139,41 @@ class Database:
                 r["review_status"], r["raw_ocr_text"], r["diagram_url"],
                 r["diagram_bbox"], r["grade"], r["corp"], r["year"],
             ))
+
+    # ── one bucket object's DB context (bucket drawer, item 12) ─────
+    def fetch_source_detail(self, source_id):
+        """The source row plus its linked questions and answers, for the
+        Database tab's bucket drawer. `source_id` is the storage object name
+        (storage.list_objects returns those as `name`)."""
+        src = self._execute(
+            "SELECT id, file_name, mime_type, file_size_bytes, storage_url, "
+            "subject, grade, topic, type FROM public.sources WHERE id = %s",
+            (source_id,), fetch=True) or []
+        source = None
+        if src:
+            r = src[0]
+            source = {"id": r[0], "file_name": r[1], "mime_type": r[2],
+                      "file_size_bytes": r[3], "storage_url": r[4],
+                      "subject": r[5],
+                      "grade": str(r[6]) if r[6] is not None else None,
+                      "topic": r[7], "type": r[8]}
+        qs = self._execute(
+            "SELECT id, question_number, question_text, review_status "
+            "FROM public.questions WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        ans = self._execute(
+            "SELECT id, question_number, answer_explanation, review_status "
+            "FROM public.answers WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        return {
+            "source": source,
+            "questions": [{"id": r[0], "question_number": r[1],
+                           "question_text": r[2], "review_status": r[3]}
+                          for r in qs],
+            "answers": [{"id": r[0], "question_number": r[1],
+                         "answer_explanation": r[2], "review_status": r[3]}
+                        for r in ans],
+        }
 
     # ── context for the answer branch ('Fetch Questions' node) ─────
     def fetch_context_questions(self, subject, topic, grade):

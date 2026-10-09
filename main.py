@@ -16,10 +16,11 @@ import json
 from pipeline import envfile
 from pipeline import vision
 from pipeline import backups
+from pipeline import storage
 from pipeline import gemini as gemini_mod
 from pipeline.dataconsole import DataConsole, GuardError
 from pipeline.revision import runner as revision_runner
-from pipeline.config import load_config, ENV_PATH, seed_proxy_profile
+from pipeline.config import load_config, ENV_PATH, seed_proxy_profile, save_proxy_store
 from pipeline.db import Database
 from pipeline.gemini_router import router, usage_chart
 from pipeline.gemini_router import mask as mask_key
@@ -51,7 +52,7 @@ async def _backup_loop():
     while True:
         try:
             if await asyncio.to_thread(backups.due):
-                manifest = await asyncio.to_thread(backups.run_backup, cfg, "weekly")
+                manifest = await asyncio.to_thread(backups.run_backup, cfg, "daily")
                 print(f"[backups] snapshot {manifest['name']} - "
                       f"{manifest['total_rows']} rows written")
         except Exception as exc:
@@ -63,12 +64,10 @@ async def _backup_loop():
 async def lifespan(_app):
     hub.attach_loop(asyncio.get_running_loop())
     # Q5 one-time upgrade: a legacy single proxy URL becomes one profile
-    # before the old lane is dropped — never overwrites an existing list.
+    # before the old lane is dropped — never overwrites an existing store.
     seeded = seed_proxy_profile()
     if seeded:
-        envfile.update_env_file(ENV_PATH, {
-            "PROXY_PROFILES": json.dumps(list(seeded), ensure_ascii=False)})
-        load_dotenv(ENV_PATH, override=True)
+        save_proxy_store(seeded, "")
     backup_task = asyncio.create_task(_backup_loop())
     if getattr(cfg, "converter_enabled", True):
         from pipeline import converter
@@ -303,6 +302,35 @@ async def proxy_image(source_id: str):
         return Response(content=resp.content, media_type=content_type)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/api/db/bucket")
+async def db_bucket(prefix: str = "", limit: int = 100, offset: int = 0):
+    """Read-only list of the configured Supabase bucket's objects (item 3.4).
+
+    The Database tab's Bucket panel browses these; each row's `name` is the
+    same value /api/proxy/image/{name} fetches. No mutation, no bucket picker.
+    """
+    try:
+        rows = await asyncio.to_thread(storage.list_objects, cfg, prefix,
+                                       limit, offset)
+        return JSONResponse({"ok": True, "objects": rows,
+                             "bucket": cfg.supabase_bucket})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
+
+@app.get("/api/db/source")
+async def db_source(source_id: str):
+    """One bucket object's DB context for the bucket drawer (item 12):
+    the source row + its linked questions and answers, tagged by type.
+    Read-only; the image itself comes from /api/proxy/image/{source_id}."""
+    try:
+        return JSONResponse(await asyncio.to_thread(
+            db.fetch_source_detail, source_id))
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
+
 
 class RevisionResolve(BaseModel):
     id: str
@@ -990,8 +1018,9 @@ async def profiles_get():
 
 @app.post("/api/profiles")
 async def profiles_save(body: ProfileSave):
-    """Persist named proxy profiles + the active one to .env and hot-swap
-    the live lane — no restart (Q4: active "" is Direct, no proxy)."""
+    """Persist named proxy profiles + the active one to the local
+    .proxy-profiles.json store and hot-swap the live lane — no restart
+    (Q4: active "" is Direct, no proxy)."""
     global cfg
     names, clean = [], []
     stored = {p.get("name", ""): p for p in cfg.proxy_profiles}
@@ -1026,17 +1055,44 @@ async def profiles_save(body: ProfileSave):
     active = body.active.strip()
     if active and active not in names:
         active = ""
-    envfile.update_env_file(ENV_PATH, {
-        "PROXY_PROFILES": json.dumps(clean, ensure_ascii=False),
-        "PROXY_ACTIVE": active,
-    })
-    load_dotenv(ENV_PATH, override=True)
+    save_proxy_store(clean, active)
     cfg = load_config()
     gemini_mod.set_proxy(cfg)        # live lane swap, no restart
     view = _profiles_view()
     view["ok"] = True
     view["saved"] = True
     return JSONResponse(view)
+
+
+class ProfileTest(BaseModel):
+    name: str = ""
+    host: str = ""
+    port: str = ""
+    scheme: str = "http"
+    user: str = ""
+    password: str = ""               # KEEP sentinel → the stored secret
+
+
+@app.post("/api/profiles/test")
+async def profiles_test(body: ProfileTest):
+    """Probe googleapis.com through ONE profile (or Direct) — a keyless
+    gateway probe: no model, no generation tokens, no key. Resolves the KEEP
+    sentinel against the stored profile so a masked password is never
+    re-sent, and never touches the live lane (gemini.test_proxy restores it)."""
+    password = body.password
+    if password == KEEP:
+        stored = {p.get("name", ""): p for p in cfg.proxy_profiles}
+        password = stored.get(body.name, {}).get("password", "")
+    profile = {"name": body.name, "host": body.host.strip(),
+               "port": str(body.port).strip(),
+               "scheme": (body.scheme or "http").lower(),
+               "user": body.user.strip(), "password": password}
+    try:
+        report = await asyncio.to_thread(gemini_mod.test_proxy, profile)
+    except Exception as exc:                       # pragma: no cover
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    report["ok"] = bool(report.get("reachable"))
+    return JSONResponse(report)
 
 
 @app.post("/api/review/bbox")

@@ -60,8 +60,7 @@ class MinimalThemeTests(unittest.TestCase):
         paints text on it must flip to the off-white idiom (like
         `.side-btn.active`). The run button also becomes a circle."""
         css = _read("styles.css")
-        for sel in (':root[data-theme="light"] #runBtn',
-                    ':root[data-theme="light"] .btn.primary',
+        for sel in (':root[data-theme="light"] .btn.primary',
                     ':root[data-theme="light"] .stage.active .hub',
                     ':root[data-theme="light"] .stage .bubble',
                     ':root[data-theme="light"] .ps-chip.active'):
@@ -73,7 +72,7 @@ class MinimalThemeTests(unittest.TestCase):
         self.assertIn("color:var(--text)", dd)
         run = _rule(css, "#runBtn")
         self.assertIsNotNone(run, "#runBtn")
-        self.assertIn("border-radius:50%", run)
+        self.assertNotIn("border-radius:50%", run)   # item 8/16: a text button, not a circle
 
 
 if __name__ == "__main__":

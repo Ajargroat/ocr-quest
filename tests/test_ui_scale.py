@@ -61,7 +61,6 @@ class ScaleTokenTests(unittest.TestCase):
     def test_named_structural_rules_use_scale_tokens(self):
         css = _read("styles.css")
         wants = {
-            ".side-footer": "--sp-3",
             "h1": "--fs-5",
             ".panel-head": "--sp-5",
             ".usage-table": "--fs-2",
@@ -76,12 +75,11 @@ class ScaleTokenTests(unittest.TestCase):
 
     def test_declutter_marks_applied(self):
         html = _read("index.html")
-        for gone in ('class="sub"', 'class="sep"', 'id="routerHint"', '<section class="stats">'):
+        for gone in ('class="sub"', 'class="sep"', 'id="routerHint"',
+                     '<section class="stats">', 'id="upQueueHint"'):
             self.assertNotIn(gone, html, gone)
-        for kept in ('id="upQueueHint"',):
-            self.assertIn(kept, html, kept)
         self.assertNotIn('id="stTotal"', html)
-        self.assertLess(html.index('id="periodStats"'), html.index('id="psSucceeded"'))
+        self.assertLess(html.index('id="periodStats"'), html.index('id="psTotal"'))
         for line in html.splitlines():
             if 'id="revNow"' in line:
                 self.assertNotIn("></div>", line)

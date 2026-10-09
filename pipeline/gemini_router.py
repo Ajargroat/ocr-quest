@@ -160,14 +160,14 @@ def usage_chart(rows, group="model", y="calls"):
     """Day × series buckets for the Usage tab curve (Q2/Q3).
 
     group: 'model' | 'key'  — what one colour stands for.
-    y:     'calls' | 'tokens' | 'ms' | 'avg_ms' — what the bar height
-           counts (tokens = tokens_in + tokens_out of the call; ms = summed
-           per-call delay in the cell; avg_ms = delay ÷ calls in the cell).
+    y:     'calls' | 'tokens' | 'sec' | 'avg_sec' — what the bar height
+           counts (tokens = tokens_in + tokens_out of the call; sec = summed
+           per-call delay in the cell; avg_sec = delay ÷ calls in the cell).
     Days are UTC, matching the "Time (UTC)" column of the table.
     Returns {"group", "y", "days": [iso…], "series": [label…],
              "cells": [[value, …], …]} where cells[day][series]."""
     group = group if group in ("model", "key") else "model"
-    y = y if y in ("calls", "tokens", "ms", "avg_ms") else "calls"
+    y = y if y in ("calls", "tokens", "sec", "avg_sec") else "calls"
     days, series, counts, calls_n = [], [], {}, {}
     for r in rows or []:
         day = datetime.fromtimestamp(r.get("ts") or 0,
@@ -182,7 +182,7 @@ def usage_chart(rows, group="model", y="calls"):
         elif y == "tokens":
             value = int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0)
         else:
-            value = float(r.get("ms") or 0.0)
+            value = float(r.get("ms") or 0.0) / 1000.0
         if day not in counts:
             counts[day] = {}
             days.append(day)
@@ -191,13 +191,13 @@ def usage_chart(rows, group="model", y="calls"):
             if label not in series:
                 series.append(label)
         counts[day][label] += value
-        if y == "avg_ms":
+        if y == "avg_sec":
             calls_n.setdefault(day, {})
             calls_n[day][label] = calls_n[day].get(label, 0) + 1
     days.sort()
     totals = {s: sum(counts[d].get(s, 0) for d in days) for s in series}
     series.sort(key=lambda s: (-totals[s], s))     # biggest series first
-    if y == "avg_ms":
+    if y == "avg_sec":
         # divide each day×series cell by its own call count (never 0 → no div
         # error); round to 1 decimal so the axis stays readable.
         cells = [[round(counts[d].get(s, 0) / calls_n.get(d, {}).get(s, 1), 1)
@@ -402,6 +402,9 @@ class GeminiRouter:
         if hours is not None:
             cutoff = time.time() - hours * 3600
             rows = [r for r in rows if r.get("ts", 0) >= cutoff]
+        # 9router is a routing helper, not a model-usage series — keep its rows
+        # out of BOTH the chart and the table (item 4.2).
+        rows = [r for r in rows if (r.get("key_name") or "") != "9router"]
         totals = {"calls": len(rows),
                   "errors": sum(1 for r in rows if not r.get("ok")),
                   "tokens_in": sum(r.get("tokens_in", 0) for r in rows),

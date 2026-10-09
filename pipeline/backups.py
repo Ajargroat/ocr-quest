@@ -39,11 +39,11 @@ def _env_int(var, default):
 
 
 def interval_days():
-    return _env_int("BACKUP_INTERVAL_DAYS", 7)
+    return _env_int("BACKUP_INTERVAL_DAYS", 1)
 
 
 def keep_sets():
-    return _env_int("BACKUP_KEEP", 12)
+    return _env_int("BACKUP_KEEP", 1)
 
 
 def _connect(cfg):
@@ -183,7 +183,8 @@ def due():
 
 
 def rotate():
-    """Delete all but the newest KEEP backup sets."""
+    """Delete all but the newest KEEP backup sets (KEEP defaults to 1 → only
+    the newest snapshot survives, so every backup deletes the older ones)."""
     sets = list_sets()
     for stale in sets[keep_sets():]:
         path = os.path.join(BACKUP_ROOT, stale["dir"])

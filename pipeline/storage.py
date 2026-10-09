@@ -57,3 +57,24 @@ def upload_file(cfg: Config, object_name: str, data: bytes, mime_type: str,
     raise faults.FaultError(
         last, f"{last['label']} after {retries} attempts — {last['hint']} "
               f"(last error: {last['raw'][:200]})")
+
+
+def list_objects(cfg: Config, prefix: str = "", limit: int = 100,
+                 offset: int = 0):
+    """Read-only listing of one bucket's objects (Supabase Storage list API).
+
+    Returns the raw JSON rows — each carries at least ``name`` (the object
+    path, i.e. the ``source_id`` ``main.proxy_image`` expects), plus ``id``,
+    ``metadata``, etc. POSTs to ``/storage/v1/object/list/{bucket}`` with the
+    service key. No mutation, no bucket picker — one configured bucket."""
+    url = f"{cfg.supabase_url}/storage/v1/object/list/{cfg.supabase_bucket}"
+    headers = {
+        "apikey": cfg.supabase_key,
+        "Authorization": f"Bearer {cfg.supabase_key}",
+        "Content-Type": "application/json",
+    }
+    body = {"prefix": prefix or "", "limit": int(limit), "offset": int(offset)}
+    resp = requests.post(url, json=body, headers=headers, timeout=30)
+    resp.raise_for_status()
+    rows = resp.json()
+    return rows if isinstance(rows, list) else []

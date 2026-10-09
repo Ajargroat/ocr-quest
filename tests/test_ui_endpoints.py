@@ -158,6 +158,47 @@ class UsageReportEndpoint(UIEndpointCase):
         self.assertEqual(res.json()["period"], "all")
 
 
+class BucketEndpoint(UIEndpointCase):
+    """C14 (item 3.4): GET /api/db/bucket proxies the Supabase Storage list
+    API read-only, with the configured bucket name echoed back."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_list = main.storage.list_objects
+        main.cfg.supabase_bucket = "test-bucket"
+
+    def tearDown(self):
+        main.storage.list_objects = self._old_list
+        super().tearDown()
+
+    def test_bucket_list_is_proxied(self):
+        seen = {}
+
+        def fake(cfg, prefix="", limit=100, offset=0):
+            seen.update({"prefix": prefix, "limit": limit, "offset": offset})
+            return [{"name": "sid-01.pdf", "id": "x"}]
+
+        main.storage.list_objects = fake
+        res = self.client().get("/api/db/bucket",
+                                params={"prefix": "math/", "limit": 5})
+        self.assertEqual(res.status_code, 200, res.text)
+        d = res.json()
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["bucket"], "test-bucket")
+        self.assertEqual(d["objects"][0]["name"], "sid-01.pdf")
+        self.assertEqual(seen["prefix"], "math/")
+        self.assertEqual(seen["limit"], 5)
+
+    def test_bucket_error_is_502(self):
+        def boom(cfg, prefix="", limit=100, offset=0):
+            raise RuntimeError("no bucket")
+
+        main.storage.list_objects = boom
+        res = self.client().get("/api/db/bucket")
+        self.assertEqual(res.status_code, 502)
+        self.assertFalse(res.json()["ok"])
+
+
 class UploadEndpoints(UIEndpointCase):
 
     def _post(self, name="sheet.pdf", dest="math/101/algebra/question",

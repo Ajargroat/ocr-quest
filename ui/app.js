@@ -92,42 +92,6 @@ function typesetMath(el){
 }
 
 /* ═══════════ PIPELINE (unchanged logic) ═══════════ */
-/* signal bars: 1 red bar while the socket is down, green bars whose
-   count follows the OCR provider's ping (outline item 3). */
-let PING = {ms: null, ok: true};          // ms null → nothing measured (Gemini pool)
-
-function setConn(ok){
-  $('conn').className = 'conn ' + (ok ? 'on' : 'off');
-  paintConn();
-}
-function paintConn(){
-  const live = $('conn').classList.contains('on');
-  const good = live && PING.ok;
-  const n = !good ? 1
-    : PING.ms == null ? 3
-    : PING.ms <= 300 ? 3 : PING.ms <= 1200 ? 2 : 1;
-  const bars = $('connBars').children;
-  for (let i = 0; i < bars.length; i++) bars[i].classList.toggle('on', i < n);
-  $('conn').classList.toggle('down', !good);
-  $('connText').textContent = live ? 'live' : 'reconnecting…';
-  $('connPing').textContent = (good && PING.ms != null) ? Math.round(PING.ms) + ' ms' : '—';
-  $('conn').title = $('pipeProvSel').value || 'Gemini pool';
-}
-async function pingProvider(){
-  try{
-    const res = await fetch('/api/credentials/check/provider', {method: 'POST'});
-    if (res.status === 409){              // Gemini pool — nothing to probe (Q2a)
-      PING = {ms: null, ok: true};
-    } else {
-      const d = await res.json();
-      PING = {ms: (typeof d.latency_ms === 'number' ? d.latency_ms : null),
-              ok: !!d.ok};
-    }
-  }catch(e){
-    PING = {ms: null, ok: false};
-  }
-  paintConn();
-}
 function applyStats(s){
   const done = (s.processed || 0) + (s.errors || 0), total = s.total || 0;
   $('barFill').style.width = total ? (done / total * 100) + '%' : '0%';
@@ -137,6 +101,14 @@ const STATUS_LABEL = {queued:'Queued', uploading:'Uploading', ocr:'OCR',
                       saving:'Saving', cached:'Cached', done:'Done', failed:'Failed'};
 function fileCard(ev){
   const wrap = $('files');
+  // Completed files leave the queue (rework item 15): a finished source has
+  // moved to done/ server-side, so keeping its card only clutters the list.
+  if (ev.status === 'done'){
+    const done = document.getElementById('f-' + ev.id);
+    if (done) done.remove();
+    $('fileCount').textContent = wrap.children.length + ' file(s)';
+    return;
+  }
   const empty = wrap.querySelector('.empty');
   if (empty) empty.remove();
   let el = document.getElementById('f-' + ev.id);
@@ -237,6 +209,12 @@ function wipeLog(){
   $('log').innerHTML = '';
   $('logCount').textContent = '';
 }
+$('logCopyBtn').onclick = async () => {
+  const txt = ($('log').innerText || '').trim();
+  if (!txt){ toast('Log is empty'); return; }
+  try { await navigator.clipboard.writeText(txt); toast('Log copied'); }
+  catch(e){ toast('Copy failed — ' + e); }
+};
 $('logClearBtn').onclick = () => {
   const box = $('log'), btn = $('logClearBtn');
   if (!box.querySelector('.line')){ toast('Log is already empty'); return; }
@@ -402,7 +380,9 @@ function setRunning(r){
   const b = $('runBtn');
   b.classList.toggle('running', PIPE_RUNNING);
   b.classList.toggle('stopping', PIPE_RUNNING && PIPE_STOPPING);
-  b.innerHTML = PIPE_RUNNING ? fi('stop') : fi('power-off');
+  b.innerHTML = PIPE_RUNNING
+    ? fi('stop') + '<span>Stop</span>'
+    : fi('power-off') + '<span>Run</span>';
   b.title = PIPE_RUNNING
     ? (PIPE_STOPPING ? 'Stopping after the current file…'
                      : 'Stop — finishes the current file, imports parked writes')
@@ -432,8 +412,10 @@ function handle(ev){
     case 'round': LANES.round = ev.no || 0; laneNowPaint(); break;
     case 'error': diagLine(ev); break;
     case 'stats': applyStats(ev.stats || {}); break;
-    case 'run_started': PIPE_STOPPING = false; setRunning(true); DIAG.counts = {}; updateDiagCount(); LANES.states = {}; LANES.round = 0; break;
-    case 'run_finished': PIPE_STOPPING = false; setRunning(false); break;
+    case 'run_started': PIPE_STOPPING = false; setRunning(true); DIAG.counts = {}; updateDiagCount(); LANES.states = {}; LANES.round = 0;
+      if (LANE_TICK){ clearInterval(LANE_TICK); LANE_TICK = null; } break;
+    case 'run_finished': PIPE_STOPPING = false; setRunning(false);
+      LANES.states = {}; LANES.round = 0; lanesRender(); laneNowPaint(); break;
     case 'wait': waitCountdown(ev); break;
     case 'upload': upApplyEvent(ev); break;
     case 'usage': credUsageLive(ev); break;
@@ -461,26 +443,26 @@ function waitCountdown(ev){
 function connect(){
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const ws = new WebSocket(proto + '://' + location.host + '/ws');
-  ws.onopen = () => setConn(true);
-  ws.onclose = () => { setConn(false); setTimeout(connect, 1500); };
+  ws.onclose = () => { setTimeout(connect, 1500); };
   ws.onmessage = m => handle(JSON.parse(m.data));
 }
 connect();
-pingProvider();
 
-/* Run mode — page-level, session-only (PREFERENCE §3): sent with Run.
-   'one' = today's serial loop, 'parallel' = round-based key-pinned lanes. */
-const PipeRun = { mode: 'one' };
+/* Run mode — page-level, remembered per-browser (localStorage; non-secret
+   UI state, item 1.2/1b) so a refresh keeps Parallel selected.
+   'one' = the serial loop, 'parallel' = round-based key-pinned lanes. */
+const PIPE_MODE_KEY = 'konkour.pipeMode';
+const PipeRun = { mode: (() => {
+  try{ return localStorage.getItem(PIPE_MODE_KEY) || 'one'; }catch(e){ return 'one'; }
+})() };
 const pipeModeEl = $('pipeMode');
 if (pipeModeEl){
-  pipeModeEl.querySelectorAll('button[data-mode]').forEach(b => {
-    b.onclick = () => {
-      PipeRun.mode = b.dataset.mode;
-      pipeModeEl.querySelectorAll('button').forEach(x =>
-        x.classList.toggle('active', x === b));
-      pipeModePaint();
-    };
-  });
+  pipeModeEl.value = PipeRun.mode;
+  pipeModeEl.onchange = () => {
+    PipeRun.mode = pipeModeEl.value;
+    try{ localStorage.setItem(PIPE_MODE_KEY, PipeRun.mode); }catch(e){}
+    pipeModePaint();
+  };
 }
 
 /* ═══════════ PARALLEL LANES ═══════════
@@ -495,29 +477,74 @@ function laneRows(){
   return (CredState.rows || []).map((r, i) => ({r, i}))
     .filter(({r}) => r.keep !== null && r.keep !== undefined && !r.removed);
 }
-function laneChipText(state, s){
-  if (state === 'off') return 'idle';            // row is dimmed anyway
-  if (s.phase === 'uploading') return 'uploading';
-  if (state === 'wait') return s.phase || 'waiting';   // "waiting 12s"
-  if (state === 'failed') return s.phase || 'failed';
-  if (state === 'done') return s.phase || 'importing';
-  const tag = s.model ? credModelTag(s.model)
-                      : (s.phase === 'ocr' ? 'OCR' : 'working');
-  return tag + (s.attempt > 1 ? ' · try ' + s.attempt : '');
+/* the one-by-one rail's five steps, shrunk to one icon per lane — the lane's
+   .hub icon IS the current stage (item 1.3), not a text chip. */
+const LANE_STEPS = [
+  ['scan', 'magnifying-glass'], ['upload', 'cloud-arrow-up'],
+  ['ocr', 'eye'], ['save', 'database'], ['archive', 'box-archive'],
+];
+const LANE_HUB_ICON = LANE_STEPS.map(([_k, icon]) => icon);
+/* map the server's phase/state onto a stage index; -1 = nothing running */
+function laneStepIndex(state, s){
+  if (s.phase === 'imported') return 4;
+  if (state === 'done' || s.phase === 'importing') return 3;
+  if (s.phase === 'uploading' || state === 'start') return 1;
+  if (state === 'route' || state === 'wait' || s.phase === 'ocr') return 2;
+  return -1;
+}
+/* the hub glyph: key when idle/off, else the current stage's icon. A live run
+   that has not picked a file up yet shows the scan glyph (item 1.3). */
+function laneHubIcon(state, s, on){
+  if (!on || state === 'off') return 'key';
+  const i = laneStepIndex(state, s);
+  if (i >= 0) return LANE_HUB_ICON[i];
+  return RAIL.running ? 'magnifying-glass' : 'key';
+}
+/* per-key on/off is remembered per-browser (item 1.2) — non-secret UI state
+   only, keyed by the row's saved index; the key VALUE never leaves .env. */
+const LANE_OFF_KEY = 'konkour.laneOff';
+function laneOffSet(){
+  try { return new Set(JSON.parse(localStorage.getItem(LANE_OFF_KEY) || '[]')); }
+  catch(e){ return new Set(); }
+}
+function laneOffSave(set){
+  try { localStorage.setItem(LANE_OFF_KEY, JSON.stringify([...set])); } catch(e){}
+}
+/* the retry ring's progress: 0 → 1 over the exact slept seconds the runner
+   sent (`until`/`total`), ending when the retry time is up (item 1.4). */
+let LANE_TICK = null;
+function laneTickStart(){
+  if (!LANE_TICK) LANE_TICK = setInterval(laneTick, 250);
+}
+function laneTick(){
+  const box = LANES.list;
+  let waiting = false;
+  if (box) box.querySelectorAll('.lane[data-state="wait"] .hub .ring').forEach(ring => {
+    waiting = true;
+    const lane = ring.closest('.lane');
+    const s = LANES.states[+lane.dataset.key] || {};
+    const total = s.total || 0, until = s.until || 0;
+    const p = (!total || !until) ? 0
+            : Math.max(0, Math.min(1, 1 - (until - Date.now() / 1000) / total));
+    ring.style.setProperty('--p', p.toFixed(3));
+  });
+  if (!waiting){ clearInterval(LANE_TICK); LANE_TICK = null; }
 }
 function lanesRender(){
   const box = LANES.list || (LANES.list = $('laneList'));
   if (!box) return;
+  const off = laneOffSet();
   box.innerHTML = laneRows().map(({r, i}) => {
+    if (r.on === undefined) r.on = !off.has(r.keep);   // seed from localStorage
     const s = LANES.states[r.keep] || {};
     const on = r.on !== false;
     const st = on ? (s.state || 'idle') : 'off';
     const where = s.file ? '#' + (s.index || '?') + ' ' + s.file : '';
     return `<div class="lane" data-key="${r.keep}" data-state="${st}">` +
-      `<div class="hub">${fi('key')}<em class="dot"></em></div>` +
+      `<div class="hub">${fi(laneHubIcon(st, s, on))}` +
+        `<i class="ring" aria-hidden="true"></i></div>` +
       `<label class="lane-name">${credEsc(r.name || ('Key ' + (r.keep + 1)))}` +
         `<em>${credEsc(r.masked)}</em></label>` +
-      `<span class="chip lane-chip">${credEsc(laneChipText(st, s))}</span>` +
       `<em class="lane-file">${credEsc(where)}</em>` +
       `<label class="sw lane-sw" title="${on ? 'ON - this key can take a parallel lane'
                                              : 'OFF - kept in .env, no lane in a parallel run'}">` +
@@ -531,11 +558,15 @@ function lanesRender(){
     box.onchange = () => {
       const r = CredState.rows[+box.dataset.keyon];
       if (!r) return;
-      r.on = box.checked;               // session-only — never written to .env
+      r.on = box.checked;                 // session state (never .env)
+      const set = laneOffSet();
+      box.checked ? set.delete(r.keep) : set.add(r.keep);
+      laneOffSave(set);                   // remembered per-browser (item 1.2)
       lanesRender();
     };
   });
   laneNowPaint();
+  if (Object.values(LANES.states).some(s => s.state === 'wait')) laneTickStart();
 }
 function laneNowPaint(){
   const now = $('laneNow');
@@ -555,7 +586,8 @@ function laneNowPaint(){
 function laneFeed(ev){
   if (ev.key === null || ev.key === undefined) return;
   const s = {state: ev.state};
-  ['index', 'file', 'model', 'attempt', 'reason', 'phase'].forEach(f => {
+  ['index', 'file', 'model', 'attempt', 'reason', 'phase',
+   'until', 'total'].forEach(f => {
     if (ev[f] !== undefined) s[f] = ev[f];
   });
   LANES.states[ev.key] = Object.assign({}, LANES.states[ev.key] || {}, s);
@@ -615,49 +647,49 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
     $('viewCredentials').classList.toggle('active', target === 'credentials');
     if (target === 'usage' && !UsageState.loaded){
       UsageState.loaded = true;
-      usageRefresh();
+      viewLoading('viewUsage', true);
+      usageRefresh().finally(() => viewLoading('viewUsage', false));
     }
     if (target === 'review' && !RState.loaded){
       RState.loaded = true;
-      loadReviewMeta().then(loadReviewRows);
+      viewLoading('viewReview', true);
+      loadReviewMeta().then(loadReviewRows).finally(() => viewLoading('viewReview', false));
     }
     if (target === 'revision' && !RevState.loaded){
       RevState.loaded = true;
-      loadRevisionSummary().then(loadRevisionItems);
+      viewLoading('viewRevision', true);
+      loadRevisionSummary().then(loadRevisionItems).finally(() => viewLoading('viewRevision', false));
     }
     if (target === 'database' && !DbState.loaded){
       DbState.loaded = true;
-      dbInit();
+      viewLoading('viewDatabase', true);
+      dbInit().finally(() => viewLoading('viewDatabase', false));
     }
     if (target === 'credentials' && !CredState.loaded){
       CredState.loaded = true;
-      loadCredentials();
+      viewLoading('viewCredentials', true);
+      loadCredentials().finally(() => viewLoading('viewCredentials', false));
     }
-    if (target === 'pipeline' && !PipeState.loaded) loadPipeProfiles();
+    if (target === 'pipeline' && !PipeState.loaded){
+      viewLoading('viewPipeline', true);
+      loadPipeProfiles().finally(() => viewLoading('viewPipeline', false));
+    }
   };
 });
 
-/* sidebar collapse — icons only; not persisted (PREFERENCE §5) */
-$('sideToggle').onclick = () => {
-  const min = document.body.classList.toggle('side-min');
-  $('sideToggle').querySelector('i').className =
-    'fa ' + (min ? 'fa-angles-right' : 'fa-bars-staggered');
-  $('sideToggle').title = min ? 'Expand the sidebar' : 'Collapse the sidebar';
-};
-
-/* theme toggle — session-only in-memory state; reload resets to dark
-   (PREFERENCE §5: zero browser storage, same rule as the sidebar collapse) */
-(function themeToggle(){
-  const btn = $('themeToggle');
-  if (!btn) return;
-  const apply = dark => {
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    btn.querySelector('i').className = 'fa ' + (dark ? 'fa-moon' : 'fa-sun');
-    btn.title = dark ? 'Switch to light theme' : 'Switch to dark theme';
-  };
-  apply(true);   // dark is the default
-  btn.onclick = () => apply(document.documentElement.dataset.theme === 'light');
-})();
+/* one loading treatment for every data-fetching view (item 13) */
+function viewLoading(viewId, on){
+  const v = document.getElementById(viewId);
+  if (!v) return;
+  let sk = v.querySelector('.load-shell');
+  if (!on){ if (sk) sk.remove(); return; }
+  if (sk) return;
+  sk = document.createElement('div');
+  sk.className = 'load-shell';
+  sk.innerHTML = '<div class="load-wave"><i></i><i></i><i></i></div>' +
+                 '<p class="load-label">Loading…</p>';
+  v.appendChild(sk);
+}
 
 /* ═══════════ QBANK ═══════════ */
 const STATUS_FA = {pending:'در انتظار', approved:'تأیید شده', rejected:'رد شده'};
@@ -1985,11 +2017,13 @@ function revRunBtnState(){
   const b = $('revRunBtn'); if (!b) return;
   b.classList.toggle('running', RevState.running);
   b.classList.toggle('stopping', RevState.running && RevState.stopping);
-  b.innerHTML = RevState.running ? fi('stop') : fi('play');
+  b.innerHTML = RevState.running
+    ? fi('stop') + '<span>Stop</span>'
+    : fi('power-off') + '<span>Run</span>';
   b.title = RevState.running
-    ? (RevState.stopping ? 'در حال توقف — چکب جاری تمام می‌شود…'
-                          : 'توقف اسکن — پس از چکب جاری؛ ردیف‌های هوش‌مصنوعی‌نشده در صف می‌مانند')
-    : 'اجرای اسکن — سه مرحله روی چکب‌های ۵۰تایی';
+    ? (RevState.stopping ? 'Stopping — the current chunk finishes first…'
+                          : 'Stop scan — after the current chunk; unreviewed AI rows stay queued')
+    : 'Start scan — three stages over 50-row chunks';
 }
 function revApplyState(st){
   const was = RevState.running;
@@ -2173,7 +2207,6 @@ function credModelTag(m){
 }
 
 function credRowEl(r, i){
-  if (r.on === undefined) r.on = true;   // session-only per-key enable (Q4=A)
   const wrap = document.createElement('div');
   const state = r.removed ? 'removed' : (r.checking ? 'checking'
     : (r.state || (r.keep === null ? 'new' : 'unknown')));
@@ -2189,7 +2222,7 @@ function credRowEl(r, i){
     const um = (r.usage && r.usage.models) || {};
     const lim = (r.usage && r.usage.limit) || CredState.usageCap;
     const used = um[m] || 0;
-    const frac = Math.max(0, Math.min(1, used / lim));
+    const frac = Math.max(0, Math.min(1, used / 20));   // green→red over the 1–20 range
     const hue = Math.round(130 * (1 - frac));       // green → red as it fills
     let cls = 'untested', why = 'not checked yet';
     if (r.keep === null){ cls = 'pending'; why = 'save this key first'; }
@@ -2210,25 +2243,17 @@ function credRowEl(r, i){
         value="${credEsc(r.value || '')}">`;
   wrap.innerHTML =
     `<div class="cred-key-main">` +
-    `<button class="cred-btn cred-grip" type="button" title="Hold and drag to reorder — the router tries keys top to bottom">⠿</button>` +
-    `<i class="dot" title="${credEsc(state)}"></i>` +
-    (r.keep !== null && (r.latency || r.penalized)
-      ? `<span class="cred-rot${r.penalized ? ' pen' : ''}" ` +
-        `title="${credEsc(r.penalized
-          ? 'soft penalty: this key just failed — healthy keys are served first until it expires'
-          : 'avg ' + Math.round(r.latency) + ' ms — slower keys sort behind in the rotation')}">` +
-        `${r.penalized ? '⧗ penalty' : Math.round(r.latency) + ' ms'}</span>`
-      : '') +
+    `<button class="cred-btn cred-grip" type="button" title="Hold and drag to reorder — the router tries keys top to bottom">${fi('up-down')}</button>` +
     `<input class="cred-in cred-name" type="text" spellcheck="false" autocomplete="off"
        placeholder="${credEsc('Key ' + ((r.keep ?? i) + 1))}" value="${credEsc(r.name || '')}">` +
     `<span class="cred-date" title="${credEsc(r.added ? 'added ' + r.added : 'no saved date yet')}">` +
     `${credEsc(r.added ? r.added.slice(0, 10) : '—')}</span>` +
     keyField +
     (r.keep !== null
-      ? `<button class="cred-btn chk" type="button" title="Re-check this key — one free googleapis listing call, no model used">♥</button>`
+      ? `<button class="cred-btn chk" type="button" title="Re-check this key — one free googleapis listing call, no model used">${fi('flask')}</button>`
       : '') +
     `<div class="cred-models">${bars}</div>` +
-    `<button class="cred-btn rm" type="button" title="Remove on save">${fi('xmark')}</button>` +
+    `<button class="cred-btn rm" type="button" title="Remove on save">${fi('trash')}</button>` +
     `</div>`;
   const nameIn = wrap.querySelector('.cred-name');
   nameIn.oninput = () => r.name = nameIn.value;
@@ -2288,33 +2313,8 @@ function credRender(){
   const box = $('credKeys');
   box.innerHTML = '';
   CredState.rows.forEach((r, i) => box.appendChild(credRowEl(r, i)));
-  const stored = CredState.rows.filter(r => !r.removed && r.keep !== null);
-  const live = stored.filter(r => r.state === 'ok' || r.state === 'alive_unlisted').length;
-  $('credKeyHint').textContent =
-    `${stored.length + CredState.rows.filter(r => r.keep === null && !r.removed).length} key(s) · ${live} verified`;
-  credGatewayBar();
   cred9rRow();
   lanesRender();
-}
-
-function credGatewayBar(){
-  const el = $('credGateway');
-  const g = CredState.gateway;
-  if (!g){ el.hidden = true; el.innerHTML = ''; return; }
-  el.hidden = false;
-  if (g.reachable && !g.google_err){
-    el.className = 'cred-gw ok';
-    el.innerHTML = `🛰 <b>googleapis.com reachable</b> — ${credEsc(g.detail || 'the path to Google is fine')}. ` +
-      `Each key is then checked one by one with a free listing call — a model is never used here.`;
-  } else if (g.google_err){
-    el.className = 'cred-gw warn';
-    el.innerHTML = `🌩 <b>Google is erroring right now</b> — ${credEsc(g.detail || 'HTTP 5xx')}. ` +
-      `Your tunnel works; this is on Google's side. Wait a few minutes and re-check.`;
-  } else {
-    el.className = 'cred-gw bad';
-    el.innerHTML = `🔌 <b>googleapis.com unreachable</b> — ${credEsc(g.detail || '')}. ` +
-      `This is your tunnel / exit-IP / region — <u>not</u> your keys, so none of them were checked or blamed.`;
-  }
 }
 
 /* the 9router credential, inline under its section header (no usage, no ring) */
@@ -2345,7 +2345,7 @@ function credDbConnRow(c, i){
     `<span class="hint">${credEsc(c.password_set ? 'password set' : '— not set —')}</span>` +
     `<label class="sw"><input type="checkbox" ${c.enabled ? 'checked' : ''} data-conn="${i}">` +
     `<span class="tr" aria-hidden="true"></span><em>Enabled</em></label>` +
-    `<button class="cred-btn rm" type="button" data-rm="${i}" title="Remove on save">${fi('xmark')}</button></div>`;
+    `<button class="cred-btn rm" type="button" data-rm="${i}" title="Remove on save">${fi('trash')}</button></div>`;
   const sw = wrap.querySelector('input[data-conn]');
   if (sw) sw.onchange = () => {
     CredState.dbConnections[i].enabled = sw.checked;
@@ -2468,9 +2468,6 @@ async function loadCredentials(){
       state: k.serving ? 'ok' : k.cooling ? 'cooldown'
              : (k.last_fault === 'bad_key' ? 'dead' : 'unknown'),
     }));
-    const hint = $('credModelsHint');
-    if (hint) hint.textContent = CredState.ladder.length
-      ? 'Every key walks the same ladder: ' + CredState.ladder.join(' → ') : '';
     const lad = $('credLadder');
     if (lad) lad.value = CredState.ladder.join(', ');
     $('credSupaUrl').value = d.supabase_url || '';
@@ -2693,7 +2690,7 @@ async function credSave(){
   }
 }
 
-$('credAddKey').onclick = () => {
+$('credAddBtn').onclick = () => {
   CredState.rows.push({ keep:null, name:'', value:'', masked:'', replaced:false,
                         removed:false, state:'new', models:{}, blocked:[],
                         usage:null, checking:false });
@@ -2921,9 +2918,6 @@ $('dbConnAdd').onclick  = () => {
     'Appends a new connection card under Supabase — presentation only, the pipeline keeps its one active connection.');
   CredModal.addConn = true;
 };
-$('credLadderEdit').onclick = () => credOpenModal('pool',
-  'Gemini key pool & model ladder',
-  'One model per line, oldest first · drag a key by its grip to reorder — order IS routing priority.');
 $('credModalClose').onclick = credCloseModal;
 $('credModalSave').onclick  = () => {
   if (CredModal.form === 'postgres' && CredModal.addConn){
@@ -2949,11 +2943,12 @@ document.addEventListener('keydown', e => {
 });
 
 /* ═══════════ PIPELINE · proxy profiles (the only proxy surface) ═══════════
-   Named profiles live in .env (PROXY_PROFILES / PROXY_ACTIVE); this
-   selector switches the active one — "" is the explicit Direct entry (Q4).
-   The GET view carries masked passwords only, so every re-save sends the
-   KEEP sentinel back and the server keeps the stored secret. */
-const PipeState = { loaded:false, profiles:[], active:'' };
+   Named profiles live in a git-ignored local JSON store (.proxy-profiles.json,
+   edited from the Credentials › Proxy pane); this selector switches the active
+   one — "" is the explicit Direct entry (Q4). The GET view carries masked
+   passwords only, so every re-save sends the KEEP sentinel back and the server
+   keeps the stored secret. */
+const PipeState = { loaded:false, profiles:[], active:'', editing:null, results:{} };
 const PKEEP = '__KEEP__';
 const pipeRows = () => PipeState.profiles.map(p => ({
   name: p.name, host: p.host, port: p.port, scheme: p.scheme, user: p.user,
@@ -2978,12 +2973,44 @@ async function loadPipeProfiles(){
     });
     sel.value = PipeState.active;
   }catch(e){ /* first paint before the server is up */ }
+  credRenderProfiles();
+}
+
+/* the Credentials › Proxy pane lists each saved profile as a row with a
+   test (flask), edit (pen) and delete (trash) control at the RIGHT (item 6) */
+function credRenderProfiles(){
+  const list = $('credProxyList');
+  if (!list) return;
+  const profs = (typeof PipeState !== 'undefined' && PipeState.profiles) || [];
+  if (!profs.length){
+    list.innerHTML = '<span class="hint">No profiles saved.</span>';
+    return;
+  }
+  list.innerHTML = profs.map(p => {
+    const res = (PipeState.results || {})[p.name];
+    const cls = res === true ? ' t-ok' : res === false ? ' t-bad' : '';
+    const addr = p.host ? credEsc(p.host) + ':' + credEsc(p.port || '') : 'Direct';
+    return `<div class="cred-key cred-prof${cls}" data-name="${credEsc(p.name)}">` +
+      `<div class="cred-key-main">` +
+        `<span class="cred-prof-name">${credEsc(p.name)}</span>` +
+        `<code class="cred-mask" title="${addr}">${addr}</code>` +
+        `<button class="cred-btn prof-test" type="button" title="Test this proxy — one keyless googleapis probe, no model used">${fi('flask')}</button>` +
+        `<button class="cred-btn prof-edit" type="button" title="Edit this profile">${fi('pen')}</button>` +
+        `<button class="cred-btn prof-rm" type="button" title="Delete this profile">${fi('trash')}</button>` +
+      `</div></div>`;
+  }).join('');
+  list.querySelectorAll('.cred-prof').forEach(row => {
+    const name = row.dataset.name;
+    row.querySelector('.prof-test').onclick = () => profTest(name);
+    row.querySelector('.prof-edit').onclick = () => proxyOpen('edit', name);
+    row.querySelector('.prof-rm').onclick = () => profDelete(name);
+  });
 }
 
 async function pipePost(msg){
   const res = await fetch('/api/profiles', {
     method:'POST', headers:{ 'Content-Type':'application/json' },
-    body: JSON.stringify({ profiles: pipeRows(), active: $('pipeProxySel').value })
+    body: JSON.stringify({ profiles: pipeRows(), active: PipeState.active })
   });
   if (!res.ok){
     const d = await res.json().catch(() => ({}));
@@ -2993,21 +3020,60 @@ async function pipePost(msg){
   PipeState.profiles = d.profiles || [];
   PipeState.active = d.active || '';
   await loadPipeProfiles();
-  toast(msg);
+  if (msg) toast(msg);
 }
 
+/* switch the active profile from the pipeline-tab selector */
 $('pipeProxySel').onchange = async () => {
-  try{ await pipePost('Proxy profile saved to .env'); }
+  PipeState.active = $('pipeProxySel').value;
+  try{ await pipePost('Proxy profile saved'); }
   catch(e){ toast('Proxy save failed — ' + e); loadPipeProfiles(); }
 };
 
-$('pipeProxyNew').onclick = () => {        // pop-up form, required fields first (Q9/criterion 9)
-  $('pxName').value = ''; $('pxHost').value = ''; $('pxPort').value = '';
-  $('pxScheme').value = 'http'; $('pxUser').value = ''; $('pxPass').value = '';
+/* one keyless googleapis probe through this profile — no model, no tokens */
+async function profTest(name){
+  const p = PipeState.profiles.find(x => x.name === name);
+  if (!p) return;
+  toast('Testing proxy “' + name + '”…');
+  try{
+    const res = await fetch('/api/profiles/test', {
+      method:'POST', headers:{ 'Content-Type':'application/json' },
+      body: JSON.stringify({ name, host:p.host, port:p.port, scheme:p.scheme,
+                             user:p.user, password:PKEEP })
+    });
+    const d = await res.json();
+    const ok = res.ok && d.ok;
+    PipeState.results = PipeState.results || {};
+    PipeState.results[name] = ok;
+    credRenderProfiles();
+    toast(ok ? 'Proxy “' + name + '” OK — ' + (d.detail || 'reachable')
+             : 'Proxy “' + name + '” failed — ' + (d.detail || d.error || res.status));
+  }catch(e){
+    PipeState.results[name] = false;
+    credRenderProfiles();
+    toast('Proxy test failed — ' + e);
+  }
+}
+
+/* the profile pop-up doubles as the ADD form (new) and the edit form (edit) */
+function proxyOpen(mode, name){
+  PipeState.editing = mode === 'edit' ? name : null;
+  const p = mode === 'edit'
+    ? (PipeState.profiles.find(x => x.name === name) || {}) : {};
+  $('proxyModalTitle').textContent = mode === 'edit'
+    ? 'Edit proxy profile' : 'New proxy profile';
+  $('pxName').value = p.name || '';
+  $('pxHost').value = p.host || '';
+  $('pxPort').value = p.port || '';
+  $('pxScheme').value = p.scheme || 'http';
+  $('pxUser').value = p.user || '';
+  $('pxPass').value = '';                     // blank keeps the stored secret
+  $('pxName').disabled = mode === 'edit';     // the name is the row key
   $('proxyModalErr').textContent = '';
   $('proxyModal').hidden = false;
   $('pxName').focus();
-};
+}
+$('pipeProxyNew').onclick = () => proxyOpen('new');   // ADD (criterion 9)
 function proxyClose(){ $('proxyModal').hidden = true; }
 $('proxyModalClose').onclick = proxyClose;
 $('proxyModalCancel').onclick = proxyClose;
@@ -3025,37 +3091,46 @@ $('proxyModalSave').onclick = async () => {
     err.textContent = 'Name, host and port are required.';
     return;
   }
-  if (PipeState.profiles.some(p => p.name === name)){
+  const editing = PipeState.editing;
+  if (!editing && PipeState.profiles.some(p => p.name === name)){
     err.textContent = 'A profile with that name already exists.';
     return;
   }
   const scheme = ($('pxScheme').value || 'http').toLowerCase();
-  const row = { name, host, port, scheme,
-                user: $('pxUser').value.trim(), password: $('pxPass').value };
-  PipeState.profiles.push(row);
+  const passIn = $('pxPass').value;
+  const row = { name, host, port, scheme, user: $('pxUser').value.trim(),
+                password: editing ? (passIn || PKEEP) : passIn };
+  const before = PipeState.profiles.slice();
+  if (editing){
+    const i = PipeState.profiles.findIndex(p => p.name === editing);
+    PipeState.profiles[i] = Object.assign({}, PipeState.profiles[i], row);
+  } else {
+    PipeState.profiles.push(row);
+  }
   try{
     await pipePost('Profile “' + name + '” saved');
     proxyClose();
   }catch(e){
-    PipeState.profiles.pop();
+    PipeState.profiles = before;
     err.textContent = 'Could not save the profile — ' + e;
   }
 };
 
-$('pipeProxyDel').onclick = async () => {
-  const name = $('pipeProxySel').value;
-  if (!name){ toast('Select a profile to delete first'); return; }
+async function profDelete(name){
   if (!window.confirm('Delete the proxy profile “' + name + '”?')) return;
-  const kept = PipeState.profiles;
-  PipeState.profiles = kept.filter(p => p.name !== name);
-  if (PipeState.active === name){ PipeState.active = ''; }
+  const before = PipeState.profiles.slice();
+  const beforeActive = PipeState.active;
+  PipeState.profiles = PipeState.profiles.filter(p => p.name !== name);
+  if (PipeState.active === name) PipeState.active = '';
+  if (PipeState.results) delete PipeState.results[name];
   try{
     await pipePost('Profile “' + name + '” deleted');
   }catch(e){
-    PipeState.profiles = kept;
+    PipeState.profiles = before;
+    PipeState.active = beforeActive;
     toast('Delete failed — ' + e);
   }
-};
+}
 
 loadPipeProfiles();   // the pipeline tab is the default view — no lazy slot fires
 
@@ -3097,16 +3172,18 @@ async function loadPipeProviders(){
     // no key to pin a lane to, so disable Parallel and fall back to one-by-one.
     const pm = $('pipeMode');
     if (pm){
-      const par = pm.querySelector('button[data-mode="parallel"]');
       const gemini = !ProvState.active;      // "" == the Gemini pool
-      if (par) par.disabled = !gemini;
+      const parOpt = pm.querySelector('option[value="parallel"]');
+      if (parOpt) parOpt.disabled = !gemini;
+      // Only fall back when parallel is genuinely unavailable (a custom
+      // provider is active) — otherwise the stored mode survives refresh.
       if (!gemini && PipeRun.mode === 'parallel'){
         PipeRun.mode = 'one';
-        pm.querySelectorAll('button').forEach(x =>
-          x.classList.toggle('active', x.dataset.mode === 'one'));
+        pm.value = 'one';
+        try{ localStorage.setItem(PIPE_MODE_KEY, 'one'); }catch(e){}
       }
+      pipeModePaint();   // C3-1: repaint the surface after the (possibly forced) mode
     }
-    paintConn();
   }catch(e){ /* first paint before the server is up */ }
 }
 
@@ -3127,7 +3204,6 @@ $('pipeProvSel').onchange = async () => {
     if (!res.ok) throw new Error(d.error || d.detail || ('HTTP ' + res.status));
     toast('OCR provider saved to .env');
     await loadPipeProviders();           // read the persisted value back
-    pingProvider();                      // re-measure the freshly selected provider
     // keep the Credentials tab honest without disturbing its edits:
     // refresh only if it is already loaded AND has nothing unsaved.
     if (CredState.loaded && !CredState.dirty) await loadCredentials();
@@ -3203,7 +3279,6 @@ function dbRenderStrip(){
       <b>${dbEsc(t.name)}</b>
       <span class="db-card-n">${t.rows.toLocaleString()}</span>
       <label>rows · newest ${dbEsc(dbFmt(t.latest))}</label>
-      ${t.row_actions ? '' : '<em class="db-ro" title="no primary key — read-only grid">read-only</em>'}
     </button>`).join('');
   $('dbStrip').querySelectorAll('.db-card').forEach(b =>
     b.onclick = () => dbSelect(b.dataset.t));
@@ -3275,7 +3350,7 @@ function dbRenderGrid(){
       <button type="button" class="db-ib" data-a="edit"   title="Edit row">${fi('pen')}</button>
       <button type="button" class="db-ib" data-a="dup"    title="Duplicate row">${fi('copy')}</button>
       <button type="button" class="db-ib del" data-a="del" title="Delete this row (saved to graveyard)">${fi('ghost')}</button>`
-      : '<span class="db-ro">—</span>') + '</td></tr>').join('');
+      : '') + '</td></tr>').join('');
   g.innerHTML =
     `<table class="db-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
 
@@ -3364,9 +3439,6 @@ function dbOpenModal(mode, row){
       <em>${dbEsc(c.type)}</em>${c.default ? '<i class="df">def: ' + dbEsc(c.default) + '</i>' : ''}</span>
       ${field}</label>`;
   }).join('');
-  $('dbModalHint').textContent = isWrite
-    ? 'The new row lands in this table immediately — timestamps are set by the database.'
-    : 'Only changed fields are written, one guarded UPDATE per field.';
   $('dbModal').hidden = false;
   const first = body.querySelector('[data-f]');
   if (first) first.focus();
@@ -3453,7 +3525,7 @@ async function sqlRun(){
     const d = await dbJson('/api/db/sql', { sql });
     if (!d.ok){
       out.innerHTML = '<div class="db-sql-msg err">⛔ ' + dbEsc(d.error) + '</div>';
-      DbState.lastSqlResult = null; $('sqlCopyLast').hidden = true;
+      DbState.lastSqlResult = null;
       if (d.affected !== undefined) dbRefreshAll();
       return;
     }
@@ -3464,12 +3536,11 @@ async function sqlRun(){
       (d.truncated ? ' (truncated at 1000)' : '') + '</span>';
     if (d.kind === 'write'){
       out.innerHTML = took;
-      DbState.lastSqlResult = null; $('sqlCopyLast').hidden = true;
+      DbState.lastSqlResult = null;
       dbRefreshAll();
       return;
     }
     DbState.lastSqlResult = d;
-    $('sqlCopyLast').hidden = !(d.columns && d.columns.length);
     out.innerHTML = took + (d.rows.length
       ? '<table class="db-grid sql"><thead><tr>' +
         d.columns.map(c => '<th>' + dbEsc(c) + '</th>').join('') + '</tr></thead><tbody>' +
@@ -3480,20 +3551,15 @@ async function sqlRun(){
     out.innerHTML = '<div class="db-sql-msg err">⛔ ' + dbEsc(e.message) + '</div>';
   } finally {
     btn.disabled = false; btn.classList.remove('stopping');
-    btn.innerHTML = fi('play');
+    btn.innerHTML = fi('power-off');
   }
 }
 
 /* ── backups panel ── */
 async function dbBkLoad(){
   const list = $('dbBackupList');
-  $('dbBkStatus').textContent = 'reading backup state…';
   try {
     const d = await dbApi('/api/db/backups');
-    $('dbBkStatus').innerHTML =
-      'Every <b>' + d.interval_days + ' days</b>, all five tables are dumped to ' +
-      '<code class="mono">backups/&lt;stamp&gt;/</code> as JSON + replayable SQL · ' +
-      'keeping the newest <b>' + d.keep + '</b> sets · next in <b>' + dbEsc(String(d.next_due)) + '</b>';
     if (!d.backups.length){
       list.innerHTML = '<div class="db-empty">No snapshots yet — press “Back up now”.</div>';
       return;
@@ -3539,8 +3605,71 @@ function dbShowPanel(name){
   $('dbPanelGrid').hidden = name !== 'grid';
   $('dbPanelSql').hidden = name !== 'sql';
   $('dbPanelBackups').hidden = name !== 'backups';
+  $('dbPanelBucket').hidden = name !== 'bucket';
   if (name === 'backups') dbBkLoad();
+  if (name === 'bucket') dbBucketLoad();
 }
+
+/* ── bucket panel · read-only browser (item 3.4) ── */
+async function dbBucketLoad(){
+  const list = $('dbBucketList');
+  if (!list) return;
+  list.innerHTML = '<div class="db-empty">Loading…</div>';
+  try{
+    const d = await dbApi('/api/db/bucket?limit=200');
+    if (!d.ok) throw new Error(d.error || 'bucket listing failed');
+    if ($('dbBucketName')) $('dbBucketName').textContent =
+      d.bucket ? 'bucket · ' + d.bucket : '';
+    const objs = d.objects || [];
+    if (!objs.length){ list.innerHTML = '<div class="db-empty">No objects in the bucket.</div>'; return; }
+    list.innerHTML = objs.map(o => {
+      const name = o.name || o.id || '';
+      return `<button class="db-bucket-row" type="button" data-name="${dbEsc(name)}" title="${dbEsc(name)}">` +
+        `<i class="fa fa-image" aria-hidden="true"></i>` +
+        `<span class="mono">${dbEsc(name)}</span></button>`;
+    }).join('');
+    list.querySelectorAll('.db-bucket-row').forEach(b => {
+      b.onclick = () => dbBucketOpen(b.dataset.name);
+    });
+  }catch(e){
+    list.innerHTML = '<div class="db-empty db-err">' + dbEsc(e.message || e) + '</div>';
+  }
+}
+function dbBucketOpen(name){
+  if (!name) return;
+  const drawer = $('bucketDrawer');
+  if (!drawer) return;
+  $('bucketDrawerName').textContent = name;
+  $('bucketDrawerImg').src = '/api/proxy/image/' + encodeURIComponent(name);
+  const src = $('bucketDrawerSrc');
+  const links = $('bucketDrawerLinks');
+  src.hidden = true; src.textContent = '';
+  links.innerHTML = '<div class="db-empty">Loading…</div>';
+  drawer.hidden = false;
+  dbApi('/api/db/source?source_id=' + encodeURIComponent(name)).then(d => {
+    const s = d.source;
+    if (s && s.storage_url){
+      src.href = s.storage_url; src.textContent = s.storage_url; src.hidden = false;
+    } else {
+      src.href = '#'; src.textContent = 'no source row in the database';
+      src.hidden = false;
+    }
+    const recs = (d.questions || []).map(q =>
+        { return { tag:'question', cls:'q', num:q.question_number, text:q.question_text }; })
+      .concat((d.answers || []).map(a =>
+        { return { tag:'answer', cls:'a', num:a.question_number, text:a.answer_explanation }; }));
+    links.innerHTML = recs.length
+      ? recs.map(r =>
+          `<div class="bucket-link ${r.cls}">` +
+            `<span class="tag">${r.tag}</span>` +
+            `<span class="txt">#${dbEsc(r.num ?? '—')} · ${dbEsc(String(r.text || '').slice(0, 240))}</span>` +
+          `</div>`).join('')
+      : '<div class="db-empty">No questions or answers linked to this source.</div>';
+  }).catch(e => {
+    links.innerHTML = '<div class="db-empty db-err">' + dbEsc(e.message || e) + '</div>';
+  });
+}
+$('bucketDrawerClose').onclick = () => { $('bucketDrawer').hidden = true; };
 
 function dbWireOnce(){
   if (DbState.wireOnce) return;
@@ -3584,12 +3713,9 @@ function dbWireOnce(){
     snip.value = '';
     $('sqlInput').focus();
   };
-  $('sqlCopyLast').onclick = () => {
-    const r = DbState.lastSqlResult;
-    if (r && r.columns.length) dbToCsv(r.columns, r.rows);
-  };
 
   $('dbBackupNow').onclick = dbBackupNow;
+  $('dbBucketReload').onclick = dbBucketLoad;
 
   $('dbModalClose').onclick = dbCloseModal;
   $('dbModalSave').onclick = dbSaveModal;
@@ -3610,7 +3736,7 @@ const PERIODS = ['24h', '7d', '30d', 'all'];
 const PERIOD_LABEL = { '24h':'24 hours', '7d':'7 days', '30d':'30 days', 'all':'all time' };
 
 /* ── 1 · credentials rail: one press, one panel (Q3) ───────────── */
-const CRED_SERVICES = ['ocr', 'revision', 'database'];
+const CRED_SERVICES = ['ocr', 'revision', 'database', 'proxy'];
 
 function credShow(service){
   CRED_SERVICES.forEach(s => {
@@ -3655,7 +3781,7 @@ function credUsageLive(ev){
 }
 
 /* ── 3 · usage tab: a plot + per-call table (criterion 6) ── */
-const UsageState = { period: 'all', group: 'model', ymode: 'calls',
+const UsageState = { period: '24h', group: 'model', ymode: 'calls',
                      data: null, busy: false, loaded: false };
 
 async function usageRefresh(){
@@ -3673,31 +3799,16 @@ async function usageRefresh(){
 
 function usageRender(data){
   const d = data || UsageState.data;
-  const chips = $('usagePeriods');
-  if (chips) chips.innerHTML = PERIODS.map(p =>
-    `<button class="ps-chip${p === UsageState.period ? ' active' : ''}" type="button"` +
-    ` data-uperiod="${p}">${p === 'all' ? 'All time' : p}</button>`).join('');
-  const totals = $('usageTotals');
   const table = $('usageTable');
   const plot = $('usagePlot');
   if (!d || !d.ok){
-    if (totals) totals.innerHTML = '<span class="hint">Usage history unavailable.</span>';
     if (plot) plot.innerHTML = '';
     if (table) table.innerHTML = '';
     usageWire();
     return;
   }
-  const t = d.totals || {};
   const rows = (d.calls || []).slice(-40).reverse();
   const fmtSecs = ms => ((Number(ms) || 0) / 1000).toLocaleString(undefined, {maximumFractionDigits: 2});
-  if (totals) totals.innerHTML =
-    `<span><b>${t.calls || 0}</b> calls</span>` +
-    `<span><b>${t.errors || 0}</b> errors</span>` +
-    `<span><b>${(t.tokens_in || 0).toLocaleString()}</b> in</span>` +
-    `<span><b>${(t.tokens_out || 0).toLocaleString()}</b> out</span>` +
-    `<span><b>${fmtSecs(t.ms)}</b> s delay</span>` +
-    `<span class="hint">avg ${fmtSecs(t.calls ? (t.ms / t.calls) : 0)} s/call</span>` +
-    `<span class="hint">${PERIOD_LABEL[UsageState.period] || 'all time'}</span>`;
   usagePlot(d.chart);
   const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
       <td>${credEsc((r.ts_utc || '').slice(0, 19).replace('T', ' '))}</td>
@@ -3713,7 +3824,25 @@ function usageRender(data){
   usageWire();
 }
 
-/* grouped bars: one bar-group per day, one colour per series (no chart lib) */
+/* grouped bars: one bar-group per day, one colour per series (no chart lib).
+   Bars keep their rect identity so the CSS transition on the SVG geometry
+   properties (y/height) animates them on filter change (item 11). */
+let usageLast = {max: 0, cells: null};          // module-level, beside usagePlot
+/* round a data max up to a readable axis level (59 → 100, 470922 → 500000) so
+   the Y gridlines read as round numbers, not the exact data value (item 4.5). */
+function niceMax(v){
+  if (!(v > 0)) return 1;
+  const pow = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * pow >= v) return m * pow;
+  return 10 * pow;
+}
+/* compact an axis label so a big token count fits the gutter (rework item 6):
+   470922 → "471k", 1.2e6 → "1.2M" — the hover tooltip keeps the exact value. */
+function fmtAxis(v){
+  if (v >= 1e6) return (v / 1e6).toFixed(v % 1e6 ? 1 : 0) + 'M';
+  if (v >= 1e3) return Math.round(v / 1e3) + 'k';
+  return String(Math.round(v));
+}
 function usagePlot(chart){
   const box = $('usagePlot');
   if (!box) return;
@@ -3722,61 +3851,105 @@ function usagePlot(chart){
   const cells = (chart && chart.cells) || [];
   if (!days.length || !series.length){
     box.innerHTML = '<p class="hint">No calls in this period.</p>';
+    usageLast = {max: 0, cells: null};
     return;
   }
-  const W = 760, H = 220, PAD = 34, GAP = 10;
-  const plotW = W - PAD * 2, plotH = H - PAD * 2;
+  const W = 760, H = 220, PAD = 40, PADL = 64, GAP = 10;   // PADL: room for 470,922
+  const plotW = W - PAD - PADL, plotH = H - PAD * 2;
   let max = 0;
   cells.forEach(row => row.forEach(v => { if (v > max) max = v; }));
-  max = max || 1;
+  const axisMax = niceMax(max);                     // round Y levels (item 4.5)
+  const ticks = 4;                                  // adaptive Y: 0 … axisMax
+  let grid = '';
+  for (let t = 0; t <= ticks; t++){
+    const y = H - PAD - (plotH * t / ticks);
+    grid += `<line class="usage-grid" x1="${PADL}" y1="${y.toFixed(1)}"` +
+            ` x2="${W - PAD}" y2="${y.toFixed(1)}"/>` +
+            `<text class="usage-tick" x="${PADL - 8}" y="${(y + 4).toFixed(1)}"` +
+            ` text-anchor="end">${fmtAxis(axisMax * t / ticks)}</text>`;
+  }
   const groupW = plotW / days.length;
   const barW = Math.max(3, (groupW - GAP - 2) / series.length);
   const labelEvery = Math.max(1, Math.ceil(days.length / 7));
   let bars = '', labels = '';
   days.forEach((day, di) => {
-    const x0 = PAD + di * groupW + (groupW - barW * series.length) / 2;
+    const x0 = PADL + di * groupW + (groupW - barW * series.length) / 2;
     series.forEach((s, si) => {
       const v = cells[di][si] || 0;
-      const h = (v / max) * plotH;
-      if (h > 0){
-        bars += `<rect class="s${si % 6}" x="${(x0 + si * barW).toFixed(1)}" ` +
-                `y="${(H - PAD - h).toFixed(1)}" width="${(barW - 2).toFixed(1)}" ` +
-                `height="${h.toFixed(1)}" rx="2"><title>${credEsc(day)} · ` +
-                `${credEsc(s)}: ${v.toLocaleString()}</title></rect>`;
-      }
+      const h = (v / axisMax) * plotH;
+      const prev = usageLast.cells && usageLast.cells[di]
+        ? (usageLast.cells[di][si] || 0) / (usageLast.max || 1) * plotH : h;
+      bars += `<rect class="s${si % 6}" x="${(x0 + si * barW).toFixed(1)}" ` +
+              `y="${(H - PAD - prev).toFixed(1)}" height="${prev.toFixed(1)}" ` +
+              `width="${(barW - 2).toFixed(1)}" rx="2" ` +
+              `data-day="${credEsc(day)}" data-series="${credEsc(s)}" ` +
+              `data-value="${v}"></rect>`;
     });
     if (di % labelEvery === 0){
-      labels += `<text class="usage-max" x="${(PAD + di * groupW + groupW / 2).toFixed(1)}" ` +
-                `y="${H - PAD + 16}" text-anchor="middle">${day.slice(5)}</text>`;
+      labels += `<text class="usage-tick" x="${(PADL + di * groupW + groupW / 2).toFixed(1)}"` +
+                ` y="${H - PAD + 16}" text-anchor="middle">${day.slice(5)}</text>`;
     }
   });
+  const unit = chart.y === 'tokens' ? 'tokens'
+             : (chart.y === 'sec' || chart.y === 'avg_sec') ? 's' : 'calls';
   const legend = series.map((s, i) =>
     `<span class="usage-legend-item"><i class="usage-swatch s${i % 6}"></i>` +
     `${credEsc(s)}</span>`).join('');
   box.innerHTML =
     `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="usage per day">` +
-    `<line class="usage-axis" x1="${PAD}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}"/>` +
-    `<text class="usage-max" x="${PAD}" y="${PAD - 8}">max ${max.toLocaleString()} ` +
-    `${chart.y === 'tokens' ? 'tokens'
-        : (chart.y === 'ms' || chart.y === 'avg_ms') ? 'ms' : 'calls'}/day</text>` +
+    grid +
+    `<line class="usage-axis" x1="${PADL}" y1="${H - PAD}" x2="${W - PAD}" y2="${H - PAD}"/>` +
+    `<text class="usage-tick" x="${PADL}" y="${PAD - 12}">${unit}/day</text>` +
     bars + labels + `</svg>` +
-    `<div class="usage-legend">${legend}</div>`;
+    `<div class="usage-legend">${legend}</div>` +
+    `<div class="usage-tip" id="usageTip" hidden></div>`;
+  /* next frame: animate every bar from the previous height to the new one */
+  requestAnimationFrame(() => {
+    box.querySelectorAll('rect[data-day]').forEach(r => {
+      const v = +r.dataset.value;
+      const h = (v / axisMax) * plotH;
+      r.setAttribute('height', h.toFixed(1));
+      r.setAttribute('y', (H - PAD - h).toFixed(1));
+    });
+  });
+  usageLast = {max: axisMax, cells: cells};
+  usageHover(box, unit);
+}
+/* hover values — a delegated listener, so it survives the box.innerHTML rewrite */
+function usageHover(box, unit){
+  const tip = box.querySelector('#usageTip');
+  if (!tip) return;
+  box.onmouseover = e => {
+    const r = e.target.closest('rect[data-day]');
+    if (!r) return;
+    tip.hidden = false;
+    tip.textContent = r.dataset.day + ' · ' + r.dataset.series + ' · ' +
+      (+r.dataset.value).toLocaleString() + ' ' + unit;
+    const b = r.getBoundingClientRect(), p = box.getBoundingClientRect();
+    tip.style.left = (b.left - p.left + b.width / 2) + 'px';
+    tip.style.top = (b.top - p.top) + 'px';
+    tip.classList.add('on');
+  };
+  box.onmouseout = e => {
+    if (e.target.closest('rect[data-day]')){ tip.classList.remove('on'); tip.hidden = true; }
+  };
 }
 function usageWire(){
-  const chips = $('usagePeriods');
-  if (chips) chips.querySelectorAll('button[data-uperiod]').forEach(b => {
-    b.onclick = () => { UsageState.period = b.dataset.uperiod; usageRefresh(); };
-  });
+  const per = $('usagePeriod');
+  if (per){
+    per.value = UsageState.period;
+    per.onchange = () => { UsageState.period = per.value; usageRefresh(); };
+  }
   const group = $('usageGroup');
   if (group){
     group.value = UsageState.group;
     group.onchange = () => { UsageState.group = group.value; usageRefresh(); };
   }
   const ym = $('usageYMode');
-  if (ym) ym.querySelectorAll('button[data-ymode]').forEach(b => {
-    b.classList.toggle('active', b.dataset.ymode === UsageState.ymode);
-    b.onclick = () => { UsageState.ymode = b.dataset.ymode; usageRefresh(); };
-  });
+  if (ym){
+    ym.value = UsageState.ymode;
+    ym.onchange = () => { UsageState.ymode = ym.value; usageRefresh(); };
+  }
 }
 
 /* the 9router panel's own summary line */
@@ -3842,13 +4015,11 @@ const upDds = {};
 function upRender(){
   const list = $('upList');
   if (!list) return;
-  const items = UpState.items;
+  // a finished file leaves the queue (item 2.3); failed/cancelled stay actionable
+  const items = UpState.items.filter(it => (it.status || 'queued') !== 'done');
   const empty = $('upEmpty');
   if (empty) empty.hidden = items.length > 0;   // picker is an empty-state
   list.hidden = !items.length;
-  $('upQueueHint').textContent = items.length
-    ? items.length + ' in the queue — extracted one at a time'
-    : '';
   if (!items.length){
     list.innerHTML = '';
     return;
@@ -3907,25 +4078,14 @@ async function upQueue(){
 
 /* choosing a file enqueues it straight away — selection is the add action */
 $('upFiles').onchange = () => { if ($('upFiles').files.length) upQueue(); };
-$('upAdd').onclick = upQueue;
+/* ADD opens the picker (item 2.2) — the enqueue happens on selection */
+$('upAdd').onclick = () => $('upFiles').click();
 
-/* ── 5 · period stats — file cards mirror the run, Q/A cards the DB ── */
+/* ── 5 · period stats — all five cards are DB-sourced (item 2.1) ── */
 const StatsState = { period: '24h' };
 
-function fileRunLabel(){
-  if (RAIL.running) return 'this run';
-  return (RAIL.total || RAIL.processed || RAIL.errors) ? 'last run' : 'no run yet';
-}
-
 function statsPaint(){
-  const set = (id, v) => { const el = $(id); if (el) el.textContent = v; };
-  const live = fileRunLabel() !== 'no run yet';
-  set('psSucceeded', live ? RAIL.processed.toLocaleString() : '—');
-  set('psErrors',    live ? RAIL.errors.toLocaleString()    : '—');
-  set('psTotal',     live ? RAIL.total.toLocaleString()     : '—');
-  set('psCaption', 'files: ' + fileRunLabel() +
-                   ' · questions & answers: last ' +
-                   (PERIOD_LABEL[StatsState.period] || 'all time'));
+  // no caption any more (rework item 14) — the chips + cards carry the state
 }
 
 async function statsLoad(period){
@@ -3937,13 +4097,15 @@ async function statsLoad(period){
   try{
     const d = await (await fetch('/api/stats?period=' + encodeURIComponent(StatsState.period))).json();
     if (!d.ok) throw new Error(d.error || 'request failed');
+    set('psTotal',     (d.total || 0).toLocaleString());
+    set('psQFiles',    (d.question_files || 0).toLocaleString());
+    set('psAFiles',    (d.answer_files || 0).toLocaleString());
     set('psQuestions', (d.questions || 0).toLocaleString());
-    set('psAnswers', (d.answers || 0).toLocaleString());
-    statsPaint();                       // file cards never touch /api/stats
+    set('psAnswers',   (d.answers || 0).toLocaleString());
+    statsPaint();                       // the caption only
   }catch(e){
     const el = $('psError');
     if (el){ el.hidden = false; el.textContent = String(e.message || e); }
-    set('psCaption', 'counts unavailable');
   }
 }
 document.querySelectorAll('.ps-chip[data-period]').forEach(c => {
@@ -3956,6 +4118,8 @@ function bootNewSurfaces(){
   upLoad();
   statsLoad('24h');
   if (CredState.loaded) credRouterSummary();
+  pipeModePaint();   // C3-1: the restored PipeRun.mode drives BOTH the select and
+                     // the #stages/#lanes surface, not just the select on refresh.
 }
 bootNewSurfaces();
 

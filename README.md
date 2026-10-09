@@ -57,7 +57,7 @@ Main groups:
 | Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD/SSLMODE`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set; blank `SSLMODE` keeps the driver default |
 | Gemini | `GEMINI_API_KEY`, `GEMINI_API_KEY_QUESTIONS/ANSWERS`, `GEMINI_MODEL_QUESTIONS/ANSWERS` | per-lane keys and models |
 | Router | `ROUTER_BASE_URL/API_KEY/MODEL` | optional OpenAI-compatible front for Gemini |
-| Providers / proxy | `EXTRACTION_PROVIDERS`, `EXTRACTION_ACTIVE`, `REVISION_PROVIDERS`, `REVISION_ACTIVE`, `PROXY_PROFILES`, `PROXY_ACTIVE` | written by the dashboard; legacy `ROUTER_*` / `OCR_*` / `GEMINI_API_KEY*` are still read when absent |
+| Providers / proxy | `EXTRACTION_PROVIDERS`, `EXTRACTION_ACTIVE`, `REVISION_PROVIDERS`, `REVISION_ACTIVE` | written by the dashboard; legacy `ROUTER_*` / `OCR_*` / `GEMINI_API_KEY*` are still read when absent. Named proxy profiles live in a git-ignored local `.proxy-profiles.json` store beside `.env`, not here |
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |

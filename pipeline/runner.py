@@ -386,7 +386,7 @@ def _lane_event(hub, cfg, bundle, state, **extra):
     hub.emit(ev)
 
 
-def _produce_round(cfg, db, assignments, hub=None):
+def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
     """Phase A+B of one parallel round.
 
     Phase A (this thread, file order): read each file's bytes and build its
@@ -397,8 +397,14 @@ def _produce_round(cfg, db, assignments, hub=None):
     the lane's PINNED key. No DB write happens here.
 
     `hub` (parallel runs) receives `lane` events WHILE the pool works — the
-    dashboard's parallel readout draws from these, not from the import phase
-    that runs after the OCR wait. None keeps the unit-test/serial paths quiet.
+    dashboard's parallel readout draws from these. None keeps the
+    unit-test/serial paths quiet.
+
+    `on_bundle`, when given, is called for each bundle the instant its lane
+    finishes (completion order), on THIS thread — so the caller can import it
+    without waiting for the round's slowest lane, while every DB write still
+    happens on the one run thread. None (serial / unit tests) keeps the old
+    "return everything, import after" shape.
 
     Returns {index0: bundle}; a bundle carries the produced values, or the
     exception to replay in the import phase. The pool's workers never raise,
@@ -428,9 +434,12 @@ def _produce_round(cfg, db, assignments, hub=None):
 
     def produce(bundle):
         def lane_problem(flt, attempt, tries, wait, where=""):
-            # Backoff → the lane says what it is waiting on. `where` defaults so
-            # the 4-arg callers (gemini.py / storage.py / vision.py) work too.
-            lane("wait", bundle, phase=f"waiting {int(wait)}s")
+            # Backoff → the lane says what it is waiting on, and carries the
+            # deadline so the dashboard draws an exact countdown ring. `where`
+            # defaults so the 4-arg callers (gemini.py / storage.py / vision.py)
+            # work too.
+            lane("wait", bundle, phase=f"waiting {int(wait)}s",
+                 until=time.time() + wait, total=wait)
 
         lane("start", bundle, phase="uploading")  # the lane picked this file up
         if bundle.get("error"):
@@ -459,7 +468,9 @@ def _produce_round(cfg, db, assignments, hub=None):
     with ThreadPoolExecutor(max_workers=max(1, len(prepared))) as pool:
         futures = [pool.submit(produce, b) for b in prepared]
         for fut in as_completed(futures):
-            fut.result()          # produce() never raises — it stores errors
+            bundle = fut.result()     # produce() never raises — it stores errors
+            if on_bundle is not None:
+                on_bundle(bundle)     # completion order, on the caller's thread
     return {b["index0"]: b for b in prepared}
 
 
@@ -467,11 +478,12 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
     """Round-based parallel run.
 
     Q1=A: N lanes, each PINNED to one healthy key (one file per lane per
-    round, a round barrier before the next round). Q2=B: a round's results
-    are imported in ORIGINAL FILE ORDER, on this thread — the DB connection
-    is single, so nothing writes it from a lane. Q3=B: a file whose lane has
-    no usable model left stays for the next run (its lane is dropped for the
-    rest of the run)."""
+    round, a round barrier before the next round). Q2=A: each lane's file is
+    imported the instant its OCR returns — COMPLETION order — on this thread,
+    so the DB connection stays single (nothing writes it from a lane) while a
+    fast key never waits on a slow one. Q3=B: a file whose lane has no usable
+    model left stays for the next run (its lane is dropped for the rest of
+    the run)."""
     plan = router._plan(cfg, time.time())
     lanes = parallel.lane_keys(cfg, options.get("enabled_keys"), plan=plan)
     if not lanes:
@@ -480,7 +492,8 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
         _run_serial(hub, cfg, db, items, log)
         return
     log("info", f"Parallel mode: {len(lanes)} lane(s) — one file per key per "
-                f"round over {len(items)} file(s); results import in file order.")
+                f"round over {len(items)} file(s); each file imports the moment "
+                "its lane finishes.")
 
     limit = deferrals.max_consecutive_failures()
     stopped = False
@@ -501,12 +514,17 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
             assignments = [(base + idx, item, key) for idx, item, key in chunk]
             hub.emit({"type": "round", "no": round_no,
                       "lanes": len(lanes), "files": len(assignments)})
-            bundles = _produce_round(cfg, db, assignments, hub=hub)
-
             exhausted = set()
             imported = 0
-            for _index0, bundle in parallel.import_order(
-                    [(b["index0"], b) for b in bundles.values()]):
+
+            def import_bundle(bundle):
+                """Import ONE finished lane's bundle on THIS (run) thread — the
+                instant the lane's OCR returns, not after the round's slowest
+                lane. The DB connection stays single because this runs on the
+                run thread (never from a pool worker)."""
+                nonlocal imported, stopped
+                if stopped:
+                    return                      # breaker tripped — drop the rest
                 index = bundle["index0"] + 1
                 pre = {"storage_url": bundle.get("storage_url"),
                        "parsed": bundle.get("parsed"),
@@ -532,7 +550,9 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
                     if hub.db_fail_streak >= limit:
                         _major_db_halt(hub, log, limit)
                         stopped = True
-                        break
+
+            _produce_round(cfg, db, assignments, hub=hub,
+                           on_bundle=import_bundle)
 
             remaining = remaining[imported:]
             base += imported

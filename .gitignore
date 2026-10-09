@@ -27,6 +27,11 @@ tools/_srv.log
 # Local secrets (start.bat recreates .env from the tracked .env.example)
 .env
 
+# Named proxy profiles (hosts + proxy passwords) — a local savable store
+# beside .env, deliberately NOT an .env key and never committed
+.proxy-profiles.json
+.proxy-profiles.json.tmp
+
 # Python
 __pycache__/
 *.pyc

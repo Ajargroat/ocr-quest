@@ -295,6 +295,21 @@ class LaneEventTests(unittest.TestCase):
         self.assertEqual(len(waits), 1)
         self.assertEqual(waits[0]["phase"], "waiting 12s")
 
+    def test_wait_lane_carries_the_deadline(self):
+        """C4 (item 1.4): the wait lane event carries `until`/`total` so the
+        dashboard can draw an exact countdown ring."""
+        def fake_ocr(cfg, prompt, data_b64, mime_type, on_problem=None,
+                     on_route=None, key_pin=None):
+            if on_problem:
+                on_problem("gemini-3.5-flash", 2, 3, 12)
+            return {"q": 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            events, _bundles = self._run(fake_ocr, tmp)
+        wait = [e for e in events if e["state"] == "wait"][0]
+        self.assertEqual(wait["total"], 12)
+        self.assertGreater(wait["until"], time.time())
+
 
 class HubLaneTests(unittest.TestCase):
     """The hub seeds the last lane state per key into `snapshot()` so a
@@ -330,9 +345,13 @@ class RoundBoundaryTests(unittest.TestCase):
         cfg = SimpleNamespace(gemini_key_pool=("k1", "k2"), ocr_provider="gemini")
         items = [SimpleNamespace(type="سوال") for _ in range(5)]   # 5 files, 2 lanes
 
-        def fake_produce(cfg, db, assignments, hub=None):
-            return {i: {"index0": i, "item": item, "key": k}
-                    for i, item, k in assignments}
+        def fake_produce(cfg, db, assignments, hub=None, on_bundle=None):
+            bundles = {i: {"index0": i, "item": item, "key": k}
+                       for i, item, k in assignments}
+            if on_bundle is not None:
+                for b in bundles.values():
+                    on_bundle(b)
+            return bundles
 
         with mock.patch.object(runner.router, "_plan",
                                lambda *a, **k: [(0, "k1", ["m"], 0.0, 0.0),
@@ -366,9 +385,13 @@ class ImportTerminalLaneTests(unittest.TestCase):
         cfg = SimpleNamespace(gemini_key_pool=("k1", "k2"), ocr_provider="gemini")
         items = [SimpleNamespace(type="سوال") for _ in range(5)]
 
-        def fake_produce(cfg, db, assignments, hub=None):
-            return {i: {"index0": i, "item": item, "key": k}
-                    for i, item, k in assignments}
+        def fake_produce(cfg, db, assignments, hub=None, on_bundle=None):
+            bundles = {i: {"index0": i, "item": item, "key": k}
+                       for i, item, k in assignments}
+            if on_bundle is not None:
+                for b in bundles.values():
+                    on_bundle(b)
+            return bundles
 
         with mock.patch.object(runner.router, "_plan",
                                lambda *a, **k: [(0, "k1", ["m"], 0.0, 0.0),
@@ -397,6 +420,43 @@ class ImportTerminalLaneTests(unittest.TestCase):
         self.assertTrue(lanes)
         self.assertTrue(all(e["state"] == "failed" for e in lanes))
         self.assertTrue(all(e["phase"] == "not imported" for e in lanes))
+
+
+class PerLaneImportTests(unittest.TestCase):
+    """C1 (item 1.1): each lane's file is imported the instant ITS OCR
+    returns — a fast lane never waits for the round's slowest lane."""
+
+    def test_fast_lane_imports_before_slow_lane(self):
+        hub = runner.Hub()
+        trace = []
+        cfg = SimpleNamespace(gemini_key_pool=("k1", "k2"), ocr_provider="gemini")
+        items = [SimpleNamespace(type="سوال") for _ in range(2)]
+
+        def fake_produce(cfg, db, assignments, hub=None, on_bundle=None):
+            bundles = {i: {"index0": i, "item": item, "key": k}
+                       for i, item, k in assignments}
+            for i in sorted(bundles):          # completion order: lane 0 first
+                if on_bundle is not None:
+                    on_bundle(bundles[i])
+            trace.append("produce_returned")   # only AFTER both lanes imported
+            return bundles
+
+        def fake_process(hub, cfg, db, item, index, total, pre=None):
+            trace.append("import_%d" % index)
+            return "clean"
+
+        with mock.patch.object(runner.router, "_plan",
+                               lambda *a, **k: [(0, "k1", ["m"], 0.0, 0.0),
+                                                (1, "k2", ["m"], 0.0, 0.0)]), \
+             mock.patch.object(runner, "_produce_round", side_effect=fake_produce), \
+             mock.patch.object(runner, "_process_item", side_effect=fake_process), \
+             mock.patch.object(runner, "_flush_parked", lambda *a, **k: None), \
+             mock.patch.object(runner.deferrals, "max_consecutive_failures",
+                               lambda: 3):
+            runner._run_parallel(hub, cfg, None, items,
+                                 {"enabled_keys": None}, lambda *a, **k: None)
+        # both files import INSIDE the round (completion order), not after it
+        self.assertEqual(trace, ["import_1", "import_2", "produce_returned"])
 
 
 if __name__ == "__main__":

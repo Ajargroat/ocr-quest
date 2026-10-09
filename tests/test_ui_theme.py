@@ -11,16 +11,15 @@ def _read(name):
 
 
 class ThemeSwitchTests(unittest.TestCase):
-    def test_no_browser_storage_is_used(self):
-        """Theme state is in-memory only - reload must reset to dark."""
-        for name in ("app.js", "index.html", "styles.css"):
+    def test_theme_toggle_is_removed(self):
+        """Rework item 11: the theme toggle (and its whole sidebar footer) is
+        gone — no markup, no renderer, no per-browser theme state."""
+        for name in ("index.html", "styles.css"):
             src = _read(name)
             self.assertNotIn("localStorage", src, name)
             self.assertNotIn("sessionStorage", src, name)
-
-    def test_switch_is_mounted_and_wired(self):
-        self.assertIn('id="themeToggle"', _read("index.html"))
-        self.assertIn("themeToggle", _read("app.js"))
+        self.assertNotIn('id="themeToggle"', _read("index.html"))
+        self.assertNotIn("themeToggle", _read("app.js"))
 
     def test_light_theme_overrides_the_palette(self):
         css = _read("styles.css")
