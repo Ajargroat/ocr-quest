@@ -2215,7 +2215,7 @@ function credRowEl(r, i){
     wrap.innerHTML = `<i class="dot"></i>` +
       `<span class="cred-rmv">${credEsc(r.masked)} · removed on save</span>` +
       `<button class="cred-btn undo" type="button" title="Undo removal — keep this key">${fi('undo')}</button>`;
-    wrap.querySelector('.undo').onclick = () => { r.removed = false; credRender(); };
+    wrap.querySelector('.undo').onclick = () => { r.removed = false; credMarkDirty(); credRender(); };
     return wrap;
   }
   const bars = CredState.ladder.map(m => {
@@ -2256,16 +2256,17 @@ function credRowEl(r, i){
     `<button class="cred-btn rm" type="button" title="Remove on save">${fi('trash')}</button>` +
     `</div>`;
   const nameIn = wrap.querySelector('.cred-name');
-  nameIn.oninput = () => r.name = nameIn.value;
+  nameIn.oninput = () => { r.name = nameIn.value; credMarkDirty(); };
   const keyIn = wrap.querySelector('.cred-keyin');
-  if (keyIn) keyIn.oninput = () => r.value = keyIn.value.trim();
+  if (keyIn) keyIn.oninput = () => { r.value = keyIn.value.trim(); credMarkDirty(); };
   const rep = wrap.querySelector('.rep');
-  if (rep) rep.onclick = () => { r.replaced = true; credRender(); };
+  if (rep) rep.onclick = () => { r.replaced = true; credMarkDirty(); credRender(); };
   const chk = wrap.querySelector('.chk');
   if (chk) chk.onclick = () => credCheckOne(r.keep);
   wrap.querySelector('.rm').onclick = () => {
     if (r.keep === null) CredState.rows.splice(i, 1);
     else r.removed = true;
+    credMarkDirty();
     credRender();
   };
   // drag-to-reorder: the grip arms the row, dropping moves it. Order IS
@@ -2306,6 +2307,7 @@ function credMoveRow(target, e){
   if (from < to) to -= 1;
   rows.splice(to, 0, moved);
   CredState.dragIdx = null;
+  credMarkDirty();
   credRender();
 }
 
@@ -2694,7 +2696,7 @@ $('credAddBtn').onclick = () => {
   CredState.rows.push({ keep:null, name:'', value:'', masked:'', replaced:false,
                         removed:false, state:'new', models:{}, blocked:[],
                         usage:null, checking:false });
-  CredState.dirty = true;
+  credMarkDirty();
   credRender();
 };
 /* One saved-provider <select> per section — the lists are independent (TASK 3).
@@ -3797,6 +3799,17 @@ async function usageRefresh(){
   usageRender(UsageState.data);
 }
 
+/* the table's Time column follows the chart's day buckets: both are the
+   RPD window (Pacific), not UTC (item 2, Q3). `sv-SE` formats ISO-like. */
+function ptStamp(ts){
+  if (!ts) return '';
+  return new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'America/Los_Angeles', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  }).format(new Date(ts * 1000));
+}
+
 function usageRender(data){
   const d = data || UsageState.data;
   const table = $('usageTable');
@@ -3811,7 +3824,7 @@ function usageRender(data){
   const fmtSecs = ms => ((Number(ms) || 0) / 1000).toLocaleString(undefined, {maximumFractionDigits: 2});
   usagePlot(d.chart);
   const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
-      <td>${credEsc((r.ts_utc || '').slice(0, 19).replace('T', ' '))}</td>
+      <td>${credEsc(ptStamp(r.ts))}</td>
       <td class="mono">${credEsc(r.model || '—')}</td>
       <td>${credEsc(r.key_name || '—')}</td>
       <td class="mono">${credEsc(r.key_masked || '—')}</td>
@@ -3819,7 +3832,7 @@ function usageRender(data){
       <td class="num">${fmtSecs(r.ms)}</td>
     </tr>`).join('')
     : '<tr><td colspan="6" class="hint">No calls recorded in this period.</td></tr>';
-  if (table) table.innerHTML = `<thead><tr><th>Time (UTC)</th><th>Model</th><th>Key name</th><th>Key</th>
+  if (table) table.innerHTML = `<thead><tr><th>Time (PT)</th><th>Model</th><th>Key name</th><th>Key</th>
       <th class="num">Tokens in / out</th><th class="num">Delay (seconds)</th></tr></thead><tbody>${body}</tbody>`;
   usageWire();
 }

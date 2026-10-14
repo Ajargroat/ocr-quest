@@ -46,7 +46,8 @@ import json
 import os
 import threading
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from . import faults
 from .gemini import call_gemini, gateway_probe, list_models
@@ -111,15 +112,26 @@ CALLS_CAP = 20000
 PERIOD_HOURS = {"24h": 24, "7d": 24 * 7, "30d": 24 * 30}
 
 
-def _next_utc_midnight_ts(now=None):
-    """Epoch seconds of the next UTC midnight — the quota refill moment (Q7).
+# Google's free-tier RPD resets at midnight Pacific, not UTC
+# (ai.google.dev/gemini-api/docs/rate-limits) — so the gauge day, the quota
+# cooldown and the chart day buckets all use this zone (item 2, Q2/Q3).
+# `tzdata` supplies the zone database on Windows and is a declared
+# dependency; without it this line raises ZoneInfoNotFoundError, loudly.
+QUOTA_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def _next_reset_ts(now=None):
+    """Epoch seconds of the next midnight PACIFIC — Google's RPD refill.
 
     A free-quota-exhausted model is parked until exactly then (Q6), never
-    retried the same day, so one exhausted model cannot chain errors."""
+    retried the same day, so one exhausted model cannot chain errors.
+    `replace(hour=0…)` + one day is wall-clock arithmetic in the zone, so
+    the real gap is 23 or 25 h on the two DST days — correct by
+    construction, unlike a fixed offset."""
     now = now if now is not None else time.time()
-    day = datetime.fromtimestamp(now, timezone.utc).date()
-    midnight = datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
-    return midnight.timestamp() + 24 * 3600
+    local = datetime.fromtimestamp(now, QUOTA_TZ)
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (midnight + timedelta(days=1)).timestamp()
 
 # Faults that mean "this key/pair is the problem" → rotate.
 ROTATE_KINDS = {"bad_key", "quota", "rate_limit", "model_unavailable",
@@ -163,7 +175,8 @@ def usage_chart(rows, group="model", y="calls"):
     y:     'calls' | 'tokens' | 'sec' | 'avg_sec' — what the bar height
            counts (tokens = tokens_in + tokens_out of the call; sec = summed
            per-call delay in the cell; avg_sec = delay ÷ calls in the cell).
-    Days are UTC, matching the "Time (UTC)" column of the table.
+    Days are Pacific, matching the table's Time (PT) column and the RPD
+    window Google resets on.
     Returns {"group", "y", "days": [iso…], "series": [label…],
              "cells": [[value, …], …]} where cells[day][series]."""
     group = group if group in ("model", "key") else "model"
@@ -171,7 +184,7 @@ def usage_chart(rows, group="model", y="calls"):
     days, series, counts, calls_n = [], [], {}, {}
     for r in rows or []:
         day = datetime.fromtimestamp(r.get("ts") or 0,
-                                     timezone.utc).strftime("%Y-%m-%d")
+                                     QUOTA_TZ).strftime("%Y-%m-%d")
         if group == "model":
             label = r.get("model") or "unknown"
         else:
@@ -263,9 +276,9 @@ class GeminiRouter:
 
     # ------------------------------------------------------ daily send count
     def _today(self):
-        # UTC midnight tracks Google's quota refill exactly (Q7) — never the
-        # server's local date, and never reset by refresh or errors.
-        return datetime.now(timezone.utc).date().isoformat()
+        # Pacific midnight is Google's free-tier RPD reset (item 2, Q3) —
+        # never the server's local date, and never reset by refresh or errors.
+        return datetime.now(QUOTA_TZ).date().isoformat()
 
     def _key_hash(self, key):
         """Identity for the usage file — a hash, never the secret itself."""
@@ -331,14 +344,15 @@ class GeminiRouter:
         except OSError:
             pass          # counters are a gauge, never worth breaking a run
 
-    def _count_send(self, key, model, tokens_in=0, tokens_out=0,
-                     ms=0.0, key_name="", ok=True):
-        """Record one COMPLETED (successful) send for today.
+    def _count_attempt(self, key, model, key_name=""):
+        """Record ONE HTTP request attempt for today (item 1, Q1/Q4).
 
-        Failures never touch this gauge — it counts calls that actually
-        finished, so it can never read N/N for a key that did not
-        complete N. Every completed call is also appended to the local
-        per-call history (CALLS_PATH) backing the usage reports (Q4)."""
+        `call_gemini` retries a transient fault up to NET_RETRIES times and
+        the router steps the ladder on a 429 — every one of those is a
+        request Google counted. So the gauge counts ATTEMPTS, not
+        completions: it can never read fewer than what Google received.
+        The same gauge feeds the 0/20 bars and the day-cap gate
+        (_spent_today → _plan), matching Google's RPD."""
         self._usage_load()
         with self._lock:
             today = self._today()
@@ -347,6 +361,16 @@ class GeminiRouter:
             per = self._usage.setdefault(self._key_hash(key), {})
             per[model] = per.get(model, 0) + 1
             self._usage_save()
+
+    def _count_send(self, key, model, tokens_in=0, tokens_out=0,
+                     ms=0.0, key_name="", ok=True):
+        """Append one COMPLETED (successful) send to the per-call history.
+
+        The daily gauge is NOT bumped here: _count_attempt already counted
+        the HTTP attempt, so bumping on completion too would read 2 for a
+        single request. Failures write no row — a row carries tokens and a
+        delay, which only a response can supply (Q4=B counts the attempt,
+        not a row)."""
         self._calls_append(key, model, tokens_in=tokens_in,
                            tokens_out=tokens_out, ms=ms,
                            key_name=key_name, ok=ok)
@@ -514,9 +538,9 @@ class GeminiRouter:
             if model:
                 if kind == "quota":
                     # Q6: a free-quota-exhausted model is NOT retried until
-                    # the next UTC midnight reset — skip the rest of the day
-                    # instead of chaining errors every KEY_COOLDOWN["quota"].
-                    st["blocked"][model] = _next_utc_midnight_ts(now)
+                    # the next PACIFIC midnight reset — skip the rest of the
+                    # day instead of chaining errors every KEY_COOLDOWN["quota"].
+                    st["blocked"][model] = _next_reset_ts(now)
                 else:
                     st["blocked"][model] = now + KEY_COOLDOWN.get(
                         kind, MODEL_COOLDOWN if kind == "model_unavailable"
@@ -620,7 +644,8 @@ class GeminiRouter:
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries,
-                        on_problem=self._problem_cb(on_problem, label, model))
+                        on_problem=self._problem_cb(on_problem, label, model),
+                        on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0
                 except faults.FaultError as exc:
                     flt = exc.fault
@@ -713,7 +738,8 @@ class GeminiRouter:
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries,
-                        on_problem=self._problem_cb(on_problem, label, model))
+                        on_problem=self._problem_cb(on_problem, label, model),
+                        on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0
                 except faults.FaultError as exc:
                     flt = exc.fault
@@ -760,6 +786,21 @@ class GeminiRouter:
 
         def cb(flt, attempt, tries, wait):
             on_problem(flt, attempt, tries, wait, f"{label} · {model}")
+        return cb
+
+    def _attempt_cb(self, key, label, model):
+        """The per-HTTP-attempt hook handed to call_gemini (item 1, Q1/Q4):
+        bump this key×model's day gauge and push the new 0/20 figures out.
+        A retry or a ladder step is a real request Google saw, so the bars
+        must move on it, not only on the completion."""
+        def cb(attempt, tries):
+            self._count_attempt(key, model, key_name=label)
+            emit_usage = getattr(self, "on_usage", None)
+            if emit_usage is not None:
+                try:
+                    emit_usage(key, model, self._usage_of(key))
+                except Exception:
+                    pass
         return cb
 
     # --------------------------------------------------------- health checks

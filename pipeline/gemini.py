@@ -70,14 +70,19 @@ def proxy_proxies():
 
 def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 temperature=0.1, max_tokens=16384, retries=None,
-                on_problem=None):
+                on_problem=None, on_attempt=None):
     """Sends one image/PDF plus the prompt to Gemini.
     Returns (parsed_json, raw_text, usage) where usage is
     ``{"tokens_in": int, "tokens_out": int}`` (zeros when the response
     carries no ``usageMetadata``).
 
     ``on_problem(fault, attempt, retries, wait)`` is called before every
-    back-off sleep so the caller can log tunnel hiccups live."""
+    back-off sleep so the caller can log tunnel hiccups live.
+
+    ``on_attempt(attempt, retries)`` fires once per ``requests.post`` —
+    before the send, so an attempt that got NO response at all (timeout,
+    tunnel) still counts. Google bills what it received, and this is the
+    only place that knows how many requests were really made."""
     if retries is None:
         retries = max(1, int(os.getenv("NET_RETRIES", "3")))
     base_wait = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
@@ -99,6 +104,8 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
     last = faults.fault("unknown")
 
     for attempt in range(1, retries + 1):
+        if on_attempt:
+            on_attempt(attempt, retries)
         try:
             resp = requests.post(url, json=payload, headers=headers,
                                  timeout=(10, 300), proxies=proxy_proxies())

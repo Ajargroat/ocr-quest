@@ -1,4 +1,4 @@
-"""Offline tests for P5/P6/P7 behaviour: UTC-midnight usage reset,
+"""Offline tests for P5/P6/P7 behaviour: Pacific-midnight usage reset,
 quota-exhausted skip-till-reset, per-call JSON history + period filter,
 exponential backoff, and DB period counts.
 
@@ -15,46 +15,74 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+import requests
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline import faults, gemini, gemini_router
 from pipeline.gemini_router import (
     GeminiRouter,
-    _next_utc_midnight_ts,
+    _next_reset_ts,
     PERIOD_HOURS,
     usage_chart,
 )
 from pipeline.db import Database
 
 
-class UtcMidnightTests(unittest.TestCase):
-    def test_today_is_utc_date(self):
+class PacificMidnightTests(unittest.TestCase):
+    def test_today_is_the_pacific_date(self):
         r = GeminiRouter()
         self.assertEqual(r._today(),
-                         datetime.now(timezone.utc).date().isoformat())
+                         datetime.now(gemini_router.QUOTA_TZ).date().isoformat())
 
-    def test_next_utc_midnight_is_tonight(self):
+    def test_quota_zone_is_pacific(self):
+        """The RPD reset zone must resolve (tzdata is a declared dependency
+        on Windows) and sit 7 or 8 h behind UTC."""
+        off = datetime.now(gemini_router.QUOTA_TZ).utcoffset()
+        self.assertIn(off, (timedelta(hours=-7), timedelta(hours=-8)))
+
+    def test_next_reset_is_the_next_pacific_midnight(self):
         now = time.time()
-        nxt = _next_utc_midnight_ts(now)
+        nxt = _next_reset_ts(now)
         self.assertGreater(nxt, now)
-        self.assertLessEqual(nxt - now, 24 * 3600)
-        day = datetime.fromtimestamp(nxt, timezone.utc)
-        self.assertEqual((day.hour, day.minute, day.second), (0, 0, 0))
+        # 25 h is the DST fall-back day, so the old <= 24 h bound would be
+        # flaky once a year.
+        self.assertLessEqual(nxt - now, 25 * 3600)
+        local = datetime.fromtimestamp(nxt, gemini_router.QUOTA_TZ)
+        self.assertEqual((local.hour, local.minute, local.second), (0, 0, 0))
+
+    def test_next_reset_spans_the_dst_fall_back_day(self):
+        """2026-11-01 is the Pacific fall-back, so that local day is 25 h:
+        two consecutive Pacific midnights are 25 h apart. A fixed UTC-8 (or
+        -7) offset would return 24 h and land an hour off."""
+        m1 = _next_reset_ts(datetime(2026, 10, 31, 12,
+                                     tzinfo=gemini_router.QUOTA_TZ).timestamp())
+        m2 = _next_reset_ts(datetime(2026, 11, 1, 12,
+                                     tzinfo=gemini_router.QUOTA_TZ).timestamp())
+        self.assertEqual(
+            datetime.fromtimestamp(m1,
+                                   gemini_router.QUOTA_TZ).date().isoformat(),
+            "2026-11-01")
+        self.assertEqual(
+            datetime.fromtimestamp(m2,
+                                   gemini_router.QUOTA_TZ).date().isoformat(),
+            "2026-11-02")
+        self.assertAlmostEqual(m2 - m1, 25 * 3600, delta=2)
 
 
 class QuotaSkipTests(unittest.TestCase):
     @staticmethod
     def _noon():
-        # Pin the clock to 12:00 UTC: the block-until-midnight assertions
+        # Pin the clock to 12:00 Pacific: the block-until-midnight assertions
         # need a full day's headroom and fail in the last hour before
         # midnight if they use real wall-clock time.
-        return datetime.now(timezone.utc).replace(
+        return datetime.now(gemini_router.QUOTA_TZ).replace(
             hour=12, minute=0, second=0, microsecond=0).timestamp()
 
-    def test_quota_block_runs_to_next_utc_midnight(self):
+    def test_quota_block_runs_to_the_next_pacific_midnight(self):
         r = GeminiRouter()
         now = self._noon()
         r._mark("k1111111111", "quota", "gemini-3.5-flash", now=now)
@@ -63,7 +91,7 @@ class QuotaSkipTests(unittest.TestCase):
         # so no consecutive error chains the same day.
         self.assertGreater(blocked_until, now + 3600)
         self.assertAlmostEqual(blocked_until,
-                               _next_utc_midnight_ts(now), delta=1.0)
+                               _next_reset_ts(now), delta=1.0)
 
     def test_quota_blocked_model_leaves_the_plan_same_day(self):
         r = GeminiRouter()
@@ -166,7 +194,15 @@ class UsageChartTests(unittest.TestCase):
 
     @staticmethod
     def _ts(day, hour=9):
-        return datetime(2026, 10, day, hour, tzinfo=timezone.utc).timestamp()
+        return datetime(2026, 10, day, hour,
+                        tzinfo=gemini_router.QUOTA_TZ).timestamp()
+
+    def test_chart_day_buckets_follow_pacific_midnight(self):
+        """A row at 02:00 UTC on the 8th is still the 7th in Pacific — the
+        day the RPD counter is actually on (item 2, Q3)."""
+        rows = [{"ts": datetime(2026, 10, 8, 2,
+                                tzinfo=timezone.utc).timestamp(), "model": "m1"}]
+        self.assertEqual(usage_chart(rows)["days"], ["2026-10-07"])
 
     def test_chart_groups_by_day_and_model(self):
         rows = [
@@ -270,6 +306,36 @@ class GeminiUsageCaptureTests(unittest.TestCase):
         _p, _t, usage = gemini.call_gemini(
             "k", "gemini-3.5-flash", "p", "", "text/plain", retries=1)
         self.assertEqual(usage, {"tokens_in": 0, "tokens_out": 0})
+
+    def test_a_single_success_fires_on_attempt_once(self):
+        """A healthy call is exactly one HTTP request (item 1)."""
+        self._use(self.Resp(200, json_body=self._body(True)))
+        seen = []
+        gemini.call_gemini("k", "gemini-3.5-flash", "p", "", "text/plain",
+                           retries=1, on_attempt=lambda a, t: seen.append(a))
+        self.assertEqual(seen, [1])
+
+    def test_every_http_attempt_is_signalled_even_with_no_response(self):
+        """Q4=B: a request that got NO response (timeout/tunnel) still
+        counts — on_attempt fires before the post, once per retry."""
+        def boom(*a, **k):
+            raise requests.ConnectionError("no route")
+        self._real_post_orig = gemini.requests.post
+        gemini.requests.post = boom
+        seen = []
+        old_wait = os.environ.get("NET_RETRY_WAIT")
+        os.environ["NET_RETRY_WAIT"] = "0"
+        try:
+            with self.assertRaises(faults.FaultError):
+                gemini.call_gemini("k", "gemini-3.5-flash", "p", "", "text/plain",
+                                   retries=3,
+                                   on_attempt=lambda a, t: seen.append(a))
+        finally:
+            if old_wait is None:
+                os.environ.pop("NET_RETRY_WAIT", None)
+            else:
+                os.environ["NET_RETRY_WAIT"] = old_wait
+        self.assertEqual(seen, [1, 2, 3])
 
 
 class BackoffTests(unittest.TestCase):

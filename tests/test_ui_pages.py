@@ -350,6 +350,11 @@ class UploadEnqueueTests(unittest.TestCase):
 
 
 class UsageTabTests(unittest.TestCase):
+    def test_usage_table_time_column_is_pacific(self):
+        js = _read("app.js")
+        self.assertIn("Time (PT)", js)
+        self.assertNotIn("Time (UTC)", js)
+
     def test_usage_table_shows_delay_in_seconds(self):
         html = _read("index.html")
         js = _read("app.js")
@@ -418,6 +423,30 @@ class CredKeyToggleTests(unittest.TestCase):
         self.assertIn("localStorage.getItem(LANE_OFF_KEY", js)
         self.assertIn("localStorage.setItem(LANE_OFF_KEY", js)
         self.assertIn("laneOffSave(set)", js)
+
+
+class CredDirtyTrackingTests(unittest.TestCase):
+    def test_every_key_row_mutation_marks_dirty(self):
+        """Editing/removing/reordering a saved Gemini key must flip
+        CredState.dirty so the Save button enables. These handlers mutate
+        CredState.rows directly and are rebuilt on every render, so each one
+        has to call credMarkDirty() itself — the regression was that they set
+        state but left the button disabled, so edits silently never saved."""
+        js = _read("app.js")
+        row_fn = js.split("function credRowEl(", 1)[1].split("function credMoveRow", 1)[0]
+        # name / key inputs, replace, remove, undo each arm the dirty flag.
+        self.assertIn("r.name = nameIn.value; credMarkDirty();", row_fn)
+        self.assertIn("r.value = keyIn.value.trim(); credMarkDirty();", row_fn)
+        self.assertIn("r.replaced = true; credMarkDirty();", row_fn)
+        self.assertIn("r.removed = false; credMarkDirty();", row_fn)
+        self.assertIn("else r.removed = true;", row_fn)
+        self.assertIn("credMarkDirty();\n    credRender();", row_fn)
+        # Reorder and the ADD button route through the one helper too.
+        move_fn = js.split("function credMoveRow", 1)[1].split("function credRender", 1)[0]
+        self.assertIn("credMarkDirty();", move_fn)
+        add_fn = js.split("$('credAddBtn').onclick", 1)[1].split("};", 1)[0]
+        self.assertIn("credMarkDirty();", add_fn)
+        self.assertNotIn("CredState.dirty = true", add_fn)
 
 
 class LaneSurfaceTests(unittest.TestCase):

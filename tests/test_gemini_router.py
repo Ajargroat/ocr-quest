@@ -54,6 +54,9 @@ class ScriptedGemini:
 
     def __call__(self, api_key, model, *args, **kwargs):
         self.calls.append((api_key, model))
+        on_attempt = kwargs.get("on_attempt")
+        if on_attempt:
+            on_attempt(1, 1)          # one HTTP request, like the real client
         seq = self.outcomes.get(f"{api_key}|{model}", ["ok"])
         outcome = seq.pop(0) if len(seq) > 1 else seq[0]
         if outcome == "ok":
@@ -202,9 +205,10 @@ class RouterTest(unittest.TestCase):
         st = r._entry("k1111111111")
         self.assertFalse(st["dead"])
         self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
-        # the refusal is NOT counted — the bar only ever holds completions
+        # the refusal IS counted as an attempt (item 1) — it is not a
+        # completion, so the key keeps serving on the next rung
         u = r._usage_of("k1111111111")
-        self.assertNotIn("gemini-3.5-flash", u["models"])
+        self.assertEqual(u["models"].get("gemini-3.5-flash"), 1)
         self.assertEqual(u["models"].get("gemini-3.6-flash"), 1)
         # the next file must start above the spent rung — 3.5 is never
         # offered to this key again while the pair is parked
@@ -455,20 +459,44 @@ class RouterTest(unittest.TestCase):
     def test_a_spent_model_is_dropped_from_the_plan(self):
         r = GeminiRouter()
         for _ in range(r.day_limit()):
-            r._count_send("k1111111111", "gemini-3.5-flash")
+            r._count_attempt("k1111111111", "gemini-3.5-flash")
         ladder = dict((i, ms) for i, _k, ms, _lat, _pen in
                       r._plan(make_cfg(keys=("k1111111111",)), 0))[0]
         self.assertNotIn("gemini-3.5-flash", ladder)
         self.assertEqual(ladder[0], "gemini-3.6-flash")
 
-    def test_errors_do_not_increment_the_completed_count(self):
+    def test_errors_still_increment_the_attempt_count(self):
+        """Item 1/Q1: a failed request is a request Google counted, so the
+        gauge moves even though the call never completed."""
         fake = self._use({"k1111111111|gemini-3.5-flash": "rate_limit"})
         r = GeminiRouter()
         r.call(make_cfg(), "p", "b", "image/jpeg")   # k1 fails, k2 completes
         u1 = r._usage_of("k1111111111")
         u2 = r._usage_of("k2222222222")
-        self.assertEqual(u1["models"], {})                       # failures count nothing
-        self.assertEqual(u2["models"]["gemini-3.5-flash"], 1)     # completions do
+        self.assertEqual(u1["models"]["gemini-3.5-flash"], 1)   # the failed attempt
+        self.assertEqual(u2["models"]["gemini-3.5-flash"], 1)   # the completed one
+
+    def test_each_retry_inside_call_gemini_counts_once(self):
+        """call_gemini retries a transient fault up to NET_RETRIES times;
+        every one of those requests must move the day gauge (item 1)."""
+        def three_tries(api_key, model, *args, **kwargs):
+            on_attempt = kwargs.get("on_attempt")
+            for attempt in range(1, 4):
+                if on_attempt:
+                    on_attempt(attempt, 3)
+            return {"answer": 1}, "raw", {"tokens_in": 0, "tokens_out": 0}
+        gemini_router.call_gemini = three_tries
+        r = GeminiRouter()
+        r.call(make_cfg(), "p", "b", "image/jpeg")
+        self.assertEqual(
+            r._usage_of("k1111111111")["models"]["gemini-3.5-flash"], 3)
+
+    def test_a_bare_mark_still_counts_nothing(self):
+        """A `_mark` (quota/rate_limit) with no request must leave the gauge
+        empty — only real HTTP attempts count (item 1)."""
+        r = GeminiRouter()
+        r._mark("k1111111111", "quota", "gemini-3.5-flash")
+        self.assertEqual(r._usage_of("k1111111111")["models"], {})
 
     def test_a_failed_pair_never_freezes_the_pool(self):
         """Two keys: the failed pair rotates to the next key and the call
@@ -500,7 +528,7 @@ class RouterTest(unittest.TestCase):
 
     def test_usage_survives_a_new_router_and_never_stores_the_key(self):
         r = GeminiRouter()
-        r._count_send("supersecretkey", "gemini-3.5-flash")
+        r._count_attempt("supersecretkey", "gemini-3.5-flash")
         with open(gemini_router.USAGE_PATH) as fh:
             blob = fh.read()
         self.assertNotIn("supersecretkey", blob)
