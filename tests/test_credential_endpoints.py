@@ -312,6 +312,36 @@ class EnableAndConnectionsTest(EndpointCase):
         self.assertEqual(stored[0]["password"], "pw-secret")
         self.assertFalse(stored[0]["enabled"])
 
+    def test_db_connection_keep_keeps_the_legacy_password(self):
+        """The UI synthesizes "Local / other" from POSTGRES_* while
+        DB_CONNECTIONS is empty and sends a bare KEEP for its password;
+        the save that materialises that card must keep the secret it was
+        showing as set instead of wiping it to ""."""
+        os.environ["POSTGRES_PASSWORD"] = "legacy-pw"
+        main.cfg = main.load_config()
+        res = self.client().post("/api/credentials", json={
+            **self.base(),
+            "postgres_password": KEEP,
+            "db_connections": [
+                {"label": "Local / other", "host": "db.local", "port": "5432",
+                 "db": "konkour", "user": "u", "password": KEEP,
+                 "sslmode": "prefer", "enabled": True}]})
+        self.assertEqual(res.status_code, 200, res.text)
+        stored = json.loads(os.environ["DB_CONNECTIONS"])
+        self.assertEqual(stored[0]["password"], "legacy-pw")
+        self.assertTrue(res.json()["db_connections"][0]["password_set"])
+        # ... and the second save keeps it positionally, as before
+        r2 = self.client().post("/api/credentials", json={
+            **self.base(),
+            "postgres_password": KEEP,
+            "db_connections": [
+                {"label": "Local / other", "host": "db.local", "port": "5432",
+                 "db": "konkour", "user": "u", "password": KEEP,
+                 "sslmode": "prefer", "enabled": True}]})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(json.loads(os.environ["DB_CONNECTIONS"])[0]["password"],
+                         "legacy-pw")
+
     def test_key_dates_stamp_only_new_keys(self):
         tmp = tempfile.mkdtemp(prefix="konkour-meta-")
         real_usage = gemini_router.USAGE_PATH
@@ -325,6 +355,11 @@ class EnableAndConnectionsTest(EndpointCase):
             view = c.get("/api/credentials").json()
             self.assertTrue(view["keys"][0]["added"], "new key must be stamped")
             first = view["keys"][0]["added"]
+            # The dashboard renders r.added.slice(0, 10): the view must carry
+            # the ISO string itself, never the meta entry {"added": ...} dict.
+            self.assertIsInstance(first, str, "added must be the ISO string")
+            self.assertIn("T", first)          # ISO 8601, not a meta dict
+            self.assertEqual(len(first[:10]), 10)
             # re-save the same key as a KEEP: the original date survives
             r2 = c.post("/api/credentials", json={
                 "gemini_keys": [KEEP + ":0"], "gemini_names": ["main"],

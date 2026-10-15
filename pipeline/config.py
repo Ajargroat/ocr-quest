@@ -261,6 +261,14 @@ class Config:
     revision_provider_enabled: bool = True
     supabase_enabled: bool = True
     db_connections: tuple = ()
+    # Studio-local provider list + per-stage actives (independent of the
+    # pipeline tab's lists). "" actives: extract → Gemini pool, enrich → none.
+    # Studio proxy: a profile name from the shared store, "" → direct.
+    # Trailing + defaulted so older direct Config(...) constructions keep working.
+    studio_providers: tuple = ()
+    studio_extract_active: str = ""
+    studio_enrich_active: str = ""
+    studio_proxy: str = ""
 
 
 def load_config() -> Config:
@@ -295,6 +303,22 @@ def load_config() -> Config:
     ext = _resolve(ext_providers, ext_active)
     rev = _resolve(rev_providers, rev_active)
     _proxy_store = load_proxy_store()
+    # Studio-local providers: same single-kind (9router) coercion as the
+    # pipeline sections, but a separate list. Absent keys mean "" (Gemini
+    # pool for extract, none for enrich) — _active() would default to the
+    # first entry, which must not pre-select 9router before the user chooses.
+    studio_providers = _migrate_ninerouter(_json_list("STUDIO_PROVIDERS"))
+    _studio_labels = {p.get("label", "") for p in studio_providers}
+    studio_extract_active = (os.getenv("STUDIO_EXTRACT_ACTIVE") or "").strip()
+    if studio_extract_active not in _studio_labels:
+        studio_extract_active = ""
+    studio_enrich_active = (os.getenv("STUDIO_ENRICH_ACTIVE") or "").strip()
+    if studio_enrich_active not in _studio_labels:
+        studio_enrich_active = ""
+    studio_proxy = (os.getenv("STUDIO_PROXY") or "").strip()
+    if studio_proxy and studio_proxy not in {p.get("name", "")
+                                            for p in _proxy_store["profiles"]}:
+        studio_proxy = ""
     return Config(
         input_root=os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT),
         min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
@@ -329,6 +353,10 @@ def load_config() -> Config:
         extraction_active=ext_active,
         revision_providers=rev_providers,
         revision_active=rev_active,
+        studio_providers=studio_providers,
+        studio_extract_active=studio_extract_active,
+        studio_enrich_active=studio_enrich_active,
+        studio_proxy=studio_proxy,
         proxy_profiles=_proxy_store["profiles"],
         proxy_active=_proxy_store["active"],
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),

@@ -551,11 +551,15 @@ class CredentialSave(BaseModel):
     db_connections: list[dict] | None = None
 
 
-def _merge_db_connections(stored, incoming):
+def _merge_db_connections(stored, incoming, keep_fallback=""):
     """Extra connections under the Supabase card (Q2 — presentation only: the
     pipeline keeps its one fixed active connection, db.py untouched).
     Fields take the submitted value; `password` follows the KEEP / "KEEP:<i>"
-    / literal sentinel rule of _merge_providers, `enabled` defaults on."""
+    / literal sentinel rule of _merge_providers, `enabled` defaults on.
+    `keep_fallback` is what a bare KEEP resolves to when the submitted row
+    has no stored counterpart yet — the legacy POSTGRES_PASSWORD the UI's
+    synthesized "Local / other" card represents — so the first save that
+    materialises that card never wipes the secret it was showing as set."""
     out = []
     for i, raw in enumerate(incoming or []):
         label = str(raw.get("label", "")).strip().replace(",", " ")
@@ -565,7 +569,8 @@ def _merge_db_connections(stored, incoming):
         if pwd == "__CLEAR__":
             pwd = ""
         elif pwd == KEEP:
-            pwd = (stored[i] if i < len(stored) else {}).get("password", "")
+            pwd = (stored[i].get("password", "")
+                   if i < len(stored) else keep_fallback)
         elif pwd.startswith(KEEP + ":"):
             try:
                 j = int(pwd.split(":", 1)[1])
@@ -732,7 +737,11 @@ def _credentials_view():
     for row in st["keys"]:
         i = row["index"]
         if 0 <= i < len(cfg.gemini_key_pool):
-            row["added"] = meta.get(router._key_hash(cfg.gemini_key_pool[i]), "")
+            # The meta entry is {"added": "<iso>"} — the view carries the ISO
+            # string itself; the dashboard renders r.added.slice(0, 10).
+            entry = meta.get(router._key_hash(cfg.gemini_key_pool[i]), "")
+            row["added"] = (entry.get("added", "")
+                            if isinstance(entry, dict) else entry) or ""
     return st
 
 
@@ -878,7 +887,8 @@ async def credentials_save(body: CredentialSave):
     # Q2 — extra connection cards under Supabase (presentation only).
     if body.db_connections is not None:
         db_conns = _merge_db_connections(list(cfg.db_connections),
-                                         body.db_connections)
+                                         body.db_connections,
+                                         keep_fallback=cfg.postgres_password)
         env_values["DB_CONNECTIONS"] = json.dumps(list(db_conns),
                                                   ensure_ascii=False)
     envfile.update_env_file(ENV_PATH, env_values)
@@ -1108,6 +1118,215 @@ async def review_bbox(body: BboxUpdate):
         return JSONResponse({"ok": True})
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+# ════════════════ OCR STUDIO · any-file OCR subsystem ════════════════
+# A parallel subsystem (pipeline/studio/) that OCRs ANY exam file — text or
+# image PDF, single or compiled — into an inspectable file bulk, then enriches,
+# re-crops, reviews and imports it. Nothing here touches the main pipeline's
+# behaviour; it reuses the same hub for live events.
+
+class StudioProfile(BaseModel):
+    """Body of POST /api/studio/jobs/{job}/profile — a partial profile edit."""
+    source_kind: str | None = None
+    compilation: str | None = None
+    answer_layout: str | None = None
+    static: dict | None = None
+    extract_per_question: list[str] | None = None
+    tag_list_ref: str | None = None
+    notes: str | None = None
+
+
+@app.get("/api/studio/jobs")
+async def studio_jobs():
+    """List every studio job on disk (newest first) — the Jobs panel."""
+    from pipeline.studio import workspace
+    return JSONResponse({"ok": True, "jobs": await asyncio.to_thread(workspace.list_jobs)})
+
+
+@app.post("/api/studio/jobs")
+async def studio_create(file: UploadFile = File(...)):
+    """Create a job from an uploaded PDF/image: store + probe + suggest profile.
+
+    The file streams to disk chunked (never whole-file in RAM), then Stage 0
+    runs inline so the Jobs list has a real, editable profile the moment the
+    upload returns."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    try:
+        result = await asyncio.to_thread(
+            studio_jobs_mod.create_job, hub, file.file, file.filename, file.filename)
+        return JSONResponse({"ok": True, **result})
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/studio/jobs/{job_id}")
+async def studio_job(job_id: str):
+    """One job's full disk state: summary + probe + profile + log."""
+    from pipeline.studio import workspace
+    if not workspace.exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        payload = await asyncio.to_thread(_studio_job_payload, job_id)
+        return JSONResponse({"ok": True, **payload})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+def _studio_job_payload(job_id: str) -> dict:
+    from pipeline.studio import profile as profile_mod
+    from pipeline.studio import workspace
+    profile = workspace.read_artifact(job_id, "profile") or profile_mod.blank()
+    return {
+        "job": workspace.summary(job_id),
+        "probe": workspace.read_artifact(job_id, "probe"),
+        "profile": profile,
+        "required_missing": profile_mod.required_missing(profile),
+        "log": workspace.read_log(job_id, 200),
+    }
+
+
+@app.post("/api/studio/jobs/{job_id}/probe")
+async def studio_reprobe(job_id: str):
+    """Re-run Stage 0's probe (keeps an existing, user-edited profile)."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        result = await asyncio.to_thread(studio_jobs_mod.run_probe, hub, job_id)
+        return JSONResponse({"ok": True, **result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/studio/jobs/{job_id}/profile")
+async def studio_save_profile(job_id: str, body: StudioProfile):
+    """Apply the Profile panel's edits and persist them to profile.json."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    overrides = body.model_dump(exclude_none=True)
+    try:
+        result = await asyncio.to_thread(
+            studio_jobs_mod.save_profile, hub, job_id, overrides)
+        return JSONResponse({"ok": True, **result})
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/studio/jobs/{job_id}")
+async def studio_delete(job_id: str):
+    """Delete a job directory and every artifact inside it."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    gone = await asyncio.to_thread(studio_jobs_mod.delete_job, job_id)
+    return JSONResponse({"ok": gone}, status_code=200 if gone else 500)
+
+
+def _studio_exists(job_id: str) -> bool:
+    from pipeline.studio import workspace
+    try:
+        return workspace.exists(job_id)
+    except ValueError:
+        return False
+
+
+@app.get("/api/studio/state")
+async def studio_state():
+    """Live stage state for the studio rail (mirrors /api/revision/state)."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    return JSONResponse(studio_jobs_mod.get_state())
+
+
+@app.get("/api/studio/tags")
+async def studio_tags():
+    """The controlled vocabulary: subjects, corps (canonical + variants), topics."""
+    from pipeline.studio import tags as tags_mod
+    data = await asyncio.to_thread(tags_mod.load)
+    return JSONResponse({"ok": True, "tags": data,
+                         "topics": tags_mod.known_topics(data)})
+
+class StudioTagsSave(BaseModel):
+    tags: dict = {}
+
+@app.post("/api/studio/tags")
+async def studio_tags_save(body: StudioTagsSave):
+    """Replace the shared tag vocabulary (global for every studio job)."""
+    from pipeline.studio import tags as tags_mod
+    errors = tags_mod.validate(body.tags)
+    if errors:
+        return JSONResponse({"ok": False, "error": "; ".join(errors[:5])},
+                            status_code=400)
+    data = tags_mod.normalize(body.tags)
+    try:
+        await asyncio.to_thread(tags_mod.save, data, tags_mod.SEED_PATH)
+    except OSError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "tags": data,
+                         "topics": tags_mod.known_topics(data)})
+
+def _studio_models_view():
+    """Studio-local model/proxy selections (masked — never raw secrets)."""
+    return {"providers": [_provider_view(p) for p in cfg.studio_providers],
+            "extract_active": cfg.studio_extract_active,
+            "enrich_active": cfg.studio_enrich_active,
+            "proxy_profiles": [p.get("name", "") for p in cfg.proxy_profiles
+                                 if p.get("name", "")],
+            "proxy": cfg.studio_proxy}
+
+@app.get("/api/studio/models")
+async def studio_models_get():
+    return JSONResponse({"ok": True, **_studio_models_view()})
+
+class StudioModelsSave(BaseModel):
+    providers: list[dict] | None = None
+    extract_active: str = KEEP   # "" → Gemini pool (extract) / none (enrich)
+    enrich_active: str = KEEP
+    proxy: str | None = None     # None → keep; "" → direct (no proxy)
+
+@app.post("/api/studio/models")
+async def studio_models_save(body: StudioModelsSave):
+    """Persist the studio-local provider list + per-stage actives + proxy pick."""
+    global cfg
+    providers = (list(cfg.studio_providers)
+                 if body.providers is None
+                 else _merge_providers(list(cfg.studio_providers), body.providers))
+    labels = {p["label"] for p in providers}
+    extract_active = (cfg.studio_extract_active if body.extract_active == KEEP
+                      else body.extract_active.strip())
+    enrich_active = (cfg.studio_enrich_active if body.enrich_active == KEEP
+                     else body.enrich_active.strip())
+    if extract_active and extract_active not in labels:
+        return JSONResponse(
+            {"ok": False, "error": f"Extract provider "
+                                       f"'{extract_active}' is not in the saved list."},
+            status_code=400)
+    if enrich_active and enrich_active not in labels:
+        return JSONResponse(
+            {"ok": False, "error": f"Enrich provider "
+                                       f"'{enrich_active}' is not in the saved list."},
+            status_code=400)
+    proxy = cfg.studio_proxy if body.proxy is None else body.proxy.strip()
+    names = {p.get("name", "") for p in cfg.proxy_profiles}
+    if proxy and proxy not in names:
+        return JSONResponse(
+            {"ok": False, "error": f"Proxy profile '{proxy}' does not exist."},
+            status_code=400)
+    envfile.update_env_file(ENV_PATH, {
+        "STUDIO_PROVIDERS": json.dumps(list(providers), ensure_ascii=False),
+        "STUDIO_EXTRACT_ACTIVE": extract_active,
+        "STUDIO_ENRICH_ACTIVE": enrich_active,
+        "STUDIO_PROXY": proxy,
+    })
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    view = _studio_models_view()
+    view["ok"] = True
+    view["saved"] = True
+    return JSONResponse(view)
+
 
 if __name__ == "__main__":
     import uvicorn

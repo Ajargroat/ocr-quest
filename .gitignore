@@ -21,6 +21,10 @@ backups/
 # (pipeline scans it at runtime; the tracked copy in git is stale and noisy)
 konkour-ocr/
 
+# OCR Studio job workspaces — one dir per job (source + layer1/layer2 + crops).
+# Plain files on purpose (the studio's inspectable bulk), local working data.
+workspace/
+
 # scratch log kept open by the detached test server
 tools/_srv.log
 

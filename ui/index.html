@@ -38,6 +38,8 @@ window.MathJax = {
     <i class="fa fa-list-check" aria-hidden="true"></i><span>QBank</span></button>
   <button class="side-btn" data-view="revision" title="Revision">
     <i class="fa fa-rotate" aria-hidden="true"></i><span>Revision</span></button>
+  <button class="side-btn" data-view="studio" title="Studio">
+    <i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><span>Studio</span></button>
   <button class="side-btn" data-view="database" title="Database">
     <i class="fa fa-database" aria-hidden="true"></i><span>Database</span></button>
   <button class="side-btn" data-view="usage" title="Usage">
@@ -328,6 +330,116 @@ window.MathJax = {
     <section class="rev-detail" id="revDetail"></section>
   </div>
 </section>
+
+<!-- ════════════ VIEW 3.5 · STUDIO (any-file OCR subsystem) ════════════ -->
+<section id="viewStudio" class="view">
+  <!-- stage rail · mirrors the pipeline/revision stepper -->
+  <section class="stages" id="stStages">
+    <div class="rail">
+      <div class="stage" data-stage="intake" data-desc="Store the source file">
+        <div class="hub"><i class="fa fa-file-arrow-up" aria-hidden="true"></i><em class="bubble" id="stStageIntake"></em></div>
+        <label>Intake</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="probe" data-desc="Detect kind, pages, static fields">
+        <div class="hub"><i class="fa fa-magnifying-glass" aria-hidden="true"></i><em class="bubble" id="stStageProbe"></em></div>
+        <label>Probe</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="extract" data-desc="Layer-1 extraction (LLM #1)">
+        <div class="hub"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><em class="bubble" id="stStageExtract"></em></div>
+        <label>Extract</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="enrich" data-desc="Layer-2 enrich + repair (LLM #2)">
+        <div class="hub"><i class="fa fa-broom" aria-hidden="true"></i><em class="bubble" id="stStageEnrich"></em></div>
+        <label>Enrich</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="geometry" data-desc="Bbox + crop">
+        <div class="hub"><i class="fa fa-crop-simple" aria-hidden="true"></i><em class="bubble" id="stStageGeometry"></em></div>
+        <label>Crop</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="review" data-desc="Human review">
+        <div class="hub"><i class="fa fa-eye" aria-hidden="true"></i><em class="bubble" id="stStageReview"></em></div>
+        <label>Review</label>
+      </div>
+      <span class="wire"><i></i></span>
+      <div class="stage" data-stage="import" data-desc="Bulk import">
+        <div class="hub"><i class="fa fa-database" aria-hidden="true"></i><em class="bubble" id="stStageImport"></em></div>
+        <label>Import</label>
+      </div>
+    </div>
+    <div class="stage-now" id="stNow" data-state="idle">
+      <span class="beacon"></span><b id="stNowStage">IDLE</b><em id="stNowMsg">No studio job running.</em>
+    </div>
+  </section>
+
+  <!-- panel switcher · the same top .seg idiom the Database tab uses -->
+  <div class="toolbar" id="stToolbar">
+    <div class="seg" id="stPanels">
+      <button data-spanel="jobs" class="active" type="button">Jobs</button>
+      <button data-spanel="profile" type="button">Profile</button>
+      <button data-spanel="bulk" type="button">Bulk</button>
+      <button data-spanel="crops" type="button">Crops</button>
+      <button data-spanel="tags" type="button">Tags</button>
+      <button data-spanel="models" type="button">Models</button>
+      <button data-spanel="import" type="button">Import</button>
+    </div>
+    <div class="st-actions">
+      <span class="hint" id="stCrumb"></span>
+      <button class="ghost-btn neutral sm" id="stRefresh" type="button" title="Reload jobs from disk">
+        <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── panel · jobs ── -->
+  <div class="db-panel" id="stPanelJobs">
+    <div class="db-actions">
+      <label class="st-upload">
+        <i class="fa fa-file-arrow-up" aria-hidden="true"></i>
+        <span id="stUploadLabel">Choose a PDF or image…</span>
+        <input type="file" id="stFile" accept=".pdf,.png,.jpg,.jpeg,.webp">
+      </label>
+    </div>
+    <div class="db-grid-wrap" id="stJobs"></div>
+  </div>
+
+  <!-- ── panel · profile ── -->
+  <div class="db-panel" id="stPanelProfile" hidden>
+    <div class="st-profile" id="stProfileBody"></div>
+  </div>
+
+  <!-- ── panel · bulk (layer1/layer2) ── -->
+  <div class="db-panel" id="stPanelBulk" hidden>
+    <div class="st-profile" id="stBulkBody"></div>
+  </div>
+
+  <!-- ── panel · crops ── -->
+  <div class="db-panel" id="stPanelCrops" hidden>
+    <div class="st-profile" id="stCropsBody"></div>
+  </div>
+
+  <!-- ── panel · tags ── -->
+  <div class="db-panel" id="stPanelTags" hidden>
+    <div class="st-profile" id="stTagsBody">
+      <p class="empty">Loading tag list…</p>
+    </div>
+  </div>
+
+  <!-- ── panel · models ── -->
+  <div class="db-panel" id="stPanelModels" hidden>
+    <div class="st-profile" id="stModelsBody"></div>
+  </div>
+
+  <!-- ── panel · import ── -->
+  <div class="db-panel" id="stPanelImport" hidden>
+    <div class="st-profile" id="stImportBody"></div>
+  </div>
+</section>
+
 <!-- ════════════ VIEW 4 · CREDENTIALS (key pool + routing health) ════════════ -->
 <section id="viewCredentials" class="view">
   <!-- service switcher · same top .seg idiom Database uses for its panels -->
@@ -751,5 +863,6 @@ window.MathJax = {
 <div class="toast-wrap no-mathjax" id="toasts"></div>
 
 <script src="static/app.js"></script>
+<script src="static/studio.js"></script>
 </body>
 </html>

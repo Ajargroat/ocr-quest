@@ -418,6 +418,7 @@ function handle(ev){
       LANES.states = {}; LANES.round = 0; lanesRender(); laneNowPaint(); break;
     case 'wait': waitCountdown(ev); break;
     case 'upload': upApplyEvent(ev); break;
+    case 'studio': studioFeed(ev); break;
     case 'usage': credUsageLive(ev); break;
   }
 }
@@ -634,48 +635,70 @@ $('runBtn').onclick = async () => {
 };
 
 /* ═══════════ TAB SWITCHING ═══════════ */
+function showView(target){
+  document.querySelectorAll('#side .side-btn').forEach(t =>
+    t.classList.toggle('active', t.dataset.view === target));
+  $('viewPipeline').classList.toggle('active', target === 'pipeline');
+  $('viewReview').classList.toggle('active', target === 'review');
+  $('viewRevision').classList.toggle('active', target === 'revision');
+  $('viewStudio').classList.toggle('active', target === 'studio');
+  $('viewDatabase').classList.toggle('active', target === 'database');
+  $('viewUsage').classList.toggle('active', target === 'usage');
+  $('viewCredentials').classList.toggle('active', target === 'credentials');
+  if (target === 'usage' && !UsageState.loaded){
+    UsageState.loaded = true;
+    viewLoading('viewUsage', true);
+    usageRefresh().finally(() => viewLoading('viewUsage', false));
+  }
+  if (target === 'review' && !RState.loaded){
+    RState.loaded = true;
+    viewLoading('viewReview', true);
+    loadReviewMeta().then(loadReviewRows).finally(() => viewLoading('viewReview', false));
+  }
+  if (target === 'revision' && !RevState.loaded){
+    RevState.loaded = true;
+    viewLoading('viewRevision', true);
+    loadRevisionSummary().then(loadRevisionItems).finally(() => viewLoading('viewRevision', false));
+  }
+  if (target === 'studio' && !StudioState.loaded){
+    StudioState.loaded = true;
+    viewLoading('viewStudio', true);
+    studioInit().then(() => {
+      const p = panelFromHash();
+      if (p) studioPanel(p, true);
+    }).finally(() => viewLoading('viewStudio', false));
+  }
+  if (target === 'database' && !DbState.loaded){
+    DbState.loaded = true;
+    viewLoading('viewDatabase', true);
+    dbInit().finally(() => viewLoading('viewDatabase', false));
+  }
+  if (target === 'credentials' && !CredState.loaded){
+    CredState.loaded = true;
+    viewLoading('viewCredentials', true);
+    loadCredentials().finally(() => viewLoading('viewCredentials', false));
+  }
+  if (target === 'pipeline' && !PipeState.loaded){
+    viewLoading('viewPipeline', true);
+    loadPipeProfiles().finally(() => viewLoading('viewPipeline', false));
+  }
+}
+
 document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
-  tab.onclick = () => {
-    document.querySelectorAll('#side .side-btn').forEach(t => t.classList.remove('active'));
-    tab.classList.add('active');
-    const target = tab.dataset.view;
-    $('viewPipeline').classList.toggle('active', target === 'pipeline');
-    $('viewReview').classList.toggle('active', target === 'review');
-    $('viewRevision').classList.toggle('active', target === 'revision');
-    $('viewDatabase').classList.toggle('active', target === 'database');
-    $('viewUsage').classList.toggle('active', target === 'usage');
-    $('viewCredentials').classList.toggle('active', target === 'credentials');
-    if (target === 'usage' && !UsageState.loaded){
-      UsageState.loaded = true;
-      viewLoading('viewUsage', true);
-      usageRefresh().finally(() => viewLoading('viewUsage', false));
-    }
-    if (target === 'review' && !RState.loaded){
-      RState.loaded = true;
-      viewLoading('viewReview', true);
-      loadReviewMeta().then(loadReviewRows).finally(() => viewLoading('viewReview', false));
-    }
-    if (target === 'revision' && !RevState.loaded){
-      RevState.loaded = true;
-      viewLoading('viewRevision', true);
-      loadRevisionSummary().then(loadRevisionItems).finally(() => viewLoading('viewRevision', false));
-    }
-    if (target === 'database' && !DbState.loaded){
-      DbState.loaded = true;
-      viewLoading('viewDatabase', true);
-      dbInit().finally(() => viewLoading('viewDatabase', false));
-    }
-    if (target === 'credentials' && !CredState.loaded){
-      CredState.loaded = true;
-      viewLoading('viewCredentials', true);
-      loadCredentials().finally(() => viewLoading('viewCredentials', false));
-    }
-    if (target === 'pipeline' && !PipeState.loaded){
-      viewLoading('viewPipeline', true);
-      loadPipeProfiles().finally(() => viewLoading('viewPipeline', false));
-    }
-  };
+  tab.onclick = () => showView(tab.dataset.view);
 });
+
+/* Deep links (#studio, #database, …) open that view on load and on hash change,
+   so a view can be shared/bookmarked and a headless screenshot can target one. */
+function viewFromHash(){
+  const h = (location.hash || '').replace('#', '').split('/')[0];
+  return ['pipeline','review','revision','studio','database','usage','credentials'].includes(h) ? h : null;
+}
+function panelFromHash(){
+  const parts = (location.hash || '').replace('#', '').split('/');
+  return parts[0] === 'studio' && parts[1] ? parts[1] : null;
+}
+window.addEventListener('hashchange', () => { const v = viewFromHash(); if (v) showView(v); });
 
 /* one loading treatment for every data-fetching view (item 13) */
 function viewLoading(viewId, on){
@@ -4135,6 +4158,16 @@ function bootNewSurfaces(){
                      // the #stages/#lanes surface, not just the select on refresh.
 }
 bootNewSurfaces();
+
+/* Honour a #view deep link after every script (incl. studio.js) has loaded —
+   so a headless screenshot or a shared URL lands on the right tab. Deferred
+   to DOMContentLoaded because showView('studio') needs StudioState, which is
+   defined by studio.js loaded after this file. */
+function bootDeepLink(){ const v = viewFromHash(); if (v) showView(v); }
+if (document.readyState === 'loading')
+  document.addEventListener('DOMContentLoaded', bootDeepLink);
+else
+  bootDeepLink();
 
 /* keep the 9router section honest whenever credentials reload */
 const _loadCredentials = loadCredentials;
