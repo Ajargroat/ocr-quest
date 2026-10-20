@@ -103,6 +103,28 @@ class ConverterSweepTests(unittest.TestCase):
         self.assertEqual((converted, failed), (0, 0))
         self.assertEqual(calls, [])
 
+    def test_studio_sources_are_never_rasterised(self):
+        """The studio tree sits inside INPUT_ROOT but its PDFs are the studio's.
+
+        Rasterising one archives it to done/ and breaks a re-extract
+        ("job has no source file"), so the sweep must leave the tree alone.
+        """
+        calls = []
+        converter._render_pdf = lambda *a: calls.append(a)
+        studio = os.path.join(self._tmp.name, "studio", "20260101-000000-abcd")
+        os.makedirs(studio)
+        pdf = os.path.join(studio, "exam.pdf")
+        with open(pdf, "wb") as fh:
+            fh.write(b"%PDF-1.4 fake")
+        old = time.time() - 3600
+        os.utime(pdf, (old, old))
+        cfg = _cfg(self._tmp.name)
+        cfg.studio_source_root = os.path.join(self._tmp.name, "studio")
+        converted, failed = converter._sweep_once(cfg)
+        self.assertEqual((converted, failed), (0, 0))
+        self.assertEqual(calls, [])
+        self.assertTrue(os.path.exists(pdf))
+
     def test_raster_quality_key_is_the_only_quality_source(self):
         """CONVERTER_JPEG_QUALITY is gone; CONVERTER_RASTER_QUALITY rules."""
         calls = []

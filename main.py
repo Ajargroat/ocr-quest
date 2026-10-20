@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 import requests as http_requests
 from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -17,6 +17,7 @@ from pipeline import envfile
 from pipeline import vision
 from pipeline import backups
 from pipeline import storage
+from pipeline import recrop
 from pipeline import gemini as gemini_mod
 from pipeline.dataconsole import DataConsole, GuardError
 from pipeline.revision import runner as revision_runner
@@ -285,23 +286,55 @@ async def websocket_endpoint(websocket: WebSocket):
         except (Exception, asyncio.CancelledError):
             pass
 
-@app.get("/api/proxy/image/{source_id}")
-async def proxy_image(source_id: str):
-    """Proxies Supabase storage images through the backend using the service key."""
-    url = f"{cfg.supabase_url}/storage/v1/object/{cfg.supabase_bucket}/{source_id}"
+def _fetch_object(name: str):
+    """One bucket object's bytes + MIME (the two read-only image routes).
+
+    Slashes are legal in an object name: studio crops live at
+    ``studio/<job>/<key>.jpg``, which the single-segment legacy route cannot
+    address. Traversal segments are rejected before any outbound call.
+    """
+    name = (name or "").strip().lstrip("/")
+    if not name or ".." in name:
+        raise ValueError("bad object name")
+    # Supabase's storage edge caches object URLs, so an upsert keeps serving
+    # the old bytes until the TTL lapses - a re-cropped picture must be visible
+    # on the very next request. A unique query string is always a cache miss.
+    url = (f"{cfg.supabase_url}/storage/v1/object/{cfg.supabase_bucket}/{name}"
+           f"?v={int(time.time() * 1000)}")
     headers = {
         "apikey": cfg.supabase_key,
         "Authorization": f"Bearer {cfg.supabase_key}",
     }
+    resp = http_requests.get(url, headers=headers, timeout=30)
+    if resp.status_code != 200:
+        raise LookupError("Image not found")
+    return resp.content, resp.headers.get("content-type", "image/jpeg")
+
+
+@app.get("/api/proxy/image/{source_id}")
+async def proxy_image(source_id: str):
+    """Proxies Supabase storage images through the backend using the service key."""
     try:
-        resp = http_requests.get(url, headers=headers, timeout=30)
-        if resp.status_code != 200:
-            return JSONResponse({"error": "Image not found"}, status_code=404)
-        content_type = resp.headers.get("content-type", "image/jpeg")
+        content, content_type = await asyncio.to_thread(_fetch_object, source_id)
         from fastapi.responses import Response
-        return Response(content=resp.content, media_type=content_type)
+        return Response(content=content, media_type=content_type)
+    except LookupError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=502)
+
+
+@app.get("/api/media")
+async def media_object(object: str):
+    """Proxy one media_images entry's bucket object (the Q12 array -> <img>)."""
+    try:
+        content, mime = await asyncio.to_thread(_fetch_object, object)
+        from fastapi.responses import Response
+        return Response(content=content, media_type=mime)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
 
 
 @app.get("/api/db/bucket")
@@ -309,7 +342,8 @@ async def db_bucket(prefix: str = "", limit: int = 100, offset: int = 0):
     """Read-only list of the configured Supabase bucket's objects (item 3.4).
 
     The Database tab's Bucket panel browses these; each row's `name` is the
-    same value /api/proxy/image/{name} fetches. No mutation, no bucket picker.
+    same object /api/media?object=<name> fetches (slashed crops too).
+    No mutation, no bucket picker.
     """
     try:
         rows = await asyncio.to_thread(storage.list_objects, cfg, prefix,
@@ -388,6 +422,7 @@ async def revision_resolve(body: RevisionResolve):
 class BboxUpdate(BaseModel):
     id: str
     bbox: list  # [ymin, xmin, ymax, xmax], each 0..1000
+    index: int = 0  # which media_images entry the bbox belongs to (Q12)
 
 
 class CellUpdate(BaseModel):
@@ -528,7 +563,8 @@ KEEP = "__KEEP__"   # UI sentinel: 'leave stored value alone'
 class CredentialSave(BaseModel):
     gemini_keys: list[str] = []      # real key text, or "__KEEP__"/"__KEEP__:<i>"
     gemini_names: list[str] = []     # optional labels, same order
-    model_ladder: list[str] = []     # ordered Gemini models (oldest first)
+    model_ladder: list[str] = []     # ordered Gemini models (cheapest first)
+    model_enabled: list[str] | None = None  # enabled subset; None = keep, [] = 400
     supabase_url: str = KEEP
     supabase_key: str = KEEP         # service key
     supabase_bucket: str = KEEP
@@ -629,11 +665,13 @@ def _merge_providers(stored, incoming):
                 key = ""
             else:
                 key = stored[j].get("api_key", "") if 0 <= j < len(stored) else ""
+        men = raw.get("models_enabled")
         out.append({"label": label,
                     "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
                     "api_key": key,
                     "model": str(raw.get("model", "")).strip(),
-                    "models": list(raw.get("models") or []) if isinstance(raw.get("models"), list) else []})
+                    "models": list(raw.get("models") or []) if isinstance(raw.get("models"), list) else [],
+                    "models_enabled": [str(m).strip() for m in men if str(m).strip()] if isinstance(men, list) else None})
     seen, dedup = set(), []
     for p in out:
         if p["label"] not in seen:
@@ -660,9 +698,12 @@ def _merge_providers(stored, incoming):
 
 def _provider_view(p: dict) -> dict:
     """Masked provider row for the dashboard — never the raw api_key."""
+    men = p.get("models_enabled")
     return {"label": p.get("label", ""),
             "base_url": p.get("base_url", ""),
             "model": p.get("model", ""),
+            "models": list(p.get("models") or []) if isinstance(p.get("models"), list) else [],
+            "models_enabled": ([str(m) for m in men] if isinstance(men, list) else None),
             "api_key_set": bool(p.get("api_key")),
             "api_key_masked": mask_key(p.get("api_key", ""))}
 
@@ -673,6 +714,7 @@ def _profiles_view():
                           "host": p.get("host", ""),
                           "port": p.get("port", ""),
                           "scheme": p.get("scheme", "http"),
+                          "enabled": bool(p.get("enabled", True)),
                           "user": p.get("user", ""),
                           "pass_set": bool(p.get("password")),
                           "pass_masked": mask_key(p.get("password", ""))}
@@ -706,6 +748,13 @@ def _credentials_view():
     for row in st["keys"]:
         i = row["index"]
         row["name"] = names[i] if i < len(names) else ""
+    st["model_ladder"] = list(cfg.gemini_model_ladder)
+    st["model_enabled"] = (list(cfg.gemini_enabled_models)
+                            if cfg.gemini_enabled_models is not None else None)
+    # Per-model RPD caps (flash-lite 500/day, the rest the shared cap) — the
+    # credential bars read used/limit per model, not one cap for the ladder.
+    st["model_limits"] = dict(router.model_limits())
+    st["model_limits"]["default"] = router.day_limit()
     st["supabase_url"] = cfg.supabase_url
     st["supabase_bucket"] = cfg.supabase_bucket
     st["supabase_key_set"] = bool(cfg.supabase_key)
@@ -802,6 +851,23 @@ async def credentials_save(body: CredentialSave):
             {"ok": False, "error": "The model ladder has duplicate "
                                    "entries — every rung must be unique."},
             status_code=400)
+    # Per-model ON/OFF toggles: None keeps the stored set (older client);
+    # a list must be non-empty and a subset of the ladder being saved.
+    if body.model_enabled is None:
+        enabled = (list(cfg.gemini_enabled_models)
+                   if cfg.gemini_enabled_models is not None else None)
+    else:
+        enabled = [m.strip() for m in body.model_enabled if m.strip()]
+        if not enabled:
+            return JSONResponse(
+                {"ok": False, "error": "Enable at least one model — "
+                                       "use the section toggle to turn the pool off."},
+                status_code=400)
+        unknown = [m for m in enabled if m not in ladder]
+        if unknown:
+            return JSONResponse(
+                {"ok": False, "error": "Unknown model(s): " + ", ".join(unknown)},
+                status_code=400)
 
     url = cfg.supabase_url if body.supabase_url == KEEP else body.supabase_url.strip().rstrip("/")
     skey = cfg.supabase_key if body.supabase_key == KEEP else (
@@ -876,6 +942,11 @@ async def credentials_save(body: CredentialSave):
         "REVISION_PROVIDERS": json.dumps(list(providers_r), ensure_ascii=False),
         "REVISION_ACTIVE": active_r,
     }
+    # Per-model toggles: only touch the key when the client sent toggles or
+    # the file already carries it — a legacy .env must not gain the key until
+    # first use (absent = every rung on).
+    if body.model_enabled is not None or os.getenv("GEMINI_MODELS_ENABLED") is not None:
+        env_values["GEMINI_MODELS_ENABLED"] = ",".join(enabled or ())
     # Q1 — the section enable switches (ui key → .env flag; 1 = on).
     if body.enabled is not None:
         for ui_key, env_key in (("gemini", "GEMINI_POOL_ENABLED"),
@@ -1057,13 +1128,18 @@ async def profiles_save(body: ProfileSave):
                 password = ordered[j] if 0 <= j < len(ordered) else ""
         else:
             password = key
+        prev_en = prev.get("enabled", True)
         clean.append({"name": name, "host": host,
                       "port": str(raw.get("port", "")).strip(),
                       "scheme": (raw.get("scheme") or "http").lower(),
+                      "enabled": bool(raw.get("enabled", prev_en)),
                       "user": str(raw.get("user", "")).strip(),
                       "password": password})
     active = body.active.strip()
     if active and active not in names:
+        active = ""
+    by_name = {c.get("name", ""): c for c in clean}
+    if active and not by_name.get(active, {}).get("enabled", True):
         active = ""
     save_proxy_store(clean, active)
     cfg = load_config()
@@ -1114,10 +1190,61 @@ async def review_bbox(body: BboxUpdate):
         ymin, xmin, ymax, xmax = bbox
         if ymax <= ymin or xmax <= xmin:
             raise ValueError("Requires ymin < ymax and xmin < xmax.")
-        db.update_diagram_bbox(body.id, [ymin, xmin, ymax, xmax])
+        if body.index < 0:
+            raise ValueError("index must be 0 or more.")
+        db.update_media_bbox(body.id, body.index, [ymin, xmin, ymax, xmax])
         return JSONResponse({"ok": True})
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+class RecropUpdate(BaseModel):
+    id: str
+    bbox: list  # [ymin, xmin, ymax, xmax], each 0..1000
+    index: int = 0  # which media_images entry to re-cut
+
+
+@app.get("/api/qbank/page")
+async def qbank_page(question: str):
+    """The page a QBank picture was cut from - the bbox editor's backdrop.
+
+    Pictures are stored as finished crops, so correcting a box needs the page
+    itself: `sources.storage_url` still points at the page JPEG the scanner
+    uploaded. Read-only; the picture on the card stays /api/media.
+    """
+    try:
+        row = await asyncio.to_thread(db.fetch_media_row, question)
+        if not row or not row.get("source_url"):
+            raise LookupError("no source page for this question")
+        data = await asyncio.to_thread(recrop.page_bytes, row["source_url"])
+        return Response(content=data, media_type="image/jpeg",
+                        headers={"Cache-Control": "private, max-age=600"})
+    except LookupError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": " ".join(str(exc).split())[:300]},
+                            status_code=502)
+
+
+@app.post("/api/qbank/recrop")
+async def qbank_recrop(body: RecropUpdate):
+    """Re-cut one picture from its page and replace the SAME bucket object.
+
+    The Q12 invariant: a corrected box re-uploads over the crop's own id, so a
+    row never accumulates variants. The box lands in the DB in the same call,
+    so the stored bbox and the stored JPEG can never disagree.
+    """
+    try:
+        result = await asyncio.to_thread(
+            recrop.recrop, cfg, db, body.id, int(body.index), body.bbox)
+        return JSONResponse({"ok": True, **result})
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except LookupError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=404)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": " ".join(str(exc).split())[:300]},
+                            status_code=502)
 
 # ════════════════ OCR STUDIO · any-file OCR subsystem ════════════════
 # A parallel subsystem (pipeline/studio/) that OCRs ANY exam file — text or
@@ -1215,6 +1342,177 @@ async def studio_save_profile(job_id: str, body: StudioProfile):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
+class StudioImportBody(BaseModel):
+    target: str = "supabase"
+    dry_run: bool = False
+
+
+class StudioReviewBody(BaseModel):
+    crops: dict = {}
+    edits: dict = {}
+
+
+class StudioCropBody(BaseModel):
+    bbox: list = []
+
+
+async def _studio_call(func, *args):
+    """Run one stage off the event loop; errors become a 500 JSON body."""
+    try:
+        result = await asyncio.to_thread(func, *args)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/api/studio/jobs/{job_id}/extract")
+async def studio_extract(job_id: str):
+    """Stage 1 — source → layer1 (text lane deterministic, image lane OCR)."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    return await _studio_call(studio_jobs_mod.run_extract, hub, job_id, cfg)
+
+
+@app.post("/api/studio/jobs/{job_id}/enrich")
+async def studio_enrich(job_id: str):
+    """Stage 2 — layer1 → layer2 (fields, flags, tags, answer links)."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    return await _studio_call(studio_jobs_mod.run_enrich, hub, job_id, cfg)
+
+
+@app.post("/api/studio/jobs/{job_id}/geometry")
+async def studio_geometry(job_id: str):
+    """Stage 3 — locate every block and plan its crop."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    return await _studio_call(studio_jobs_mod.run_geometry, hub, job_id, cfg)
+
+
+@app.post("/api/studio/jobs/{job_id}/import")
+async def studio_import(job_id: str, body: StudioImportBody):
+    """Stage 4 — import everything ready right now to the chosen target."""
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    return await _studio_call(studio_jobs_mod.run_import, hub, job_id, cfg,
+                              body.target, body.dry_run)
+
+
+@app.get("/api/studio/jobs/{job_id}/bulk")
+async def studio_bulk(job_id: str):
+    """The merged bulk view (layer2 + geometry + review) + import state."""
+    from pipeline.studio import importers as importers_mod
+    from pipeline.studio import merge
+    from pipeline.studio import workspace
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        view = await asyncio.to_thread(merge.merged, job_id)
+        imports = await asyncio.to_thread(
+            workspace.read_artifact, job_id, "imports") or {}
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "view": view,
+                         "targets": importers_mod.targets(),
+                         "results": imports.get("results") or {},
+                         "runs": imports.get("runs") or [],
+                         "settings": _studio_batch_view()})
+
+
+@app.get("/api/studio/jobs/{job_id}/crop/{key}")
+async def studio_crop(job_id: str, key: str):
+    """One block's crop, rendered (or re-rendered) on demand."""
+    from pipeline.studio import merge, workspace
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        await asyncio.to_thread(merge.render_crop, job_id, key)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    path = workspace.crop_path(job_id, key)
+    if not os.path.exists(path):
+        return JSONResponse({"ok": False, "error": "crop not available"},
+                            status_code=404)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/studio/jobs/{job_id}/crop/{key}")
+async def studio_crop_upload(job_id: str, key: str, body: StudioCropBody):
+    """Re-crop: render, delete the old object, upload under the same object id."""
+    from pipeline.studio import geometry, merge, workspace
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+
+    def _run():
+        view = merge.merged(job_id)
+        block = next((b for b in view["blocks"] if b.get("key") == key), None)
+        if not block or not (block.get("crop") or {}).get("needed"):
+            raise ValueError("block has no crop")
+        entry = geometry.render_crop(job_id, key,
+                                     body.bbox or block["crop"].get("bbox"),
+                                     force=bool(body.bbox))
+        if not entry:
+            raise ValueError("crop could not be rendered")
+        folder = view.get("folder_id") or ("studio-%s" % job_id)
+        obj = geometry.crop_object(cfg, folder, key)
+        imports = workspace.read_artifact(job_id, "imports") or {}
+        uploads = (imports.get("uploads") or {}).get("crops") or {}
+        have = uploads.get(key) or {}
+        if have.get("object") == obj:
+            storage.delete_file(cfg, obj)
+        with open(workspace.crop_path(job_id, key), "rb") as fh:
+            data = fh.read()
+        url = storage.upload_file(cfg, obj, data, "image/jpeg")
+        uploads[key] = {"url": url, "object": obj, "spec": entry.get("spec")}
+        imports.setdefault("uploads", {})["crops"] = uploads
+        workspace.write_artifact(job_id, "imports", imports)
+        return {"object": obj, "url": url,
+                "bbox": entry.get("crop_bbox"), "page": entry.get("crop_page")}
+
+    try:
+        result = await asyncio.to_thread(_run)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, **result})
+
+
+@app.post("/api/studio/jobs/{job_id}/review")
+async def studio_review(job_id: str, body: StudioReviewBody):
+    """Persist human edits and crop approvals (review.json)."""
+    from pipeline.studio import workspace
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+
+    def _save():
+        current = workspace.read_artifact(job_id, "review") or {}
+        edits = dict(current.get("edits") or {})
+        crops = dict(current.get("crops") or {})
+        for key, patch in (body.edits or {}).items():
+            if isinstance(patch, dict):
+                edits[key] = {**(edits.get(key) or {}), **patch}
+        for key, patch in (body.crops or {}).items():
+            if isinstance(patch, dict):
+                crops[key] = {**(crops.get(key) or {}), **patch}
+        payload = {"version": 1, "job_id": job_id, "edits": edits,
+                   "crops": crops,
+                   "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        workspace.write_artifact(job_id, "review", payload)
+        return {"review": payload, "job": workspace.summary(job_id)}
+
+    try:
+        result = await asyncio.to_thread(_save)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, **result})
+
+
 @app.delete("/api/studio/jobs/{job_id}")
 async def studio_delete(job_id: str):
     """Delete a job directory and every artifact inside it."""
@@ -1267,14 +1565,22 @@ async def studio_tags_save(body: StudioTagsSave):
     return JSONResponse({"ok": True, "tags": data,
                          "topics": tags_mod.known_topics(data)})
 
+def _studio_batch_view():
+    """Request batching knobs shown on the Studio Extract panel."""
+    return {"pages_per_call": getattr(cfg, "studio_pages_per_call", 3),
+            "band_batch": getattr(cfg, "studio_band_batch", 6)}
+
+
 def _studio_models_view():
     """Studio-local model/proxy selections (masked — never raw secrets)."""
     return {"providers": [_provider_view(p) for p in cfg.studio_providers],
             "extract_active": cfg.studio_extract_active,
             "enrich_active": cfg.studio_enrich_active,
+            "vision_active": cfg.studio_vision_active,
             "proxy_profiles": [p.get("name", "") for p in cfg.proxy_profiles
                                  if p.get("name", "")],
-            "proxy": cfg.studio_proxy}
+            "proxy": cfg.studio_proxy,
+            **_studio_batch_view()}
 
 @app.get("/api/studio/models")
 async def studio_models_get():
@@ -1284,6 +1590,7 @@ class StudioModelsSave(BaseModel):
     providers: list[dict] | None = None
     extract_active: str = KEEP   # "" → Gemini pool (extract) / none (enrich)
     enrich_active: str = KEEP
+    vision_active: str = KEEP
     proxy: str | None = None     # None → keep; "" → direct (no proxy)
 
 @app.post("/api/studio/models")
@@ -1298,6 +1605,8 @@ async def studio_models_save(body: StudioModelsSave):
                       else body.extract_active.strip())
     enrich_active = (cfg.studio_enrich_active if body.enrich_active == KEEP
                      else body.enrich_active.strip())
+    vision_active = (cfg.studio_vision_active if body.vision_active == KEEP
+                     else body.vision_active.strip())
     if extract_active and extract_active not in labels:
         return JSONResponse(
             {"ok": False, "error": f"Extract provider "
@@ -1307,6 +1616,11 @@ async def studio_models_save(body: StudioModelsSave):
         return JSONResponse(
             {"ok": False, "error": f"Enrich provider "
                                        f"'{enrich_active}' is not in the saved list."},
+            status_code=400)
+    if vision_active and vision_active not in labels:
+        return JSONResponse(
+            {"ok": False, "error": f"Locate provider "
+                                       f"'{vision_active}' is not in the saved list."},
             status_code=400)
     proxy = cfg.studio_proxy if body.proxy is None else body.proxy.strip()
     names = {p.get("name", "") for p in cfg.proxy_profiles}
@@ -1318,6 +1632,7 @@ async def studio_models_save(body: StudioModelsSave):
         "STUDIO_PROVIDERS": json.dumps(list(providers), ensure_ascii=False),
         "STUDIO_EXTRACT_ACTIVE": extract_active,
         "STUDIO_ENRICH_ACTIVE": enrich_active,
+        "STUDIO_VISION_ACTIVE": vision_active,
         "STUDIO_PROXY": proxy,
     })
     load_dotenv(ENV_PATH, override=True)
@@ -1326,6 +1641,33 @@ async def studio_models_save(body: StudioModelsSave):
     view["ok"] = True
     view["saved"] = True
     return JSONResponse(view)
+
+
+class StudioSettingsSave(BaseModel):
+    pages_per_call: int | None = None   # None → keep the saved value
+    band_batch: int | None = None
+
+
+@app.post("/api/studio/settings")
+async def studio_settings_save(body: StudioSettingsSave):
+    """Persist the request batching knobs (pages/bands per call).
+
+    The page count is also the stage-1 chunk window: one number controls how
+    many pages an extraction request carries, so the label never lies.
+    """
+    global cfg
+    pages = (cfg.studio_pages_per_call if body.pages_per_call is None
+             else max(1, min(8, int(body.pages_per_call))))
+    band_batch = (cfg.studio_band_batch if body.band_batch is None
+                  else max(1, min(12, int(body.band_batch))))
+    envfile.update_env_file(ENV_PATH, {
+        "STUDIO_PAGES_PER_CALL": str(pages),
+        "STUDIO_CHUNK_IMAGES": str(pages),
+        "STUDIO_BAND_BATCH": str(band_batch),
+    })
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    return JSONResponse({"ok": True, "saved": True, **_studio_batch_view()})
 
 
 if __name__ == "__main__":

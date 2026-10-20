@@ -17,13 +17,14 @@ load_dotenv(ENV_PATH)
 # default resolves relative to the project instead of a hard-coded drive letter.
 DEFAULT_INPUT_ROOT = os.path.join(os.path.dirname(ENV_PATH), "konkour-ocr")
 
-# Production model ladder: start at the oldest version and step up, so a
-# working 3.5 is always preferred over 3.6/3.7/3.8. Every key walks the same
-# ladder; advanced users can still override it via GEMINI_MODEL_LADDER in .env
-# (the Credentials tab deliberately offers no picker — there is nothing to
-# choose when every request may need every rung).
-DEFAULT_MODEL_LADDER = ("gemini-3.5-flash", "gemini-3.6-flash",
-                        "gemini-3.7-flash", "gemini-3.8-flash")
+# Production model ladder: cheapest rung first, then step up, so a working
+# flash-lite is always preferred over the full flash versions. Every key walks
+# the same ladder; advanced users can still override it via GEMINI_MODEL_LADDER
+# in .env. Per-model ON/OFF toggles live in GEMINI_MODELS_ENABLED (absent = all
+# on); the router skips disabled rungs.
+DEFAULT_MODEL_LADDER = ("gemini-3.5-flash-lite", "gemini-3.5-flash",
+                        "gemini-3.6-flash", "gemini-3.7-flash",
+                        "gemini-3.8-flash")
 
 
 def _csv(value: str) -> tuple:
@@ -57,6 +58,18 @@ def _gemini_pool() -> tuple:
 def _model_ladder() -> tuple:
     ladder = _csv(os.getenv("GEMINI_MODEL_LADDER", ""))
     return ladder or DEFAULT_MODEL_LADDER
+
+
+def _enabled_models():
+    """Enabled subset of the ladder, or None when unconfigured.
+
+    Absent GEMINI_MODELS_ENABLED means every rung is on (an untouched .env
+    keeps working unchanged). A present value — even empty — is authoritative:
+    only the named models may be used."""
+    raw = os.getenv("GEMINI_MODELS_ENABLED")
+    if raw is None:
+        return None
+    return tuple(dict.fromkeys(_csv(raw)))
 
 
 def _json_list(name):
@@ -153,6 +166,18 @@ def _resolve(providers, active):
     return {}
 
 
+def _lane_model(provider):
+    """The model the custom lane actually runs: the provider's `model` when
+    it survives its own per-model toggle, else the first enabled rung of its
+    list (models_enabled is None → every rung is on)."""
+    want = (provider.get("model") or "").strip()
+    men = provider.get("models_enabled")
+    if men is None or want in men:
+        return want
+    allowed = [m for m in (provider.get("models") or []) if m in men]
+    return allowed[0] if allowed else want
+
+
 # The ONE built-in non-Gemini provider (Q2): fixed loopback URL, editable
 # API key, own model list for the model ring. The generic custom-provider
 # kind is deleted — anything stored that is not this entry is discarded.
@@ -176,10 +201,12 @@ def _migrate_ninerouter(stored):
                 or p.get("label") == "9router"):
             if not kept:
                 models = p.get("models")
+                men = p.get("models_enabled")
                 kept = {"label": "9router", "base_url": NINEROUTER_URL,
                         "api_key": p.get("api_key", ""),
                         "model": p.get("model", ""),
-                        "models": list(models) if isinstance(models, list) else []}
+                        "models": list(models) if isinstance(models, list) else [],
+                        "models_enabled": [str(m) for m in men] if isinstance(men, list) else None}
         else:
             print(f"[config] dropping non-9router provider "
                   f"'{p.get('label', '')}' ({url}) — custom kind removed (Q2)")
@@ -268,7 +295,26 @@ class Config:
     studio_providers: tuple = ()
     studio_extract_active: str = ""
     studio_enrich_active: str = ""
+    studio_vision_active: str = ""
+    # Optional Gemini model for the vision stage ("" -> the router ladder).
+    studio_vision_model: str = ""
     studio_proxy: str = ""
+    gemini_enabled_models: tuple | None = None
+    # Stage-1 request windows (Q1/Q10): chars per text chunk, images per call.
+    # pages_per_call is the transport batch (OCR and locate); band_batch is the
+    # figure pass's bands per request.
+    studio_chunk_chars: int = 24000
+    studio_chunk_images: int = 3
+    studio_pages_per_call: int = 3
+    studio_band_batch: int = 6
+    # Vision pages are capped by pixels, not bytes: a sharp 3000 px page is
+    # smaller than the old q20 4968 px one and gives every model more to see.
+    studio_vision_long_edge: int = 3000
+    studio_vision_quality: int = 88
+    # Workstream B: the folder-tree root the DB's folder ids point at, and the
+    # bucket prefix standalone crops are uploaded under (Q8/Q11/Q3).
+    studio_source_root: str = ""
+    studio_crop_prefix: str = "crops"
 
 
 def load_config() -> Config:
@@ -315,12 +361,28 @@ def load_config() -> Config:
     studio_enrich_active = (os.getenv("STUDIO_ENRICH_ACTIVE") or "").strip()
     if studio_enrich_active not in _studio_labels:
         studio_enrich_active = ""
+    studio_vision_active = (os.getenv("STUDIO_VISION_ACTIVE") or "").strip()
+    if studio_vision_active not in _studio_labels:
+        studio_vision_active = ""
+    studio_vision_model = (os.getenv("STUDIO_VISION_MODEL") or "").strip()
     studio_proxy = (os.getenv("STUDIO_PROXY") or "").strip()
     if studio_proxy and studio_proxy not in {p.get("name", "")
                                             for p in _proxy_store["profiles"]}:
         studio_proxy = ""
+    input_root = os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT)
+    source_root = (os.getenv("STUDIO_SOURCE_ROOT") or "").strip() \
+        or os.path.join(input_root, "studio")
+    crop_prefix = (os.getenv("STUDIO_CROP_PREFIX") or "crops").strip().strip("/")
+    pages_per_call = max(1, min(8, int(os.getenv("STUDIO_PAGES_PER_CALL", "3"))))
+    band_batch = max(1, min(12, int(os.getenv("STUDIO_BAND_BATCH", "6"))))
+    vision_edge = max(800, min(5000, int(os.getenv("STUDIO_VISION_LONG_EDGE",
+                                                   "3000"))))
+    vision_quality = max(50, min(95, int(os.getenv("STUDIO_VISION_QUALITY",
+                                                    "88"))))
+    chunk_images = max(1, min(12, int(os.getenv("STUDIO_CHUNK_IMAGES",
+                                                str(pages_per_call)))))
     return Config(
-        input_root=os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT),
+        input_root=input_root,
         min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
         supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
         supabase_key=os.getenv("SUPABASE_SERVICE_KEY", ""),
@@ -335,6 +397,7 @@ def load_config() -> Config:
         gemini_key_pool=_gemini_pool(),
         gemini_key_names=_csv(os.getenv("GEMINI_KEY_NAMES", "")),
         gemini_model_ladder=_model_ladder(),
+        gemini_enabled_models=_enabled_models(),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         # Resolved views: consumers (runner, vision, revision/audit) keep
@@ -344,11 +407,11 @@ def load_config() -> Config:
         router_provider="custom" if rev else "",
         router_base_url=rev.get("base_url", ""),
         router_api_key=rev.get("api_key", ""),
-        router_model=rev.get("model", ""),
+        router_model=_lane_model(rev),
         ocr_provider="gemini" if not ext else "custom",
         ocr_base_url=ext.get("base_url", ""),
         ocr_api_key=ext.get("api_key", ""),
-        ocr_model=ext.get("model", ""),
+        ocr_model=_lane_model(ext),
         extraction_providers=ext_providers,
         extraction_active=ext_active,
         revision_providers=rev_providers,
@@ -356,7 +419,17 @@ def load_config() -> Config:
         studio_providers=studio_providers,
         studio_extract_active=studio_extract_active,
         studio_enrich_active=studio_enrich_active,
+        studio_vision_active=studio_vision_active,
+        studio_vision_model=studio_vision_model,
         studio_proxy=studio_proxy,
+        studio_chunk_chars=int(os.getenv("STUDIO_CHUNK_CHARS", "24000")),
+        studio_chunk_images=chunk_images,
+        studio_pages_per_call=pages_per_call,
+        studio_band_batch=band_batch,
+        studio_vision_long_edge=vision_edge,
+        studio_vision_quality=vision_quality,
+        studio_source_root=source_root,
+        studio_crop_prefix=crop_prefix or "crops",
         proxy_profiles=_proxy_store["profiles"],
         proxy_active=_proxy_store["active"],
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),

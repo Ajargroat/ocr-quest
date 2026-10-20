@@ -59,6 +59,27 @@ def upload_file(cfg: Config, object_name: str, data: bytes, mime_type: str,
               f"(last error: {last['raw'][:200]})")
 
 
+def delete_file(cfg: Config, object_name: str) -> bool:
+    """Remove one bucket object. Missing is not an error; returns True if gone.
+
+    Supabase's bulk-delete endpoint takes a prefix list under the bucket; a
+    404 means there is nothing to delete (a first upload never calls this).
+    """
+    url = f"{cfg.supabase_url}/storage/v1/object/{cfg.supabase_bucket}"
+    headers = {
+        "apikey": cfg.supabase_key,
+        "Authorization": f"Bearer {cfg.supabase_key}",
+        "Content-Type": "application/json",
+    }
+    resp = requests.delete(url, json={"prefixes": [object_name]},
+                           headers=headers, timeout=60)
+    if resp.status_code in (200, 204):
+        return True
+    if resp.status_code == 404:
+        return False
+    resp.raise_for_status()
+    return True
+
 def list_objects(cfg: Config, prefix: str = "", limit: int = 100,
                  offset: int = 0):
     """Read-only listing of one bucket's objects (Supabase Storage list API).

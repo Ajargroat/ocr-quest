@@ -213,6 +213,26 @@ class CallOcrOpenaiTest(unittest.TestCase):
             vision.call_ocr_openai(make_cfg(), "p", "", "image/jpeg")
         self.assertEqual(ctx.exception.fault["kind"], "model_empty")
 
+    def test_multiple_images_become_separate_parts_with_labels(self):
+        seen = {}
+
+        def fake(url, json=None, headers=None, timeout=None, **kwargs):
+            seen["payload"] = json
+            return Resp(200, json_body={
+                "choices": [{"message": {"content": "{}"}}]})
+
+        vision.requests.post = fake
+        vision.call_ocr_openai(make_cfg(), "prompt", ["a", "b"], "image/jpeg",
+                               labels=["BAND p1:", "BAND p2:"])
+        content = seen["payload"]["messages"][0]["content"]
+        self.assertEqual([part["text"] for part in content
+                          if part["type"] == "text"],
+                         ["prompt", "BAND p1:", "BAND p2:"])
+        images = [part for part in content if part["type"] == "image_url"]
+        self.assertEqual(len(images), 2)
+        self.assertIn("base64,a", images[0]["image_url"]["url"])
+        self.assertIn("base64,b", images[1]["image_url"]["url"])
+
 
 class SavedProviderDispatchTest(unittest.TestCase):
     """REPORT item 1: a saved custom provider that is active must

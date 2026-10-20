@@ -3,7 +3,7 @@
 Layout (all under ``<project>/workspace/`` by default, gitignored):
 
     workspace/<job_id>/
-        source.<ext>      the uploaded PDF/image (stored once)
+        source_meta.json  the source's tree path + scanner folder id
         profile.json      Stage 0 result (kind, compilation, static fields)
         layer1.json       Stage 1 raw bulk
         layer2.json       Stage 2 enriched bulk  (the reviewed artifact)
@@ -11,13 +11,19 @@ Layout (all under ``<project>/workspace/`` by default, gitignored):
         crops/            on-demand crop cache
         log.jsonl         append-only, per-stage, cite-able events
 
-Nothing here talks to a database or the network; it is pure file I/O so the
-stage code and the UI can both read the same bytes.
+The uploaded source does not live here: it is streamed once into the folder
+tree (``<INPUT_ROOT>/studio/<job>/`` by default, ``STUDIO_SOURCE_ROOT``
+overrides it) and ``source_meta.json`` records its tree-relative path plus the
+scanner-derived folder id (Q8/Q11). Nothing here talks to a database or the
+network; it is pure file I/O so the stage code and the UI can both read the
+same bytes.
 """
 import json
 import os
 import re
 import time
+
+from pipeline.utils import sha1_hex
 
 # A job id is a short, sortable, filesystem-safe token. It is NOT a secret and
 # NOT a hash of content (re-uploading the same file makes a NEW job on purpose —
@@ -58,6 +64,39 @@ def job_dir(job_id: str, create: bool = False) -> str:
         os.makedirs(path, exist_ok=True)
         os.makedirs(os.path.join(path, "crops"), exist_ok=True)
     return path
+
+
+def job_subdir(job_id: str, name: str, create: bool = False) -> str:
+    """One named subdirectory of a job ('assets', 'pages', 'crops')."""
+    if name not in ("assets", "pages", "crops", "bands"):
+        raise ValueError("unknown job subdirectory: " + str(name))
+    path = os.path.join(job_dir(job_id, create=create), name)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def asset_path(job_id: str, asset_id: str) -> str:
+    """Where one deduped figure asset lives: assets/<sha-id>.jpg."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", str(asset_id or ""))[:64]
+    return os.path.join(job_subdir(job_id, "assets", create=True), safe + ".jpg")
+
+
+def crop_path(job_id: str, key: str) -> str:
+    """Where one block's rendered crop lives (cache; on-demand render)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", str(key or ""))[:80]
+    return os.path.join(job_subdir(job_id, "crops", create=True), safe + ".jpg")
+
+
+def page_image_path(job_id: str, page: int) -> str:
+    """The stored page render of an image-lane source page."""
+    return os.path.join(job_subdir(job_id, "pages", create=True),
+                        "page-%d.jpg" % int(page))
+
+def band_path(job_id: str, key: str) -> str:
+    """Where the figure pass keeps one question band (inspection artifact)."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", str(key or ""))[:80]
+    return os.path.join(job_subdir(job_id, "bands", create=True), safe + ".jpg")
 
 
 def exists(job_id: str) -> bool:
@@ -101,8 +140,49 @@ def write_artifact(job_id: str, name: str, value):
 _SOURCE_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
 
 
+def _source_root() -> str:
+    """The folder-tree root sources live under (STUDIO_SOURCE_ROOT overrides).
+
+    Defaults to ``<INPUT_ROOT>/studio`` — the scanner skips unknown top-level
+    folders (only ``question``/``answer`` are walked), so the tree is inert.
+    """
+    root = (os.getenv("STUDIO_SOURCE_ROOT") or "").strip()
+    if root:
+        return root
+    from pipeline import config as config_mod
+    input_root = os.getenv("INPUT_ROOT") or config_mod.DEFAULT_INPUT_ROOT
+    return os.path.join(input_root, "studio")
+
+
+def source_dir(job_id: str) -> str:
+    """The folder-tree directory one job's source lives in."""
+    if not valid_id(job_id):
+        raise ValueError("invalid job id")
+    return os.path.join(_source_root(), job_id)
+
+
+def folder_id(rel_path: str) -> str:
+    """The scanner's own id derivation, applied to a tree-relative path."""
+    return sha1_hex(rel_path.replace(os.sep, "/"))
+
+
+def _safe_name(name: str) -> str:
+    """A single path segment safe for the source tree (never '..', keeps Persian)."""
+    base = os.path.basename(str(name or "").replace("\\", "/"))
+    safe = re.sub(r"[^\w.\- ]", "-", base, flags=re.UNICODE).strip(" .")
+    return safe[:80] or "source"
+
+
 def source_path(job_id: str):
-    """The stored source file's path, or None when the job has no source yet."""
+    """The source file's path: the tree copy first, the legacy job copy second."""
+    try:
+        meta = read_artifact(job_id, "source_meta", {}) or {}
+    except ValueError:
+        return None
+    rel = meta.get("rel_path")
+    if rel:
+        path = os.path.join(_source_root(), rel.replace("/", os.sep))
+        return path if os.path.isfile(path) else None
     try:
         directory = job_dir(job_id)
     except ValueError:
@@ -122,26 +202,33 @@ def source_name(job_id: str):
 
 
 def save_source(job_id: str, fileobj, filename: str, original_name: str = None):
-    """Stream one uploaded file to ``workspace/<job>/source.<ext>``.
+    """Stream one uploaded file into the folder tree (one copy, no workspace copy).
 
     ``fileobj`` is any binary file-like (an UploadFile's ``.file``); it is
     copied in chunks so a large PDF is never held whole in memory. Returns the
-    stored path. Also records the original name for display.
+    stored path. ``source_meta.json`` records the tree-relative path, the
+    scanner-derived folder id and the original name for display.
     """
-    job_dir(job_id, create=True)
+    job_dir(job_id, create=True)          # artifacts only; the source lives in the tree
     ext = os.path.splitext(filename or "")[1].lower()
     if ext not in _SOURCE_EXTS:
         raise ValueError("unsupported file type: " + (ext or "(none)"))
-    dest = os.path.join(job_dir(job_id), "source" + ext)
+    name = _safe_name(filename)
+    directory = source_dir(job_id)
+    os.makedirs(directory, exist_ok=True)
+    dest = os.path.join(directory, name)
     with open(dest, "wb") as out:
         while True:
             chunk = fileobj.read(1024 * 1024)
             if not chunk:
                 break
             out.write(chunk)
+    rel = os.path.relpath(dest, _source_root()).replace(os.sep, "/")
     write_artifact(job_id, "source_meta", {
         "name": original_name or filename,
-        "stored": os.path.basename(dest),
+        "stored": name,
+        "rel_path": rel,
+        "folder_id": folder_id(rel),
         "size": os.path.getsize(dest),
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     })
@@ -185,7 +272,7 @@ def read_log(job_id: str, limit: int = 200):
 
 # Which artifacts a job "has" is derived from disk, not a stored flag, so the
 # UI can never disagree with reality.
-ARTIFACTS = ("profile", "layer1", "layer2", "review")
+ARTIFACTS = ("profile", "layer1", "layer2", "geometry", "review", "imports")
 
 
 def summary(job_id: str) -> dict:
@@ -197,6 +284,13 @@ def summary(job_id: str) -> dict:
     have = {name: os.path.isfile(os.path.join(directory, name + ".json"))
             for name in ARTIFACTS}
     layer2 = read_artifact(job_id, "layer2", {}) or {}
+    layer1 = layer2 or (read_artifact(job_id, "layer1", {}) or {})
+    blocks = layer1.get("blocks") or []
+    figures = [b for b in blocks if b.get("has_figure")]
+    imports = read_artifact(job_id, "imports", {}) or {}
+    imported = sum(1 for row in (imports.get("results") or {}).values()
+                   if isinstance(row, dict) and row.get("status") == "ok")
+    geometry = read_artifact(job_id, "geometry", {}) or {}
     return {
         "id": job_id,
         "name": meta.get("name") or (os.path.basename(src) if src else job_id),
@@ -205,7 +299,11 @@ def summary(job_id: str) -> dict:
         "subject": (profile.get("static") or {}).get("subject"),
         "has_source": bool(src),
         "artifacts": have,
-        "blocks": len(layer2.get("blocks") or []) if have["layer2"] else None,
+        "blocks": len(blocks) if (have["layer2"] or have["layer1"]) else None,
+        "figures": len(figures) if blocks else None,
+        "geometry": bool(have["geometry"]),
+        "geometry_missing": (geometry.get("stats") or {}).get("missing"),
+        "imported": imported,
         "created_at": meta.get("saved_at"),
         "mtime": os.path.getmtime(directory) if os.path.isdir(directory) else None,
     }

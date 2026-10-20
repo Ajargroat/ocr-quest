@@ -389,7 +389,6 @@ function setRunning(r){
     : 'Start scan — click again mid-run to stop it';
 }
 function handle(ev){
-  if (ev.rev){ revLogLine(ev); return; }   // revision lives in its own timeline
   stageFeed(ev);
   switch (ev.type){
     case 'snapshot':
@@ -402,7 +401,6 @@ function handle(ev){
         else if (e.type === 'file') fileCard(e);
         else if (e.type === 'error') diagLine(e, true);
       });
-      revSeedLogs(ev.rev_log || [], true);
       if (ev.lanes) LANES.states = Object.assign({}, ev.lanes);
       if (ev.running) setRunning(true);
       break;
@@ -640,7 +638,6 @@ function showView(target){
     t.classList.toggle('active', t.dataset.view === target));
   $('viewPipeline').classList.toggle('active', target === 'pipeline');
   $('viewReview').classList.toggle('active', target === 'review');
-  $('viewRevision').classList.toggle('active', target === 'revision');
   $('viewStudio').classList.toggle('active', target === 'studio');
   $('viewDatabase').classList.toggle('active', target === 'database');
   $('viewUsage').classList.toggle('active', target === 'usage');
@@ -654,11 +651,6 @@ function showView(target){
     RState.loaded = true;
     viewLoading('viewReview', true);
     loadReviewMeta().then(loadReviewRows).finally(() => viewLoading('viewReview', false));
-  }
-  if (target === 'revision' && !RevState.loaded){
-    RevState.loaded = true;
-    viewLoading('viewRevision', true);
-    loadRevisionSummary().then(loadRevisionItems).finally(() => viewLoading('viewRevision', false));
   }
   if (target === 'studio' && !StudioState.loaded){
     StudioState.loaded = true;
@@ -692,13 +684,18 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
    so a view can be shared/bookmarked and a headless screenshot can target one. */
 function viewFromHash(){
   const h = (location.hash || '').replace('#', '').split('/')[0];
-  return ['pipeline','review','revision','studio','database','usage','credentials'].includes(h) ? h : null;
+  return ['pipeline','review','studio','database','usage','credentials'].includes(h) ? h : null;
 }
 function panelFromHash(){
   const parts = (location.hash || '').replace('#', '').split('/');
   return parts[0] === 'studio' && parts[1] ? parts[1] : null;
 }
-window.addEventListener('hashchange', () => { const v = viewFromHash(); if (v) showView(v); });
+window.addEventListener('hashchange', () => {
+  const v = viewFromHash(); if (v) showView(v);
+  if (v === 'studio' && window.StudioState && StudioState.loaded){
+    const p = panelFromHash(); if (p) studioPanel(p, true);
+  }
+});
 
 /* one loading treatment for every data-fetching view (item 13) */
 function viewLoading(viewId, on){
@@ -989,6 +986,20 @@ async function loadReviewRows(){
   }
 }
 
+/* The one media_images entry a card shows (first array element). The review
+   payload carries the JSON array; an older cached payload may still carry a
+   JSON string, so both shapes are accepted. */
+function mediaEntry(raw){
+  let list = raw;
+  if (typeof list === 'string'){ try { list = JSON.parse(list); } catch (e) { return null; } }
+  if (!Array.isArray(list) || !list.length) return null;
+  const first = list[0] || {};
+  return first.object ? first : null;
+}
+function mediaUrl(object){
+  return '/api/media?object=' + encodeURIComponent(object || '');
+}
+
 function renderCard(r){
   const card = document.createElement('div');
   const status = r.review_status || 'pending';
@@ -1021,19 +1032,28 @@ function renderCard(r){
     c.textContent = v;
     chips.appendChild(c);
   });
+  /* read-only provenance chips (C3c) - no controls, no coaching text */
+  [['duplicate', 'تکراری', 'fa-copy'],
+   ['unreadable', 'ناخوانا', 'fa-triangle-exclamation'],
+   ['split', 'ادامه‌دار', 'fa-scissors']].forEach(([field, label, icon]) => {
+    const v = r[field];
+    if (v === null || v === undefined || v === false || v === '') return;
+    const c = document.createElement('span');
+    c.className = 'qflag f-' + field;
+    c.innerHTML = fi(icon) + '<span>' + label +
+      (field === 'split' ? ' · ' + dbEsc(String(v)) : '') + '</span>';
+    c.title = field + ': ' + String(v);
+    chips.appendChild(c);
+  });
   card.appendChild(chips);
 
   /* question body (hidden in answers-only mode) */
   if (RState.mode !== 'answers'){
     const qt = document.createElement('div');
     qt.className = 'qtext';
-    // Preserve line breaks from OCR while keeping math renderable
+    // Tables -> real <table>, bare LaTeX -> $$ fences, then MathJax sees them
     const rawText = r.question_text || '';
-    const lines = rawText.split('\n');
-    lines.forEach((line, i) => {
-      if (i > 0) qt.appendChild(document.createElement('br'));
-      qt.appendChild(document.createTextNode(line));
-    });
+    qt.innerHTML = mdHtml(rawText);
     card.appendChild(qt);
 
     const options = parseOptions(r.options);
@@ -1049,19 +1069,22 @@ function renderCard(r){
         lab.textContent = o.label;
         const txt = document.createElement('span');
         txt.className = 'opt-text';
-        txt.textContent = o.text;
+        txt.innerHTML = mdHtml(o.text);
         li.append(lab, txt);
         ul.appendChild(li);
       });
       card.appendChild(ul);
     }
 
-    if ((r.diagram_url || r.diagram_bbox) && r.source_id){
+    const media = mediaEntry(r.media_images);
+    if (media && r.source_id){
       const box = document.createElement('div');
       box.className = 'diag';
+      box.dataset.object = media.object;
       box.dataset.sourceId = r.source_id;
       box.dataset.questionId = r.id;
-      box.dataset.bbox = r.diagram_bbox || '';
+      box.dataset.index = '0';
+      box.dataset.bbox = media.bbox ? JSON.stringify(media.bbox) : '';
       card.appendChild(box);
     }
   }
@@ -1079,11 +1102,7 @@ function renderCard(r){
       if (r.answer_explanation){
         const expl = document.createElement('div');
         expl.className = 'aexpl';
-        const explLines = r.answer_explanation.split('\n');
-        explLines.forEach((line, i) => {
-          if (i > 0) expl.appendChild(document.createElement('br'));
-          expl.appendChild(document.createTextNode(line));
-        });
+        expl.innerHTML = mdHtml(r.answer_explanation);
         ab.appendChild(expl);
       }
     } else {
@@ -1182,8 +1201,18 @@ function mountDiagrams(){
     box.dataset.mounted = '1';
 
     const sourceId = box.dataset.sourceId;
+    const object = box.dataset.object || sourceId;
     const questionId = box.dataset.questionId || '';
     let bbox = parseBbox(box.dataset.bbox);
+    /* A `crops/...` object is already the finished picture, so the box is
+       never re-applied to it: the canvas draws the crop whole. Its editor
+       still works - the backdrop becomes the page the crop came from
+       (/api/qbank/page) and saving re-cuts that page region, re-uploads it
+       over the same object id, and rewrites the stored bbox. Legacy page
+       objects keep the old crop-on-canvas behaviour. */
+    const preCropped = /^crops\//.test(object);
+    const pageUrl = preCropped && questionId
+      ? '/api/qbank/page?question=' + encodeURIComponent(questionId) : '';
 
     /* wrapper: image area + collapsible editor */
     const wrap = document.createElement('div');
@@ -1196,6 +1225,10 @@ function mountDiagrams(){
        editor doesn't jump around — it snaps to the new fit on release. */
     const MAX_W = 560, MAX_H = 460;
     const DPR = window.devicePixelRatio || 1;
+
+    /* the stored picture, and - for a crop - the page it was cut from */
+    const img = new Image();
+    const pageImg = new Image();
 
     const canvas = document.createElement('canvas');
     canvas.style.width = '100%';
@@ -1246,9 +1279,9 @@ function mountDiagrams(){
 
     head.onclick = () => {
       editor.classList.toggle('open');
-      if (editor.classList.contains('open') && mode === 'full'){
-        mode = 'crop';
-        swInput.checked = false;
+      if (editor.classList.contains('open') && mode !== 'full'){
+        /* a box is only meaningful over the whole page */
+        setMode('full');
         draw(true);
       }
     };
@@ -1317,15 +1350,21 @@ function mountDiagrams(){
     }
 
     let mode = 'crop';
-    let imgLoaded = false;
+    let imgLoaded = false, pageLoaded = false, pageFailed = false;
+
+    /* full view = the page itself when the stored object is already a crop */
+    function activeImg(){
+      return (mode === 'full' && preCropped) ? pageImg : img;
+    }
 
     function draw(fit){
-      if (!imgLoaded) return;
-      const nw = img.naturalWidth, nh = img.naturalHeight;
+      const im = activeImg();
+      if (!im || !im.naturalWidth) return;
+      const nw = im.naturalWidth, nh = im.naturalHeight;
       const cur = vals();
       let src;
 
-      if (mode === 'crop'){
+      if (mode === 'crop' && !preCropped){
         src = bboxToPixels(cur, nw, nh);
         if (src.w < 2 || src.h < 2) src = { x:0, y:0, w:nw, h:nh };
       } else {
@@ -1344,7 +1383,7 @@ function mountDiagrams(){
       const scale = Math.min(W / src.w, H / src.h);
       const dw = src.w * scale, dh = src.h * scale;
       const ox = (W - dw) / 2, oy = (H - dh) / 2;
-      ctx.drawImage(img, src.x, src.y, src.w, src.h, ox, oy, dw, dh);
+      ctx.drawImage(im, src.x, src.y, src.w, src.h, ox, oy, dw, dh);
 
       if (mode === 'full'){
         /* saved bbox — solid red */
@@ -1367,9 +1406,15 @@ function mountDiagrams(){
       }
     }
 
+    function setMode(next){
+      mode = next;
+      swInput.checked = next === 'full';
+      cap.textContent = next === 'full' ? 'نمایش برش‌خورده' : 'نمایش بیشتر';
+      if (next === 'full') ensurePage();
+    }
+
     swInput.onchange = () => {
-      mode = swInput.checked ? 'full' : 'crop';
-      cap.textContent = swInput.checked ? 'نمایش برش‌خورده' : 'نمایش بیشتر';
+      setMode(swInput.checked ? 'full' : 'crop');
       draw(true);
     };
     resetBtn.onclick = () => { initVals(); draw(true); };
@@ -1383,15 +1428,19 @@ function mountDiagrams(){
       saveBtn.disabled = true;
       saveBtn.textContent = 'در حال ذخیره…';
       try{
-        const res = await fetch('/api/review/bbox', {
+        const res = await fetch(
+          preCropped ? '/api/qbank/recrop' : '/api/review/bbox', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({id: questionId, bbox: cur})
+          body: JSON.stringify({id: questionId, bbox: cur,
+                               index: Number(box.dataset.index || 0)})
         });
         const j = await res.json();
         if (!j.ok) throw new Error(j.error || '');
         bbox = cur.slice();
         box.dataset.bbox = JSON.stringify(bbox);
+        /* the crop was replaced under its own object id: refetch it */
+        if (preCropped && j.url) img.src = j.url;
         saveBtn.textContent = '✓ ذخیره شد';
         toast('برش تصویر ذخیره شد ✓');
         draw(true);
@@ -1407,7 +1456,11 @@ function mountDiagrams(){
       }
     };
 
-    const img = new Image();
+    function ensurePage(){
+      if (!pageUrl || pageLoaded || pageFailed) return;
+      if (!pageImg.src) pageImg.src = pageUrl;
+    }
+
     img.onload = () => {
       imgLoaded = true;
       initVals();
@@ -1418,7 +1471,22 @@ function mountDiagrams(){
       box.textContent = 'تصویر بارگذاری نشد';
       editor.style.display = 'none';
     };
-    img.src = '/api/proxy/image/' + encodeURIComponent(sourceId);
+    img.src = mediaUrl(object);
+
+    /* the page a crop was cut from - fetched only when the box is edited */
+    pageImg.onload = () => {
+      pageLoaded = true;
+      if (mode === 'full') draw(true);
+    };
+    pageImg.onerror = () => {
+      pageFailed = true;
+      setMode('crop');
+      viewSw.style.display = 'none';
+      editor.classList.remove('open');
+      editor.style.display = 'none';
+      toast('تصویر بارگذاری نشد');
+      draw(true);
+    };
 
     /* keep the fitted size honest when the window/container changes */
     const refit = () => {
@@ -1560,583 +1628,6 @@ createDropdown('rvCorp', 'نشر', true);
 createDropdown('rvDifficulty', 'سطح', true);
 initFilterUI();
 
-/* ═══════════ REVISION (three-stage audit console) ═══════════ */
-const RevState = { view:'flagged', entity:'question', loaded:false, polling:null, items:[], selected:null,
-                   repFilter:'all', running:false, stopping:false, ours:false, lastSeq:0 };
-
-const REV_STATUS_FA  = { pending:'در انتظار', revised:'بازبینی‌شده', needs_human:'نیازمند بررسی انسانی', approved:'تأیید نهایی' };
-const REV_STATUS_CLS = { pending:'pending', revised:'revised', needs_human:'rejected', approved:'approved' };
-const REV_ISSUE_FA = {
-  'null_required_column': 'ستون اجباری خالی است',
-  'qa_unmatched_answer': 'پاسخی برای این سؤال جفت نشد',
-  'qa_unmatched_question': 'سؤالی برای این پاسخ پیدا نشد',
-  'qa_ambiguous_pair': 'جفت‌سازی مبهم — بیش از یک نامزد',
-  'linked to matched question': 'اتصال قطعی پاسخ به سؤال',
-  'ai_no_verdict': 'AI پاسخی برای این ردیف نداد',
-  'derived from explanation review section': 'برچسب گزینه از بخش «بررسی سایر گزینه‌ها» استخراج شد',
-  'ai corrected option label from explanation': 'AI برچسب گزینه را از پاسخ تشریحی اصلاح کرد',
-  'filled from options by label': 'متن گزینه از روی برچسب در لیست گزینه‌ها پر شد',
-  'filled from options by text': 'برچسب گزینه از روی متن در لیست گزینه‌ها پر شد',
-  'text normalized + LaTeX sanitized + digit policy': 'یکسان‌سازی متن + پالایش LaTeX + قانون اعداد',
-  'Persian digits converted to English': 'اعداد فارسی سال به لاتین تبدیل شد',
-  'options normalized/rebuilt + LaTeX sanitized': 'لیست گزینه‌ها بازسازی و پالایش شد',
-  'tags rebuilt from metadata': 'برچسب‌ها از فراداده بازسازی شد',
-  'filled from source storage url': 'نشانی شکل از منبع پر شد',
-};
-function revIssueText(rep){
-  const i = String(rep.issue || '');
-  if (REV_ISSUE_FA[i]) return REV_ISSUE_FA[i];
-  if (i.startsWith('filled from paired ')) return 'از ' + (i.includes('answer') ? 'پاسخ' : 'سؤال') + 'ِ جفت‌شده پر شد';
-  if (i.startsWith('qa_label_mismatch')) return 'برچسب گزینه با «بررسی سایر گزینه‌ها» در تضاد است';
-  if (i.startsWith('ai suggested unknown label')) return 'AI برچسب گزینه‌ای پیشنهاد داد که در لیست نیست';
-  return i;
-}
-
-function revEl(cls, text){ const d = document.createElement('div'); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
-function revSpan(cls, text){ const s = document.createElement('span'); if (cls) s.className = cls; if (text != null) s.textContent = text; return s; }
-function revChip(st){
-  const s = st || 'pending';
-  const chip = revSpan('status-chip sc-' + (REV_STATUS_CLS[s] || 'pending'), REV_STATUS_FA[s] || s);
-  return chip;
-}
-function revLinkChip(kind, text){ return revSpan('rev-link' + (kind ? ' ' + kind : ''), text); }
-function revTextBlock(cls, txt){
-  const d = revEl(cls);
-  String(txt || '').split('\n').forEach((ln,i)=>{
-    if (i>0) d.appendChild(document.createElement('br'));
-    d.appendChild(document.createTextNode(ln));
-  });
-  return d;
-}
-function revMetaChips(it){
-  const row = revEl('rev-chiprow');
-  [[ 'موضوع', it.subject && subjectFa(it.subject)], ['فصل', it.topic && chapterFa(it.topic)],
-   ['پایه', it.grade != null && it.grade !== '' ? faDigits(it.grade) : null],
-   ['ناشر', it.corp], ['سال', it.year && faDigits(it.year)], ['سطح', it.difficulty]]
-    .forEach(([k,v]) => { if (v) row.appendChild(revSpan('rev-metachip', k + ': ' + v)); });
-  return row;
-}
-
-/* ── summary stat cards + stage counters ── */
-async function loadRevisionSummary(){
-  try{
-    const m = await (await fetch('/api/revision/summary')).json();
-    renderRevStats(m);
-    const c = m.counts || {};
-    $('revCounts').textContent =
-      'سؤال — نیازمند بررسی: ' + faDigits(c.needs_human || 0) +
-      ' · بازبینی‌شده: ' + faDigits(c.revised || 0) +
-      ' · در انتظار: ' + faDigits(c.pending || 0);
-  }catch(e){}
-}
-
-function revStatCard(title, total, c, nr){
-  const w = n => c && total ? (n/total*100) + '%' : '0%';
-  const card = revEl('rev-stat-card');
-  card.innerHTML =
-    `<div class="rev-stat-head"><b>${title}</b><span>${faDigits(total||0)} مورد</span></div>` +
-    `<div class="rev-segbar">` +
-      `<span class="s-h" style="width:${w(c.needs_human||0)}"></span>` +
-      `<span class="s-r" style="width:${w(c.revised||0)}"></span>` +
-      `<span class="s-a" style="width:${w(c.approved||0)}"></span>` +
-      `<span class="s-p" style="width:${w(c.pending||0)}"></span>` +
-    `</div>` +
-    `<div class="rev-legend">` +
-      `<span><i style="background:var(--red)"></i>نیازمند بررسی ${faDigits(c.needs_human||0)}</span>` +
-      `<span><i style="background:linear-gradient(90deg,var(--violet),var(--cyan))"></i>بازبینی ${faDigits(c.revised||0)}</span>` +
-      `<span><i style="background:var(--green)"></i>تأیید ${faDigits(c.approved||0)}</span>` +
-      `<span><i style="background:#565b70"></i>در انتظار ${faDigits(c.pending||0)}</span>` +
-      (nr ? `<span style="color:var(--amber)">⚠ ${faDigits(nr)} نیازمند دید انسانی</span>` : '') +
-    `</div>`;
-  return card;
-}
-
-function renderRevStats(m){
-  const box = $('revStats');
-  if (!box) return;
-  box.innerHTML = '';
-  const q = m.counts || {}, a = m.answer_counts || {};
-  const sum = c => (c.pending||0)+(c.revised||0)+(c.needs_human||0)+(c.approved||0);
-  box.appendChild(revStatCard('سؤال‌ها', sum(q), q, m.needs_review));
-  box.appendChild(revStatCard('پاسخ‌ها', sum(a), a, m.answer_needs_review));
-  fetch('/api/revision/state').then(r=>r.json()).then(st=>{
-    revApplyState(st);
-    const s = st.last_summary;
-    if (!s) return;
-    const card = revEl('rev-stat-card');
-    card.innerHTML =
-      `<div class="rev-stat-head"><b>آخرین اسکن</b><span>${faDigits((s.questions_scanned||0)+(s.answers_scanned||0))} بررسی‌شده</span></div>` +
-      `<div class="rev-legend" style="margin-top:8px">` +
-        `<span><i style="background:var(--green)"></i>پیوند ساخته‌شده ${faDigits(s.links||0)}</span>` +
-        `<span><i style="background:var(--cyan)"></i>تکمیل قطعی ${faDigits(s.backfills||0)}</span>` +
-        `<span><i style="background:var(--red)"></i>ستون خالی ${faDigits(s.null_reports||0)}</span>` +
-        `<span><i style="background:var(--amber)"></i>تعارض ${faDigits(s.conflicts||0)}</span>` +
-        `<span><i style="background:#a5b4fc"></i>پرچم AI ${faDigits(s.ai_flags||0)}</span>` +
-      `</div>`;
-    box.appendChild(card);
-  }).catch(()=>{});
-}
-
-/* ── the revision stage rail · same visual language as the pipeline's ── */
-const RAILREV = { box:null, stages:[], wires:[] };
-function revRailInit(){
-  RAILREV.box = $('revStages'); if (!RAILREV.box) return;
-  RAILREV.stages = [...RAILREV.box.querySelectorAll('.stage')];
-  RAILREV.wires  = [...RAILREV.box.querySelectorAll('.wire')];
-}
-function revBubble(id, v){
-  const el = $(id); if (!el) return;
-  const n = Number(v || 0);
-  const stg = el.closest ? el.closest('.stage') : null;
-  if (stg) stg.classList.toggle('counting', n > 0);
-  el.textContent = n ? String(n) : '';
-}
-const REV_STAGE_EN = { completeness:'Completeness', pairing:'Pairing & Fill', ai:'AI Audit' };
-function revRail(st){
-  if (!RAILREV.box) revRailInit();
-  const running = !!(st && st.running);
-  const pr = st && st.progress;
-  const s = (pr && pr.summary) || (st && st.last_summary) || {};
-  revBubble('revStageNull', s.null_reports);
-  revBubble('revStagePair', (s.links || 0) + (s.backfills || 0));
-  revBubble('revStageAi', s.ai_flags);
-  const ORDER = ['completeness', 'pairing', 'ai'];
-  const cur = running ? Math.max(0, ORDER.indexOf((pr && pr.stage) || 'completeness')) : -1;
-  RAILREV.stages.forEach((el, i) => {
-    el.classList.remove('active', 'warm', 'passed', 'err');
-    if (running){
-      if (i < cur) el.classList.add('warm');
-      else if (i === cur) el.classList.add('active');
-    } else if (st && st.last_summary) el.classList.add(st.last_summary.stopped ? 'warm' : 'passed');
-  });
-  RAILREV.wires.forEach((w, i) => {
-    w.classList.remove('live', 'warm');
-    if (running && cur === i + 1) w.classList.add('live');
-    else if ((running && cur > i + 1) || (!running && st && st.last_summary && !st.last_summary.stopped)) w.classList.add('warm');
-  });
-  RAILREV.box.classList.toggle('live', running);
-  const now = $('revNow'); if (!now) return;
-  const name = $('revNowName'), det = $('revNowDetail');
-  if (running && pr){
-    now.dataset.state = 'live';
-    name.textContent = REV_STAGE_EN[pr.stage] || REV_STAGE_EN.completeness;
-    const pct = pr.chunks_total ? Math.max(3, Math.round(pr.chunk / pr.chunks_total * 100)) : 3;
-    det.textContent = (pr.part > 1 ? 'answers pass' : 'questions pass')
-      + ' — chunk ' + pr.chunk + ' of ' + pr.chunks_total
-      + ' (' + pct + '%)' + (st.stop_requested ? ' · stopping…' : '');
-  } else if (st && st.last_summary){
-    const ls = st.last_summary;
-    if (ls.stopped){ now.dataset.state = 'stopped'; name.textContent = 'stopped'; }
-    else if (ls.errors > 0){ now.dataset.state = 'err'; name.textContent = 'done with errors'; }
-    else { now.dataset.state = 'done'; name.textContent = 'ready'; }
-    det.textContent = 'last scan: ' + ((ls.questions_scanned || 0) + (ls.answers_scanned || 0))
-      + ' reviewed · ' + (ls.links || 0) + ' linked · ' + (ls.revised || 0)
-      + ' revised · ' + (ls.needs_human || 0) + ' need review';
-  } else {
-    now.dataset.state = 'idle'; name.textContent = 'idle';
-    det.textContent = '';
-  }
-}
-
-/* ── revision live log · its own box, never mixed with the pipeline's ── */
-function revLogLine(ev, replay){
-  const box = $('revLog'); if (!box) return;
-  if (ev.seq != null){
-    if (!replay && ev.seq <= RevState.lastSeq) return;
-    if (ev.seq > RevState.lastSeq) RevState.lastSeq = ev.seq;
-  }
-  const ph = box.querySelector('.empty'); if (ph) ph.remove();
-  const line = document.createElement('div');
-  line.className = 'line lv-' + (ev.level || 'info');
-  line.innerHTML = '<span class="t"></span><span class="m"></span>';
-  line.querySelector('.t').textContent = ev.ts || '';
-  line.querySelector('.m').textContent = String(ev.message || '').replace(/^\[Revision\]\s*/, '');
-  box.appendChild(line);
-  while (box.children.length > 300) box.removeChild(box.firstChild);
-  box.scrollTop = box.scrollHeight;
-  const c = $('revLogCount');
-  if (c) c.textContent = box.querySelectorAll('.line').length + ' events';
-}
-function revSeedLogs(list, rebuild){
-  const box = $('revLog');
-  if (!box || !list || !list.length) return;
-  if (rebuild){
-    box.innerHTML = '';
-    RevState.lastSeq = 0;
-    list.forEach(e => revLogLine(e, true));
-  } else {
-    list.forEach(e => revLogLine(e, false));
-  }
-}
-$('revLogClearBtn').onclick = () => {
-  const box = $('revLog');
-  if (!box.querySelector('.line')){ toast('لاگ اسکن همین حالا خالی است'); return; }
-  box.innerHTML = '<div class="empty">لاگ پاک شد — رویدادهای تازه همین‌جا سرازیر می‌شوند.</div>';
-  $('revLogCount').textContent = '';
-};
-
-/* ── item list ── */
-async function loadRevisionItems(){
-  const list = $('revList');
-  list.innerHTML = '<div class="rev-empty">در حال بارگذاری…</div>';
-  try{
-    const url = '/api/revision/items?view=' + RevState.view + '&entity=' + RevState.entity;
-    const data = await (await fetch(url)).json();
-    RevState.items = data.items || [];
-    list.innerHTML = '';
-    if (!RevState.items.length){
-      list.innerHTML = '<div class="rev-empty">موردی یافت نشد</div>';
-      $('revDetail').innerHTML = '<div class="rev-empty">موردی برای نمایش وجود ندارد</div>';
-      RevState.selected = null;
-      return;
-    }
-    list.appendChild(revEl('rev-list-head', faDigits(RevState.items.length) + ' ' + (RevState.entity==='answer' ? 'پاسخ' : 'سؤال')));
-    RevState.items.forEach(it => list.appendChild(renderRevListItem(it)));
-    selectRevItem(RevState.items[0].id);
-  }catch(e){
-    list.innerHTML = '<div class="rev-empty" style="color:var(--red)">خطا در دریافت داده‌ها</div>';
-  }
-}
-
-function revSeverityStats(it){
-  const reps = it.reports || [];
-  return {
-    err:  reps.filter(r=>r.severity==='error').length,
-    warn: reps.filter(r=>r.severity==='warn').length
-  };
-}
-
-function renderRevListItem(it){
-  const isA = RevState.entity === 'answer';
-  const s = revSeverityStats(it);
-  const row = revEl('rev-row');
-  row.dataset.id = it.id;
-
-  const top = revEl('rev-row-top');
-  const title = revEl('rev-row-title');
-  title.appendChild(document.createTextNode((isA ? 'پاسخ ' : 'سؤال ') + faDigits(it.question_number ?? '—')));
-  title.appendChild(isA
-    ? revLinkChip(it.question_id ? 'ok' : 'bad', it.question_id ? 'متصل' : 'بی‌سؤال')
-    : revLinkChip(it.answer_id ? 'ok' : '',    it.answer_id ? 'جفت‌شده' : 'بی‌پاسخ'));
-  const badges = revEl('rev-row-badges');
-  if (s.err)  badges.appendChild(revSpan('rev-count-badge e', faDigits(s.err)));
-  if (s.warn) badges.appendChild(revSpan('rev-count-badge w', faDigits(s.warn)));
-  badges.appendChild(revSpan('sev-dot ' + (s.err ? 'e' : (s.warn ? 'w' : 'i'))));
-  top.append(title, badges);
-
-  const meta = revEl('rev-row-meta');
-  const parts = [it.subject && subjectFa(it.subject), it.topic && chapterFa(it.topic), it.difficulty];
-  if (isA && it.correct_option_label) parts.push('گزینه ' + faDigits(it.correct_option_label));
-  meta.textContent = parts.filter(Boolean).join(' · ');
-
-  row.append(top, meta);
-  row.addEventListener('click', () => selectRevItem(it.id));
-  return row;
-}
-
-function selectRevItem(id){
-  RevState.selected = id;
-  document.querySelectorAll('.rev-row').forEach(r => r.classList.toggle('active', r.dataset.id === id));
-  const it = RevState.items.find(x => x.id === id);
-  if (it) renderRevDetail(it);
-}
-
-/* ── detail pane: question ⇄ answer pair ── */
-function revOptionList(it, correctLabel){
-  const opts = parseOptions(it.options);
-  if (!opts.length) return null;
-  const ul = document.createElement('ul'); ul.className = 'opts';
-  opts.forEach(o=>{
-    const li = document.createElement('li');
-    if (correctLabel && String(o.label) === String(correctLabel)) li.classList.add('correct');
-    const lab = revSpan('opt-label', o.label);
-    const txt = revSpan('opt-text', o.text);
-    li.append(lab, txt); ul.appendChild(li);
-  });
-  return ul;
-}
-
-function revNoAnswerBox(msg){
-  return revEl('answer-box no-answer', msg || 'پاسخی جفت نشده است.');
-}
-
-function renderRevDetail(it){
-  const pane = $('revDetail');
-  pane.innerHTML = '';
-  const isA = RevState.entity === 'answer';
-
-  // header
-  const head = revEl('rev-detail-head');
-  const left = document.createElement('div');
-  const title = revEl('rev-detail-title', (isA ? 'پاسخ ' : 'سؤال ') + faDigits(it.question_number ?? '—'));
-  const sub = revEl('rev-detail-sub');
-  sub.textContent = [ it.grade != null && it.grade !== '' ? ('پایه ' + faDigits(it.grade)) : null,
-                      it.corp, it.year && faDigits(it.year),
-                      it.revised_at ? ('بازبینی: ' + faDate(it.revised_at)) : null ]
-                      .filter(Boolean).join(' · ');
-  left.append(title, sub);
-  const side = revEl('rev-detail-side');
-  side.appendChild(revChip(it.revision_status));
-  const notes = it.revision_notes || {};
-  if (notes.ai_confidence != null){
-    side.appendChild(revEl('rev-conf', 'اطمینان مدل: ' + faDigits(Math.round(Number(notes.ai_confidence)*100)) + '٪'));
-  }
-  head.append(left, side);
-  pane.appendChild(head);
-  pane.appendChild(revMetaChips(it));
-
-  // paired question/answer grid
-  const grid = revEl('rev-pair-grid');
-  const qc = revEl('rev-pair-col q-col');
-  const qtag = revEl('rev-pair-tag');
-  qtag.appendChild(revSpan('t-q', 'متن سؤال'));
-  const correctLabel = isA ? (it.correct_option_label || it.q_correct_option_label) : (it.correct_option_label || it.answer_correct_option_label);
-  if (correctLabel) qtag.appendChild(revSpan('rev-metachip', 'گزینه صحیح: ' + faDigits(correctLabel)));
-  qc.appendChild(qtag);
-  if (it.question_text) qc.appendChild(revTextBlock('rev-qtext', it.question_text));
-  else qc.appendChild(revEl('answer-box no-answer', 'متن سؤال خالی است (ستون اجباری).'));
-  const ol = revOptionList(it, correctLabel);
-  if (ol) qc.appendChild(ol);
-
-  const ac = revEl('rev-pair-col a-col');
-  const atag = revEl('rev-pair-tag');
-  atag.appendChild(revSpan('t-a', 'پاسخ تشریحی'));
-  if (isA){
-    atag.appendChild(revChip(it.revision_status));
-  } else if (it.answer_id){
-    atag.appendChild(revChip(it.answer_revision_status));
-  }
-  ac.appendChild(atag);
-  if (isA ? !!it.answer_explanation : !!it.answer_id){
-    ac.appendChild(revTextBlock('aexpl', it.answer_explanation || ''));
-    if (isA && it.correct_option_label){
-      ac.appendChild(revEl('rev-conf', 'برچسب گزینه: ' + faDigits(it.correct_option_label)));
-    }
-  } else {
-    ac.appendChild(revNoAnswerBox(isA ? 'متن پاسخ تشریحی خالی است (ستون اجباری).'
-                                      : 'پاسخی به این سؤال جفت نشده — جفت‌سازی بر پایهٔ شماره/درس/پایه/فصل نتیجه نداد.'));
-  }
-
-  if (isA) grid.append(ac, qc);
-  else grid.append(qc, ac);
-  pane.appendChild(grid);
-
-  // audit findings (filterable)
-  const reps = it.reports || [];
-  pane.appendChild(revEl('rev-section-label', 'یافته‌های ممیزی (' + faDigits(reps.length) + ')'));
-  const fbox = revEl('rev-repf');
-  [['all','همه'],['error','خطا'],['warn','هشدار'],['fix','اصلاحات کد'],['ai','AI']].forEach(([k,label])=>{
-    const b = document.createElement('button');
-    b.textContent = label;
-    if (RevState.repFilter === k) b.classList.add('on');
-    b.onclick = () => { RevState.repFilter = k; renderRevDetail(it); };
-    fbox.appendChild(b);
-  });
-  pane.appendChild(fbox);
-
-  const order = { error:0, warn:1, info:2 };
-  const shown = reps
-    .filter(r => RevState.repFilter === 'all' ? true
-                : RevState.repFilter === 'error' ? r.severity === 'error'
-                : RevState.repFilter === 'warn' ? r.severity === 'warn'
-                : RevState.repFilter === 'fix' ? (r.source === 'code' && r.severity === 'info')
-                : r.source === 'ai')
-    .sort((a,b)=>(order[a.severity]??3)-(order[b.severity]??3));
-  if (!shown.length){
-    const none = revEl('rev-report sev-info');
-    const msg = revEl('rev-issue', reps.length ? 'موردی در این فیلتر نیست.' : 'هیچ ایرادی ثبت نشده است.');
-    msg.style.direction = 'rtl'; msg.style.textAlign = 'right'; msg.style.fontFamily = 'Vazirmatn';
-    none.appendChild(msg); pane.appendChild(none);
-  } else {
-    shown.forEach(rep => pane.appendChild(renderRevReport(rep)));
-  }
-
-  // per-entity actions
-  const foot = revEl('rev-actions');
-  function actRow(label, entityId, entityKind){
-    const r = revEl('rev-action-row');
-    const b = document.createElement('b'); b.textContent = label;
-    const ok = document.createElement('button');
-    ok.className = 'act approve'; ok.type = 'button';
-    ok.title = 'تأیید و بستن — ' + label;
-    ok.innerHTML = fi('circle-check');
-    ok.onclick = () => resolveRevision(entityId, 'approve', entityKind);
-    const again = document.createElement('button');
-    again.className = 'act reopen'; again.type = 'button';
-    again.title = 'بررسی مجدد — بازگشت به صف اسکن';
-    again.innerHTML = fi('rotate-left');
-    again.onclick = () => resolveRevision(entityId, 'reopen', entityKind);
-    r.append(b, ok, again);
-    return r;
-  }
-  if (!isA){
-    foot.appendChild(actRow('سؤال', it.id, 'question'));
-    if (it.answer_id) foot.appendChild(actRow('پاسخ', it.answer_id, 'answer'));
-  } else {
-    foot.appendChild(actRow('پاسخ', it.id, 'answer'));
-  }
-  pane.appendChild(foot);
-
-  typesetMath(pane);
-}
-
-function renderRevReport(rep){
-  const box = revEl('rev-report sev-' + (rep.severity || 'info'));
-
-  const head = revEl('rev-report-head');
-  const sev = revSpan('rev-sev ' + (rep.severity==='error' ? 'error' : (rep.severity==='warn' ? 'warn' : 'info')),
-                       rep.severity==='error' ? 'خطا' : (rep.severity==='warn' ? 'هشدار' : 'اصلاح'));
-  head.appendChild(sev);
-  if (rep.entity){
-    head.appendChild(revSpan('rev-ent' + (rep.entity==='question' ? ' q' : ''),
-                             rep.entity==='question' ? 'سؤال' : 'پاسخ'));
-  }
-  if (rep.field){
-    head.appendChild(revSpan('rev-field', rep.field));
-  }
-  head.appendChild(revSpan('rev-src', rep.source==='ai' ? 'AI' : 'کد'));
-  box.appendChild(head);
-
-  const issue = revEl('rev-issue');
-  const txt = revIssueText(rep);
-  if (/[\u0600-\u06FF]/.test(txt)){
-    issue.style.direction = 'rtl'; issue.style.textAlign = 'right'; issue.style.fontFamily = 'Vazirmatn';
-  }
-  issue.textContent = txt;
-  box.appendChild(issue);
-
-  if (rep.before_value || rep.after_value){
-    const diff = revEl('rev-diff');
-    if (rep.before_value){
-      diff.appendChild(revSpan('before', 'قبل: ' + rep.before_value));
-    }
-    if (rep.before_value && rep.after_value){
-      diff.appendChild(revSpan('arrow', '←'));
-    }
-    if (rep.after_value){
-      diff.appendChild(revSpan('after', 'بعد: ' + rep.after_value));
-    }
-    box.appendChild(diff);
-  }
-  return box;
-}
-
-async function resolveRevision(id, action, entity){
-  try{
-    const res = await fetch('/api/revision/resolve', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({id, action, entity: entity || 'question'})
-    });
-    const j = await res.json();
-    if (!j.ok) throw new Error();
-    toast(action==='approve' ? 'تأیید شد ✓' : 'برای بازبینی مجدد به صف بازگشت');
-    loadRevisionSummary();
-    loadRevisionItems();
-  }catch(e){ toast('خطا در ذخیرهٔ وضعیت'); }
-}
-
-/* ── run / stop · the scan is interruptible after every chunk ── */
-function revRunBtnState(){
-  const b = $('revRunBtn'); if (!b) return;
-  b.classList.toggle('running', RevState.running);
-  b.classList.toggle('stopping', RevState.running && RevState.stopping);
-  b.innerHTML = RevState.running
-    ? fi('stop') + '<span>Stop</span>'
-    : fi('power-off') + '<span>Run</span>';
-  b.title = RevState.running
-    ? (RevState.stopping ? 'Stopping — the current chunk finishes first…'
-                          : 'Stop scan — after the current chunk; unreviewed AI rows stay queued')
-    : 'Start scan — three stages over 50-row chunks';
-}
-function revApplyState(st){
-  const was = RevState.running;
-  RevState.running = !!st.running;
-  RevState.stopping = RevState.running && !!st.stop_requested;
-  revRail(st);
-  revSeedLogs(st.logs, false);
-  revRunBtnState();
-  const pr = st.progress;
-  if (RevState.running && pr){
-    $('revProgress').hidden = false;
-    const pct = pr.chunks_total ? Math.max(3, Math.round(pr.chunk / pr.chunks_total * 100)) : 3;
-    $('revProgressFill').style.width = pct + '%';
-    $('revProgressLabel').textContent = (pr.part > 1 ? 'روبش پاسخ‌ها' : 'اسکن سؤال‌ها')
-      + ' — چکب ' + faDigits(pr.chunk) + ' از ' + faDigits(pr.chunks_total) + ' (' + faDigits(pct) + '٪)';
-  } else if (!RevState.running){
-    $('revProgress').hidden = true;
-  }
-  if (was && !RevState.running){
-    // a run just ended (naturally, or on request) — refresh everything once
-    if (RevState.polling){ clearInterval(RevState.polling); RevState.polling = null; }
-    RevState.ours = false;
-    loadRevisionSummary();
-    if (RevState.loaded) loadRevisionItems();
-    const s = st.last_summary;
-    if (s){
-      if (s.stopped)
-        toast('اسکن متوقف شد — ' + faDigits(s.links || 0) + ' پیوند و ' +
-              faDigits(s.revised || 0) + ' بازبینی تا این لحظه؛ بقیه در صف بعدی', 4600);
-      else
-        toast('اسکن تمام شد — ' + faDigits(s.revised || 0) + ' بازبینی، ' +
-              faDigits(s.needs_human || 0) + ' نیازمند بررسی، ' +
-              faDigits(s.links || 0) + ' پیوند ساخته‌شده', 4200);
-    }
-  }
-}
-function revPollOnce(){
-  return fetch('/api/revision/state').then(r => r.json()).then(revApplyState).catch(() => {});
-}
-$('revRunBtn').onclick = async () => {
-  if (RevState.running){
-    if (RevState.stopping) return;                 // already asked to halt
-    RevState.stopping = true; revRunBtnState();
-    try{
-      const j = await (await fetch('/api/revision/stop', {method:'POST'})).json();
-      if (!j.stopping) RevState.stopping = false;
-      else toast('توقف درخواست شد — چکب جاری کامل می‌شود، سپس اسکن می‌ایستد.', 4600);
-    }catch(e){ RevState.stopping = false; }
-    revRunBtnState();
-    return;
-  }
-  $('revProgress').hidden = false;
-  $('revProgressFill').style.width = '2%';
-  $('revProgressLabel').textContent = 'آماده‌سازی اسکن…';
-  try{
-    const j = await (await fetch('/api/revision/run', {method:'POST'})).json();
-    if (!j.started){ toast('یک اسکن همین حالا در حال اجراست'); }
-    else RevState.ours = true;
-  }catch(e){ RevState.ours = true; }
-  RevState.running = true; RevState.stopping = false;
-  revRunBtnState();
-  if (RevState.polling) clearInterval(RevState.polling);
-  RevState.polling = setInterval(revPollOnce, 1500);
-};
-
-$('revRefresh').onclick = () => { revPollOnce(); loadRevisionSummary().then(loadRevisionItems); };
-document.querySelectorAll('#revView button').forEach(b => {
-  b.onclick = () => {
-    document.querySelectorAll('#revView button').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active');
-    RevState.view = b.dataset.rview;
-    loadRevisionItems();
-  };
-});
-document.querySelectorAll('#revEntity button').forEach(b => {
-  b.onclick = () => {
-    document.querySelectorAll('#revEntity button').forEach(x=>x.classList.remove('active'));
-    b.classList.add('active');
-    RevState.entity = b.dataset.rentity;
-    loadRevisionItems();
-  };
-});
-
-/* restore a mid-run scan after a page reload: rail, log replay and polling */
-revRailInit();
-revPollOnce().then(() => {
-  if (RevState.running && !RevState.polling) RevState.polling = setInterval(revPollOnce, 1500);
-});
-
-
 /* ════════════ network-mesh background ════════════ */
 (function meshBackground(){
   const cvs = document.getElementById('meshBg');
@@ -2213,8 +1704,8 @@ revPollOnce().then(() => {
 /* ═══════════ CREDENTIALS · Gemini key pool & routing ═══════════ */
 const CRED_KEEP = '__KEEP__';
 const CRED_CLEAR = '__CLEAR__';
-const CredState = { loaded:false, rows:[], ladder:[], events:[], supaKeySet:false,
-                    gateway:null, usageCap:20, dragIdx:null,
+const CredState = { loaded:false, rows:[], ladder:[], modelEnabled:null, events:[], supaKeySet:false,
+                    gateway:null, usageCap:20, modelLimits:{}, dragIdx:null,
                     extraction:{ engine:'gemini', active:'', providers:[] },
                     revision:{ active:'', providers:[] },
                     providerOk:null, dirty:false, busy:false,
@@ -2226,7 +1717,11 @@ const credEsc = s => String(s ?? '').replace(/[<>"']/g,
 
 // 'gemini-3.5-flash' → '3.5' (bars would be unreadable otherwise)
 function credModelTag(m){
-  return m.replace(/^gemini[-_]?/i, '').replace(/[-_]?(flash|pro|lite)$/i, '') || m;
+  const s = m.replace(/^gemini[-_]?/i, '');
+  // flash-lite keeps a tag of its own: it is the 500/day rung, and two bars
+  // both reading "3.5-flash" would hide which cap is which
+  if (/lite$/i.test(s)) return s.replace(/[-_]?(flash[-_]?)?lite$/i, '-lite') || m;
+  return s.replace(/[-_]?(flash|pro)$/i, '') || m;
 }
 
 function credRowEl(r, i){
@@ -2243,9 +1738,10 @@ function credRowEl(r, i){
   }
   const bars = CredState.ladder.map(m => {
     const um = (r.usage && r.usage.models) || {};
-    const lim = (r.usage && r.usage.limit) || CredState.usageCap;
+    const lim = (r.usage && r.usage.limits && r.usage.limits[m])
+      || CredState.modelLimits[m] || (r.usage && r.usage.limit) || CredState.usageCap;
     const used = um[m] || 0;
-    const frac = Math.max(0, Math.min(1, used / 20));   // green→red over the 1–20 range
+    const frac = Math.max(0, Math.min(1, used / (lim || 20)));   // green→red as the cap fills
     const hue = Math.round(130 * (1 - frac));       // green → red as it fills
     let cls = 'untested', why = 'not checked yet';
     if (r.keep === null){ cls = 'pending'; why = 'save this key first'; }
@@ -2262,13 +1758,12 @@ function credRowEl(r, i){
     ? `<code class="cred-mask" title="stored in .env — replace to change">${credEsc(r.masked)}</code>` +
       `<button class="cred-btn rep" type="button" title="Replace this key">${fi('pen')}</button>`
     : `<input class="cred-in cred-keyin" type="text" spellcheck="false" autocomplete="off"
-        placeholder="${r.keep !== null ? 'paste new key · replaces ' + credEsc(r.masked) : 'AIza…'}"
-        value="${credEsc(r.value || '')}">`;
+        value="${credEsc(r.value || '')}" aria-label="New API key">`;
   wrap.innerHTML =
     `<div class="cred-key-main">` +
     `<button class="cred-btn cred-grip" type="button" title="Hold and drag to reorder — the router tries keys top to bottom">${fi('up-down')}</button>` +
     `<input class="cred-in cred-name" type="text" spellcheck="false" autocomplete="off"
-       placeholder="${credEsc('Key ' + ((r.keep ?? i) + 1))}" value="${credEsc(r.name || '')}">` +
+       value="${credEsc(r.name || '')}" aria-label="Key name">` +
     `<span class="cred-date" title="${credEsc(r.added ? 'added ' + r.added : 'no saved date yet')}">` +
     `${credEsc(r.added ? r.added.slice(0, 10) : '—')}</span>` +
     keyField +
@@ -2339,6 +1834,8 @@ function credRender(){
   box.innerHTML = '';
   CredState.rows.forEach((r, i) => box.appendChild(credRowEl(r, i)));
   cred9rRow();
+  credRenderModelToggles();
+  credRender9rModelToggles();
   lanesRender();
 }
 
@@ -2391,6 +1888,69 @@ function credRenderDbConns(){
   if (!box) return;
   box.innerHTML = '';
   (CredState.dbConnections || []).forEach((c, i) => box.appendChild(credDbConnRow(c, i)));
+}
+
+/* ── per-model ON/OFF (round .sw, same theme as every switch here) ──
+   Gemini: CredState.modelEnabled drives GEMINI_MODELS_ENABLED; null = all rungs on.
+   9router: each provider's models_enabled array (null = all on), saved with the
+   provider via extraction_providers — the pipeline lane and studio both honour it. */
+function modelToggleRow(m, on, section){
+  const row = document.createElement('div');
+  row.className = 'cred-key cred-model' + (on ? '' : ' s-removed');
+  row.innerHTML = `<div class="cred-key-main">` +
+    `<i class="dot"></i>` +
+    `<b class="cred-name-ro">${credEsc(m)}</b>` +
+    `<label class="sw"><input type="checkbox" ${on ? 'checked' : ''} data-mt="${credEsc(m)}">` +
+    `<span class="tr" aria-hidden="true"></span><em>Enabled</em></label></div>`;
+  row.querySelector('input[data-mt]').onchange = e => {
+    const on2 = e.target.checked;
+    if (section === 'gemini'){
+      // materialise the "all on" (null) state into an explicit list
+      const list = CredState.modelEnabled === null
+        ? (CredState.ladder || []).slice() : (CredState.modelEnabled || []).slice();
+      const i = list.indexOf(m);
+      if (on2 && i === -1) list.push(m);
+      if (!on2 && i > -1) list.splice(i, 1);
+      if (!list.length){ e.target.checked = true; toast('Enable at least one model'); return; }
+      CredState.modelEnabled = list;
+      credRenderModelToggles();
+    } else {
+      const p = rtProvider();
+      if (!p) return;
+      const all = rtModels();
+      const list = Array.isArray(p.models_enabled) ? p.models_enabled.slice()
+        : all.slice();                       // null = all on → materialise
+      const i = list.indexOf(m);
+      if (on2 && i === -1) list.push(m);
+      if (!on2 && i > -1) list.splice(i, 1);
+      if (!list.length){ e.target.checked = true; toast('Enable at least one model'); return; }
+      p.models_enabled = (list.length === all.length) ? null : list;  // all on → null
+      credRender9rModelToggles();
+    }
+    credMarkDirty();
+  };
+  return row;
+}
+
+function credRenderModelToggles(){
+  const box = $('credModelToggles');
+  if (!box) return;
+  box.innerHTML = '';
+  (CredState.ladder || []).forEach(m => {
+    const on = CredState.modelEnabled === null
+      || (CredState.modelEnabled || []).includes(m);
+    box.appendChild(modelToggleRow(m, on, 'gemini'));
+  });
+}
+
+function credRender9rModelToggles(){
+  const box = $('cred9rModelToggles');
+  if (!box) return;
+  box.innerHTML = '';
+  const p = rtProvider();
+  if (!p) return;
+  const on = m => Array.isArray(p.models_enabled) ? p.models_enabled.includes(m) : true;
+  rtModels().forEach(m => box.appendChild(modelToggleRow(m, on(m), '9router')));
 }
 
 /* section enable switches → .env flags; a run with the active provider off is blocked */
@@ -2482,8 +2042,12 @@ async function loadCredentials(){
     const d = await res.json();
     CredState.loaded = true;
     CredState.ladder = d.models || [];
+    // GEMINI_MODELS_ENABLED: null → every rung on (absent key = all on)
+    CredState.modelEnabled = Array.isArray(d.model_enabled)
+      ? d.model_enabled.slice() : null;
     CredState.gateway = d.gateway || null;
     CredState.usageCap = (d.keys && d.keys[0] && d.keys[0].usage && d.keys[0].usage.limit) || 20;
+  CredState.modelLimits = d.model_limits || {};
     CredState.rows = (d.keys || []).map(k => ({
       keep:k.index, masked:k.masked, name:k.name || '', value:'', replaced:false, removed:false,
       added:k.added || '',
@@ -2682,6 +2246,14 @@ async function credSave(){
       body: JSON.stringify({
         gemini_keys: keys, gemini_names: names,
         model_ladder: ladder,             // edited above; validated server-side
+        // per-model toggles: null → keep stored (nothing was touched); a list
+        // must be a non-empty subset of `ladder` — intersect defensively so an
+        // edited ladder can't 400 on a stale toggle (empty → null = keep stored).
+        model_enabled: CredState.modelEnabled === null ? null
+          : (() => {
+              const keep = CredState.modelEnabled.filter(m => ladder.includes(m));
+              return keep.length ? keep : null;
+            })(),
         supabase_url: $('credSupaUrl').value.trim(),
         supabase_bucket: $('credSupaBucket').value.trim(),
         supabase_key: $('credSupaKeyClear').checked ? CRED_CLEAR
@@ -2977,6 +2549,7 @@ const PipeState = { loaded:false, profiles:[], active:'', editing:null, results:
 const PKEEP = '__KEEP__';
 const pipeRows = () => PipeState.profiles.map(p => ({
   name: p.name, host: p.host, port: p.port, scheme: p.scheme, user: p.user,
+  enabled: p.enabled !== false,          // round .sw in the Proxy pane (default on)
   password: p.password === undefined ? PKEEP : p.password,
 }));
 
@@ -2992,6 +2565,7 @@ async function loadPipeProfiles(){
     direct.value = ''; direct.textContent = 'Direct (no proxy)';
     sel.appendChild(direct);
     PipeState.profiles.forEach(p => {
+      if (p.enabled === false) return;    // toggled off — not a selectable lane
       const o = document.createElement('option');
       o.value = p.name; o.textContent = p.name;
       sel.appendChild(o);
@@ -3014,11 +2588,14 @@ function credRenderProfiles(){
   list.innerHTML = profs.map(p => {
     const res = (PipeState.results || {})[p.name];
     const cls = res === true ? ' t-ok' : res === false ? ' t-bad' : '';
+    const off = p.enabled === false ? ' s-removed' : '';
     const addr = p.host ? credEsc(p.host) + ':' + credEsc(p.port || '') : 'Direct';
-    return `<div class="cred-key cred-prof${cls}" data-name="${credEsc(p.name)}">` +
+    return `<div class="cred-key cred-prof${cls}${off}" data-name="${credEsc(p.name)}">` +
       `<div class="cred-key-main">` +
         `<span class="cred-prof-name">${credEsc(p.name)}</span>` +
         `<code class="cred-mask" title="${addr}">${addr}</code>` +
+        `<label class="sw"><input type="checkbox" ${off ? '' : 'checked'} data-prof-en>` +
+        `<span class="tr" aria-hidden="true"></span><em>Enabled</em></label>` +
         `<button class="cred-btn prof-test" type="button" title="Test this proxy — one keyless googleapis probe, no model used">${fi('flask')}</button>` +
         `<button class="cred-btn prof-edit" type="button" title="Edit this profile">${fi('pen')}</button>` +
         `<button class="cred-btn prof-rm" type="button" title="Delete this profile">${fi('trash')}</button>` +
@@ -3029,6 +2606,14 @@ function credRenderProfiles(){
     row.querySelector('.prof-test').onclick = () => profTest(name);
     row.querySelector('.prof-edit').onclick = () => proxyOpen('edit', name);
     row.querySelector('.prof-rm').onclick = () => profDelete(name);
+    const en = row.querySelector('input[data-prof-en]');
+    if (en) en.onchange = () => {
+      const p = PipeState.profiles.find(x => x.name === name);
+      if (!p) return;
+      p.enabled = en.checked;
+      row.classList.toggle('s-removed', !en.checked);
+      pipePost().catch(e => toast('Proxy: ' + e));   // persisted immediately, like pipeProxySel
+    };
   });
 }
 
@@ -3261,6 +2846,55 @@ const DbState = {
 const dbEsc = credEsc;
 const dbBigType = t => /text|json|bytea/.test(t || '');
 
+/* QBank / DB text -> HTML: fence bare LaTeX environments, render pipe tables.
+   Escapes first, so every '<' the OCR produced stays literal. */
+function mdHtml(raw){
+  let s = dbEsc(String(raw == null ? '' : raw)).replace(/\r\n?/g, '\n');
+  if (!s) return '';
+  /* 0. MathJax has no LaTeX float/table environments and the OCR emits them
+        ("\begin{table}[] \centering \begin{tabular}{|c|c|}"). Left alone
+        they draw a red "Unknown environment" where the table belongs. The
+        `table` float is unwrapped (its body is the maths), `tabular` becomes
+        `array` (same column spec), and \centering is a no-op here. */
+  s = s.replace(/\\begin\{table\}(?:\[[^\]]*\])?/g, '')
+       .replace(/\\end\{table\}/g, '')
+       .replace(/\\begin\{tabular\}(?:\[[^\]]*\])?/g, '\\begin{array}')
+       .replace(/\\end\{tabular\}/g, '\\end{array}')
+       .replace(/\\centering\b\s*/g, '');
+  /* 1. each bare LaTeX environment becomes display math; prose stays prose.
+        The replacement MUST be a function: in a *string* replacement a '$$'
+        sequence is an escape, so the fence would silently vanish. */
+  if (s.indexOf('\\begin{') !== -1 && s.indexOf('$$') === -1 && s.indexOf('\\[') === -1)
+    s = s.replace(/(\\begin\{[a-zA-Z*]+\}[\s\S]*?\\end\{[a-zA-Z*]+\})/g,
+                  m => '$$' + m + '$$');
+  /* 1b. A display block that still nests inline math ("$^6\text{A}$" inside
+        an OCR'd table) dies on the misplaced `$`: inside $$ the delimiters are
+        dropped and the TeX runs inline. Escaped \$ survives. */
+  s = s.replace(/\$\$([\s\S]*?)\$\$/g,
+                (m, inner) => '$$' + inner.replace(/(^|[^\\])\$/g, '$1') + '$$');
+  /* 2. pipe tables -> real <table>, so MathJax inside cells still works */
+  const lines = s.split('\n'), out = [];
+  for (let i = 0; i < lines.length; i++){
+    const next = lines[i + 1] || '';
+    if (/^\s*\|.*\|\s*$/.test(lines[i]) && /^\s*\|[\s:|-]+\|\s*$/.test(next)){
+      const rows = [];
+      const cells = line => line.trim().replace(/^\||\|$/g, '').split('|')
+        .map(c => '<td>' + c.trim() + '</td>').join('');
+      rows.push('<tr>' + cells(lines[i]) + '</tr>');
+      i += 2;
+      for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++)
+        rows.push('<tr>' + cells(lines[i]) + '</tr>');
+      i--;
+      out.push('<table class="md-table"><tbody>' + rows.join('') + '</tbody></table>');
+      continue;
+    }
+    out.push(lines[i]);
+  }
+  /* 3. everything that is not a table keeps its line breaks */
+  return out.join('<br>').replace(/<br>(<table)/g, '$1')
+            .replace(/(<\/table>)<br>/g, '$1');
+}
+
 async function dbApi(url, opts){
   const res = await fetch(url, opts);
   const d = await res.json().catch(() => ({}));
@@ -3345,11 +2979,23 @@ async function dbLoadRows(){
   }
 }
 
+/* A cell that holds a table or a formula gets a formatted preview; the title
+   keeps the raw value so nothing is hidden from a curious eye. */
+function dbRichHtml(s){
+  const html = mdHtml(s);
+  const rich = html.indexOf('<table') !== -1 || html.indexOf('$$') !== -1;
+  if (!rich) return null;
+  return '<span class="db-rich">' + html + '</span>';
+}
+
 function dbCellHtml(v){
   if (v === null || v === undefined) return '<i class="db-null">NULL</i>';
   if (v === true || v === false)
     return '<span class="db-bool ' + (v ? 'yes' : 'no') + '">' + v + '</span>';
   const s = String(v);
+  const rich = dbRichHtml(s);
+  if (rich) return '<div class="db-rich-wrap" title="' + dbEsc(s.slice(0, 900)) + '">'
+    + rich + '</div>';
   return '<span class="db-v" title="' + dbEsc(s.length > 900 ? s.slice(0, 900) + '…' : s)
          + '">' + dbEsc(s.length > 240 ? s.slice(0, 240) + '…' : s) + '</span>';
 }
@@ -3378,6 +3024,7 @@ function dbRenderGrid(){
       : '') + '</td></tr>').join('');
   g.innerHTML =
     `<table class="db-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  typesetMath(g);
 
   g.querySelectorAll('th[data-c]').forEach(th => th.onclick = () => {
     const c = th.dataset.c;
@@ -3665,7 +3312,7 @@ function dbBucketOpen(name){
   const drawer = $('bucketDrawer');
   if (!drawer) return;
   $('bucketDrawerName').textContent = name;
-  $('bucketDrawerImg').src = '/api/proxy/image/' + encodeURIComponent(name);
+  $('bucketDrawerImg').src = mediaUrl(name);
   const src = $('bucketDrawerSrc');
   const links = $('bucketDrawerLinks');
   src.hidden = true; src.textContent = '';
@@ -3673,6 +3320,8 @@ function dbBucketOpen(name){
   drawer.hidden = false;
   dbApi('/api/db/source?source_id=' + encodeURIComponent(name)).then(d => {
     const s = d.source;
+    const folder = s && s.folder_id;
+    $('bucketDrawerName').textContent = name + (folder ? ' · ' + folder : '');
     if (s && s.storage_url){
       src.href = s.storage_url; src.textContent = s.storage_url; src.hidden = false;
     } else {

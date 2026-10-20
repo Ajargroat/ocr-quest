@@ -40,6 +40,9 @@ class EndpointCase(unittest.TestCase):
         main.ENV_PATH = self._env_path
         for k in _POOL_KEYS:
             os.environ.pop(k, None)
+        # The DB connection list is user state: tests assert on what they
+        # submit, so a stale value must not leak in from a real .env.
+        os.environ.pop("DB_CONNECTIONS", None)
         main.cfg = main.load_config()
         self._old_test_chat = main.vision.test_chat
         self._old_check_provider = main.vision.check_provider
@@ -236,6 +239,28 @@ class CredentialsSaveTest(EndpointCase):
         self.assertEqual(os.environ["GEMINI_API_KEYS"], "")
         self.assertEqual(main.cfg.gemini_key_pool, ())
 
+    def test_model_enabled_subset_round_trips(self):
+        c = self.client()
+        r = c.post("/api/credentials", json={**self.base(), "model_ladder": ["gemini-3.5-flash-lite", "gemini-3.5-flash"], "model_enabled": ["gemini-3.5-flash-lite"]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["model_enabled"], ["gemini-3.5-flash-lite"])
+        g = c.get("/api/credentials")
+        self.assertEqual(g.json()["model_enabled"], ["gemini-3.5-flash-lite"])
+
+    def test_model_enabled_rejects_empty_and_unknown(self):
+        c = self.client()
+        r1 = c.post("/api/credentials", json={**self.base(), "model_ladder": ["gemini-3.5-flash-lite"], "model_enabled": []})
+        self.assertEqual(r1.status_code, 400)
+        r2 = c.post("/api/credentials", json={**self.base(), "model_ladder": ["gemini-3.5-flash-lite"], "model_enabled": ["gemini-nope"]})
+        self.assertEqual(r2.status_code, 400)
+
+    def test_model_limits_carry_the_flash_lite_day_cap(self):
+        c = self.client()
+        g = c.get("/api/credentials")
+        self.assertEqual(g.status_code, 200, g.text)
+        limits = g.json()["model_limits"]
+        self.assertEqual(limits.get("gemini-3.5-flash-lite"), 500)
+        self.assertEqual(limits.get("default"), 20)
     def test_keep_sentinels_and_the_ladder_survive_a_selection_change(self):
         """The payload the toolbar actually sends: every stored key as
         __KEEP__:<i>, the ladder, and only extraction_active changed."""

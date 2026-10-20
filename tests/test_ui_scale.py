@@ -80,12 +80,9 @@ class ScaleTokenTests(unittest.TestCase):
             self.assertNotIn(gone, html, gone)
         self.assertNotIn('id="stTotal"', html)
         self.assertLess(html.index('id="periodStats"'), html.index('id="psTotal"'))
-        for line in html.splitlines():
-            if 'id="revNow"' in line:
-                self.assertNotIn("></div>", line)
-                break
-        else:
-            self.fail("id=revNow not found")
+        # the revision page is retired; its rail slot is not replaced by an
+        # empty marketing block either
+        self.assertNotIn('id="revNow"', html)
 
     def test_toolbar_shares_the_pipeline_edge(self):
         """The pipeline toolbar pads to the same 34px edge as .stages /

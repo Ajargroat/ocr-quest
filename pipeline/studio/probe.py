@@ -20,6 +20,11 @@ TEXT_PAGE_MIN_CHARS = 40
 # Answer-key pages look like long runs of "<number> <option-digit>" pairs.
 _KEY_ROW = re.compile(r"\d+\s*[\)\.]?\s*[\u06F0-\u06F9\u0660-\u06691-4]\b")
 _KEY_HINT = re.compile(r"پاسخ\s*کلیدی|کلید\s*پاسخ")
+# A line with this many Persian letters is a sentence (a question stem or an
+# option text), never a key-grid cell. Computed pages carry several of them;
+# a key grid carries digits only.
+_KEY_SENTENCE_LETTERS = 8
+_FA_LETTER = re.compile(r"[\u0600-\u06FF]")
 
 
 def _page_text(page):
@@ -30,15 +35,16 @@ def _page_text(page):
 
 
 def _count_figures(page):
-    """Rough figure count: image-like objects plus vector paths.
+    """Rough figure count: pdfium image objects on the page.
 
-    pdfium object types: 1 = image-ish in practice for these PDFs; we count
-    anything the caller can use as "this page is likely to have a diagram".
+    pdfium object types (pypdfium2.raw): 1 = text, 2 = path, 3 = image.
+    Images are the reliable "this page has a picture" signal; vector paths
+    flood-count rules and text on every page, so only 3 counts here.
     """
     figures = 0
     try:
         for obj in page.get_objects():
-            if obj.type == 1:          # image object
+            if obj.type == 3:          # image object
                 figures += 1
     except Exception:
         return 0
@@ -46,17 +52,29 @@ def _count_figures(page):
 
 
 def _looks_like_answer_key(text: str) -> bool:
-    """True when a page reads like a bare answer-key grid (no prose)."""
+    """True when a page reads like a bare answer-key grid (no prose).
+
+    A question page spells its options as "۱) ۲/۶", so the pair pattern alone
+    matches half of a normal exam page; the sentence count is what separates
+    the two. Misreading a question page as a key would drop every stem, while
+    misreading a key as questions only adds recoverable prose blocks.
+    """
     if _KEY_HINT.search(text):
         return True
     compact = re.sub(r"\s+", " ", text).strip()
     if len(compact) < 60:
         return False
     hits = len(_KEY_ROW.findall(compact))
+    if hits < 8:
+        return False
+    sentences = sum(1 for line in (text or "").splitlines()
+                    if len(_FA_LETTER.findall(line)) >= _KEY_SENTENCE_LETTERS)
+    if sentences > 1:
+        return False
     # Many number/option pairs and few sentence-like stretches (Persian words
     # with a trailing period/question mark) => a key table.
     prose = len(re.findall(r"[\u0600-\u06FF]{4,}[.؟!]", compact))
-    return hits >= 8 and prose <= 2
+    return prose <= 2
 
 
 def probe(path: str, max_pages: int = None) -> dict:

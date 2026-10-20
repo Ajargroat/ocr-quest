@@ -41,7 +41,9 @@ __pycache__/
 *.pyc
 .venv/
 
-# Agent workflow state (local-only per checkout, same convention as Sapienstech)
-/.agent
+# Agent instructions (local-only per checkout, same convention as Sapienstech)
 /AGENTS.md
-/.claude
+
+# DeepSeek Harness node_modules dropped beside the checkout (harness artifact,
+# not project code — never commit)
+/dsh/

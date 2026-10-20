@@ -70,7 +70,8 @@ def proxy_proxies():
 
 def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 temperature=0.1, max_tokens=16384, retries=None,
-                on_problem=None, on_attempt=None):
+                on_problem=None, on_attempt=None, labels=None,
+                json_mode=False, thinking=None):
     """Sends one image/PDF plus the prompt to Gemini.
     Returns (parsed_json, raw_text, usage) where usage is
     ``{"tokens_in": int, "tokens_out": int}`` (zeros when the response
@@ -89,15 +90,33 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
     parts = [{"text": prompt}]
     if data_b64:
         # Empty payload = a text-only call (the cheapest possible probe).
-        parts.append({"inline_data": {"mime_type": mime_type, "data": data_b64}})
+        # A list carries one inline part per image (a chunk or band batch).
+        # A label before each image lets one request address several images
+        # by name (the band pass answers per band, not per request).
+        blobs = data_b64 if isinstance(data_b64, (list, tuple)) else [data_b64]
+        for index, blob in enumerate(blobs):
+            if not blob:
+                continue
+            if labels and index < len(labels) and labels[index]:
+                parts.append({"text": labels[index]})
+            parts.append({"inline_data": {"mime_type": mime_type,
+                                          "data": blob}})
+    generation = {
+        "temperature": temperature,
+        "maxOutputTokens": max_tokens,
+    }
+    if json_mode:
+        generation["responseMimeType"] = "application/json"
+    # Thinking is pure overhead for a bbox reply. Pro and lite models reject
+    # an explicit budget, so leave their default alone.
+    lower = (model or "").lower()
+    if thinking is not None and "pro" not in lower and "lite" not in lower:
+        generation["thinkingConfig"] = {"thinkingBudget": max(0, int(thinking))}
     payload = {
         "contents": [{
             "parts": parts,
         }],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_tokens,
-        },
+        "generationConfig": generation,
     }
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     url = API_URL.format(model=model)

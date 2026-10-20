@@ -20,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline import gemini_router, parallel, runner                    # noqa: E402
+from pipeline.config import DEFAULT_MODEL_LADDER                        # noqa: E402
 from pipeline.gemini_router import GeminiRouter                          # noqa: E402
 from pipeline.runner import blocked_remaining                            # noqa: E402
 
@@ -185,7 +186,9 @@ class CallPinnedTests(unittest.TestCase):
             self._cfg(), "k2222222222", "p", "b", "image/jpeg")
         self.assertEqual(parsed, {"answer": 1})
         self.assertTrue(all(key == "k2222222222" for key, _m in calls), calls)
-        self.assertEqual(route["model"], "gemini-3.5-flash")
+        # lite-first ladder (config.DEFAULT_MODEL_LADDER): the walk starts on
+        # the cheapest enabled rung, not a hard-coded model name.
+        self.assertEqual(route["model"], DEFAULT_MODEL_LADDER[0])
 
     def test_call_pinned_marks_exhausted_when_parked(self):
         self._record()

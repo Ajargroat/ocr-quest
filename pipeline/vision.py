@@ -60,12 +60,15 @@ def provider_label(cfg):
 
 def call_ocr_openai(cfg, prompt, data_b64, mime_type,
                     temperature=0.1, max_tokens=16384, retries=None,
-                    on_problem=None, on_route=None):
+                    on_problem=None, on_route=None, raw_text=False,
+                    labels=None):
     """One vision chat-completion against an OpenAI-compatible endpoint.
 
     Mirrors gemini.call_gemini's retry contract (growing wait, classified
     faults) so the runner can treat both engines identically. Returns the
-    parsed JSON object; raises faults.FaultError on failure.
+    parsed JSON object — or the verbatim reply text when ``raw_text`` is set
+    (the studio's OCR lane wants the raw reading, not a JSON wrapper).
+    Raises faults.FaultError on failure.
 
     `on_route(label, masked, model, attempt)` fires before every retry
     with the endpoint's host as the label — the OpenAI lane has one
@@ -77,8 +80,14 @@ def call_ocr_openai(cfg, prompt, data_b64, mime_type,
     content = [{"type": "text", "text": prompt}]
     if data_b64:
         mime = MIME_TO_DATAURL.get((mime_type or "").lower(), mime_type or "image/jpeg")
-        content.append({"type": "image_url",
-                        "image_url": {"url": f"data:{mime};base64,{data_b64}"}})
+        blobs = data_b64 if isinstance(data_b64, (list, tuple)) else [data_b64]
+        for index, blob in enumerate(blobs):
+            if not blob:
+                continue
+            if labels and index < len(labels) and labels[index]:
+                content.append({"type": "text", "text": labels[index]})
+            content.append({"type": "image_url",
+                            "image_url": {"url": f"data:{mime};base64,{blob}"}})
     payload = {
         "model": cfg.ocr_model,
         "stream": False,
@@ -112,6 +121,8 @@ def call_ocr_openai(cfg, prompt, data_b64, mime_type,
                     if not (text or "").strip():
                         last = faults.fault("model_empty",
                                             "Model returned no text content.")
+                    elif raw_text:
+                        return text
                     else:
                         try:
                             return extract_json(text)

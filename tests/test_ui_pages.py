@@ -215,6 +215,22 @@ class CredentialsCoherenceTests(unittest.TestCase):
         self.assertIn('id="credLadder"', pool)
         self.assertNotIn('id="credKeys"', pool)
 
+    def test_model_toggles_are_round_sw_in_both_sections(self):
+        """Per-model ON/OFF rows (Gemini ladder + 9router) wear the house
+        round .sw theme; the save payload carries model_enabled."""
+        html = _read("index.html")
+        pane = _pane(html, "ocr")
+        self.assertIn('id="credModelToggles"', pane)
+        self.assertIn('id="cred9rModelToggles"', pane)
+        js = _read("app.js")
+        self.assertIn("credRenderModelToggles()", js)
+        self.assertIn("credRender9rModelToggles()", js)
+        # the round toggle markup, exactly as every other switch wears it
+        self.assertIn('<span class="tr" aria-hidden="true"></span><em>Enabled</em>', js)
+        self.assertIn("model_enabled:", js)
+        # proxy rows: enabled round-trips through pipeRows
+        self.assertIn("enabled: p.enabled !== false", js)
+
     def test_gemini_key_row_shows_name_date_health_and_bars(self):
         js = _read("app.js")
         self.assertIn('class="cred-date"', js)
@@ -599,17 +615,37 @@ class CredentialLayoutTests(unittest.TestCase):
         self.assertIn("'proxy'", js)
         self.assertNotIn("cred-savebar", html)
 
-    def test_mbar_ramps_green_to_red_over_20(self):
+    def test_mbar_ramps_green_to_red_over_the_model_cap(self):
         """Item 5: the model usage meter is bigger, always shows a track, and
-        ramps green -> red over the fixed 1–20 range."""
+        ramps green -> red over that model's day cap."""
         js = _read("app.js")
         css = _read("styles.css")
-        self.assertIn("used / 20", js)
+        self.assertIn("used / (lim || 20)", js)
+        self.assertIn("CredState.modelLimits[m]", js)
+        self.assertIn("d.model_limits", js)
         self.assertIn("height:30px", css)
         self.assertIn("min-width:104px", css)
         self.assertNotIn(".mbar.m-untested i{display:none}", css)
 
 
+    def test_flash_lite_keeps_its_own_bar_tag(self):
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node unavailable")
+        js = _read("app.js")
+        start = js.index("function credModelTag")
+        body = js[start:js.index("\n}", start) + 2]   # include the closing brace
+        script = body + """
+if (credModelTag('gemini-3.5-flash-lite') !== '3.5-lite') process.exit(1);
+if (credModelTag('gemini-3.5-flash') !== '3.5') process.exit(2);
+"""
+        proc = subprocess.run([node], input=script.encode("utf-8"),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=30)
+        self.assertEqual(proc.returncode, 0,
+                         proc.stderr.decode("utf-8", "replace"))
 class UsagePlotTests(unittest.TestCase):
     def test_usage_controls_dropdown_and_seconds(self):
         """Items 9/10/11: the period is a 24h-default dropdown, the y-modes
@@ -637,7 +673,7 @@ class LoadingStateTests(unittest.TestCase):
         self.assertIn("function viewLoading(", js)
         self.assertIn(".load-shell", js)
         self.assertIn("@keyframes loadWave{", css)
-        for view in ("viewUsage", "viewReview", "viewRevision",
+        for view in ("viewUsage", "viewReview",
                      "viewDatabase", "viewCredentials", "viewPipeline"):
             self.assertIn("viewLoading('%s', true)" % view, js, view)
 
@@ -651,7 +687,7 @@ class HintCopyTests(unittest.TestCase):
         for gone in ("dbBkStatus", "credModelsHint", "upQueueHint", "dbModalHint"):
             self.assertNotIn(gone, html, gone)
             self.assertNotIn(gone, js, gone)
-        for kept in ('id="logCount"', 'id="fileCount"', 'id="revLogCount"'):
+        for kept in ('id="logCount"', 'id="fileCount"'):
             self.assertIn(kept, html, kept)
         self.assertIn(".hint{", _read("styles.css"))
 

@@ -446,4 +446,13 @@ Each phase is independently testable and leaves the old pipeline untouched.
 
 ---
 
-*End of plan. Awaiting your answers to §13 before any code is written.*
+*End of plan.*
+
+---
+
+*Status (2026-10-17): the chain is live end to end — intake/probe/profile, Stage 1
+(`extract`: deterministic text lane, ≤200 KB image lane → raw-text OCR, figures
+stored once by content id), Stage 2 (`enrich`: fields, flags, tag folding, answer-key
+links), Stage 3 (`geometry`: exact or model-verified bbox + crop cache), human review
+(vision crops gated, text crops exact), continuous import (Database / JSON export,
+idempotent). Code: `pipeline/studio/`; routes: `/api/studio/*`; UI: `ui/studio.js`.*

@@ -425,12 +425,14 @@ class SourceDetailTests(unittest.TestCase):
     def test_source_detail_shapes_source_questions_and_answers(self):
         db = self._db(
             [("sid-1", "f.jpg", "image/jpeg", 100, "http://x/f.jpg",
-              "math", 12, "alg", "سوال")],
+              "math", 12, "alg", "سوال",
+              "math/12/alg")],
             [("q1", 1, "question text", "pending")],
             [("a1", 1, "answer text", "pending")])
         got = db.fetch_source_detail("sid-1")
         self.assertEqual(got["source"]["id"], "sid-1")
         self.assertEqual(got["source"]["storage_url"], "http://x/f.jpg")
+        self.assertEqual(got["source"]["folder_id"], "math/12/alg")
         self.assertEqual(got["source"]["grade"], "12")        # cast to text
         self.assertEqual(got["questions"][0]["question_number"], 1)
         self.assertEqual(got["questions"][0]["question_text"], "question text")

@@ -1,9 +1,8 @@
 """Stage orchestration + job state for the studio.
 
-This is the thin conductor the UI talks to. Phase 1 wires the *probe* stage
-end to end (create job → store source → probe → save a profile); the later
-stages (extract / enrich / geometry / import) plug in as additional
-``run_*`` functions that share the same job state machine.
+This is the thin conductor the UI talks to: create job → store source → probe
+→ save profile → extract → enrich → geometry → import, with the stage
+functions below sharing the same job state machine.
 
 State is process-local (like ``revision/runner.py``): the authoritative job
 record is the workspace directory on disk, and this module only mirrors the
@@ -11,6 +10,10 @@ record is the workspace directory on disk, and this module only mirrors the
 """
 import threading
 
+from . import enrich as enrich_mod
+from . import extract as extract_mod
+from . import geometry as geometry_mod
+from . import importers
 from . import probe as probe_mod
 from . import profile as profile_mod
 from . import workspace
@@ -114,6 +117,51 @@ def save_profile(hub, job_id: str, overrides: dict) -> dict:
     return {"job": workspace.summary(job_id), "profile": merged,
             "required_missing": profile_mod.required_missing(merged)}
 
+
+# ── the stage chain (extract → enrich → geometry → import) ──────────────
+
+def _run_stage(hub, job_id: str, stage: str, func, message: str) -> dict:
+    """Shared shell: state → emit → call → last_result → clear."""
+    _set(running=True, job=job_id, stage=stage, message=message, error=None)
+    try:
+        def emit(step, level, text, **extra):
+            _emit(hub, job_id, step, level, text, **extra)
+        result = func(job_id, emit)
+        _set(last_result=result)
+        return result
+    except Exception as exc:
+        _set(error=str(exc))
+        _emit(hub, job_id, stage, "error", str(exc))
+        raise
+    finally:
+        _set(running=False, stage=None)
+
+def run_extract(hub, job_id: str, cfg) -> dict:
+    """Stage 1 — source → layer1 (text lane deterministic, image lane OCR)."""
+    return _run_stage(hub, job_id, "extract",
+                      lambda jid, emit: extract_mod.run(jid, cfg, emit),
+                      "extracting")
+
+def run_enrich(hub, job_id: str, cfg) -> dict:
+    """Stage 2 — layer1 → layer2 (fields, flags, tags, answer links)."""
+    return _run_stage(hub, job_id, "enrich",
+                      lambda jid, emit: enrich_mod.run(jid, cfg, emit),
+                      "sorting")
+
+def run_geometry(hub, job_id: str, cfg) -> dict:
+    """Stage 3 — locate every block, plan + cache its crop."""
+    return _run_stage(hub, job_id, "geometry",
+                      lambda jid, emit: geometry_mod.run(jid, cfg, emit),
+                      "locating")
+
+def run_import(hub, job_id: str, cfg, target: str = "supabase",
+               dry_run: bool = False) -> dict:
+    """Stage 4 — write whatever is ready now to the chosen target."""
+    return _run_stage(
+        hub, job_id, "import",
+        lambda jid, emit: importers.run(cfg, jid, target=target,
+                                        dry_run=dry_run, emit=emit),
+        "importing")
 
 def delete_job(job_id: str) -> bool:
     """Remove a job directory (and all its artifacts). Returns True if gone."""

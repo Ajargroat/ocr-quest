@@ -61,6 +61,7 @@ Main groups:
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |
+| Studio | `STUDIO_CHUNK_CHARS`, `STUDIO_CHUNK_IMAGES`, `STUDIO_PAGES_PER_CALL`, `STUDIO_BAND_BATCH`, `STUDIO_VISION_MODEL`, `STUDIO_VISION_LONG_EDGE`, `STUDIO_VISION_QUALITY`, `STUDIO_SOURCE_ROOT`, `STUDIO_CROP_PREFIX` | stage-1 request windows (contiguous pages per extraction call, bounded by chars and page images); pages per vision call (extraction/locate/OCR) and bands per figure pass; vision pages are capped by long edge and JPEG quality, not bytes; sources live in the folder tree (`<INPUT_ROOT>/studio` by default) and the DB references a source by its folder id; only crops go to the bucket under `STUDIO_CROP_PREFIX` (re-crop replaces the same object id) |
 | Converter | `CONVERTER_ENABLED`, `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | the watcher runs inside the app (no Docker); `CONVERTER_ENABLED=0` turns it off; every page JPEG is capped at 200 KB by re-encoding at a lower quality (DPI is never lowered) |
 | Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | |
 

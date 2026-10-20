@@ -17,11 +17,11 @@ window.MathJax = {
     displayMath: [['$$', '$$'], ['\\[', '\\]']],
     processEscapes: true
   },
-  options: { ignoreHtmlClass: 'no-mathjax' },
-  svg: { fontCache: 'global' }
+  options: { ignoreHtmlClass: 'no-mathjax' }
 };
 </script>
-<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js" async></script>
+<!-- CHTML, not SVG: the OCR puts Persian words inside \text{...} (isotope/molar-mass table headers, column labels, ...). SVG output draws every glyph with the maths font's own per-character metrics, so Arabic script loses its joining forms and reads as isolated, reversed letters; CHTML emits the run as real text and the browser shapes it. -->
+<script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
 </head>
 <body>
 <canvas id="meshBg" class="mesh-bg" aria-hidden="true"></canvas>
@@ -36,8 +36,6 @@ window.MathJax = {
     <i class="fa fa-power-off" aria-hidden="true"></i><span>Pipeline</span></button>
   <button class="side-btn" data-view="review" title="QBank">
     <i class="fa fa-list-check" aria-hidden="true"></i><span>QBank</span></button>
-  <button class="side-btn" data-view="revision" title="Revision">
-    <i class="fa fa-rotate" aria-hidden="true"></i><span>Revision</span></button>
   <button class="side-btn" data-view="studio" title="Studio">
     <i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><span>Studio</span></button>
   <button class="side-btn" data-view="database" title="Database">
@@ -256,81 +254,6 @@ window.MathJax = {
   <div class="cards" id="cards"></div>
 </section>
 
-<!-- ════════════ VIEW 3 · REVISION (three-stage audit console) ════════════ -->
-<section id="viewRevision" class="view" dir="rtl">
-  <!-- stage rail · mirrors the pipeline's live phase readout -->
-  <section class="stages" id="revStages" dir="ltr">
-    <div class="rail">
-      <div class="stage" data-stage="completeness" data-desc="Empty-column report for questions &amp; answers">
-        <div class="hub"><i class="fa fa-list-check" aria-hidden="true"></i><em class="bubble" id="revStageNull"></em></div>
-        <label>Completeness</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="pairing" data-desc="Link answers to questions + definitive data fill">
-        <div class="hub"><i class="fa fa-link" aria-hidden="true"></i><em class="bubble" id="revStagePair"></em></div>
-        <label>Pairing</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="ai" data-desc="Only typos, math numerals &amp; option labels">
-        <div class="hub"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><em class="bubble" id="revStageAi"></em></div>
-        <label>AI Audit</label>
-      </div>
-    </div>
-    <div class="stage-now" id="revNow" data-state="idle">
-      <span class="beacon"></span>
-      <b id="revNowName">idle</b>
-
-      <em id="revNowDetail"></em>
-    </div>
-  </section>
-
-  <div class="rev-stats" id="revStats"></div>
-
-  <div class="toolbar" dir="ltr">
-    <button class="ghost-btn neutral" id="revRunBtn" type="button" title="Start scan — click again to stop it mid-run">
-      <i class="fa fa-power-off" aria-hidden="true"></i><span>Run</span>
-    </button>
-    <div class="seg" id="revEntity" dir="rtl">
-      <button data-rentity="question" class="active">سؤال‌ها</button>
-      <button data-rentity="answer">پاسخ‌ها</button>
-    </div>
-    <div class="seg" id="revView" dir="rtl">
-      <button data-rview="flagged" class="active">نیازمند بررسی</button>
-      <button data-rview="revised">بازبینی‌شده</button>
-      <button data-rview="approved">تأییدشده</button>
-      <button data-rview="all">همه</button>
-    </div>
-    <button class="ghost-btn neutral" id="revRefresh" type="button" title="Refresh list and stats">
-      <i class="fa fa-arrows-rotate" aria-hidden="true"></i><span>Refresh</span>
-    </button>
-    <span class="count-line" id="revCounts"></span>
-  </div>
-
-  <div class="rev-progress" id="revProgress" hidden>
-    <div class="rev-progress-track"><div class="rev-progress-fill" id="revProgressFill"></div></div>
-    <span id="revProgressLabel"></span>
-  </div>
-
-  <section class="panel rev-log-panel" dir="ltr">
-    <div class="panel-head">
-      <h2>Scan log</h2>
-      <div class="head-tools">
-        <span class="hint" id="revLogCount"></span>
-        <button class="ghost-btn icon-only" id="revLogClearBtn" type="button"
-                title="Wipe the revision log view — the server keeps its history">
-          <i class="fa fa-trash" aria-hidden="true"></i>
-        </button>
-      </div>
-    </div>
-    <div class="log no-mathjax" id="revLog"></div>
-  </section>
-
-  <div class="rev-layout">
-    <aside class="rev-list" id="revList"></aside>
-    <section class="rev-detail" id="revDetail"></section>
-  </div>
-</section>
-
 <!-- ════════════ VIEW 3.5 · STUDIO (any-file OCR subsystem) ════════════ -->
 <section id="viewStudio" class="view">
   <!-- stage rail · mirrors the pipeline/revision stepper -->
@@ -346,98 +269,106 @@ window.MathJax = {
         <label>Probe</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="extract" data-desc="Layer-1 extraction (LLM #1)">
+      <div class="stage" data-stage="extract" data-desc="Layer-1 bulk: exact text layer or OCR">
         <div class="hub"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><em class="bubble" id="stStageExtract"></em></div>
         <label>Extract</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="enrich" data-desc="Layer-2 enrich + repair (LLM #2)">
+      <div class="stage" data-stage="enrich" data-desc="Sort, repair, tag and health-check">
         <div class="hub"><i class="fa fa-broom" aria-hidden="true"></i><em class="bubble" id="stStageEnrich"></em></div>
         <label>Enrich</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="geometry" data-desc="Bbox + crop">
+      <div class="stage" data-stage="geometry" data-desc="Bbox per question + crop cache">
         <div class="hub"><i class="fa fa-crop-simple" aria-hidden="true"></i><em class="bubble" id="stStageGeometry"></em></div>
         <label>Crop</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="review" data-desc="Human review">
+      <div class="stage" data-stage="review" data-desc="Human crop + field review">
         <div class="hub"><i class="fa fa-eye" aria-hidden="true"></i><em class="bubble" id="stStageReview"></em></div>
         <label>Review</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="import" data-desc="Bulk import">
+      <div class="stage" data-stage="import" data-desc="Continuous import to a target">
         <div class="hub"><i class="fa fa-database" aria-hidden="true"></i><em class="bubble" id="stStageImport"></em></div>
         <label>Import</label>
       </div>
     </div>
-    <div class="stage-now" id="stNow" data-state="idle">
-      <span class="beacon"></span><b id="stNowStage">IDLE</b><em id="stNowMsg">No studio job running.</em>
-    </div>
   </section>
 
-  <!-- panel switcher · the same top .seg idiom the Database tab uses -->
-  <div class="toolbar" id="stToolbar">
-    <div class="seg" id="stPanels">
-      <button data-spanel="jobs" class="active" type="button">Jobs</button>
-      <button data-spanel="profile" type="button">Profile</button>
-      <button data-spanel="bulk" type="button">Bulk</button>
-      <button data-spanel="crops" type="button">Crops</button>
-      <button data-spanel="tags" type="button">Tags</button>
-      <button data-spanel="models" type="button">Models</button>
-      <button data-spanel="import" type="button">Import</button>
+  <div class="stage-now st-live" id="stNow" data-state="idle">
+    <span class="beacon"></span><b id="stNowStage">IDLE</b><em id="stNowMsg"></em>
+    <span class="st-live-meta" id="stNowPage" hidden></span>
+    <span class="st-live-meta" id="stNowChunk" hidden></span>
+  </div>
+
+  <!-- stage tabs · one stage at a time, routable by #studio/<tab> -->
+  <div class="st-tabbar">
+    <div class="seg st-tabs" id="stTabs" role="tablist" aria-label="Studio stages">
+      <button class="rail-btn active" data-sttab="jobs" type="button" role="tab">Upload</button>
+      <button class="rail-btn" data-sttab="profile" type="button" role="tab">Profile</button>
+      <button class="rail-btn" data-sttab="bulk" type="button" role="tab">Extract</button>
+      <button class="rail-btn" data-sttab="crops" type="button" role="tab">Crops</button>
+      <button class="rail-btn" data-sttab="tags" type="button" role="tab">Tags</button>
+      <button class="rail-btn" data-sttab="models" type="button" role="tab">Models</button>
+      <button class="rail-btn" data-sttab="import" type="button" role="tab">Import</button>
     </div>
-    <div class="st-actions">
-      <span class="hint" id="stCrumb"></span>
-      <button class="ghost-btn neutral sm" id="stRefresh" type="button" title="Reload jobs from disk">
-        <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
+    <span class="st-crumb" id="stCrumb"></span>
+    <button class="ghost-btn neutral sm" id="stRefresh" type="button" title="Reload">
+      <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
+    </button>
+  </div>
+
+  <main class="st-tabpanes">
+    <section class="st-pane" data-sttab="jobs" id="stPaneJobs">
+      <div class="db-actions">
+        <label class="st-upload">
+          <i class="fa fa-file-arrow-up" aria-hidden="true"></i>
+          <span id="stUploadLabel">Upload</span>
+          <input type="file" id="stFile" accept=".pdf,.png,.jpg,.jpeg,.webp">
+        </label>
+      </div>
+      <div class="db-grid-wrap st-jobs-wrap" id="stJobs"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="profile" id="stPaneProfile" hidden>
+      <div class="st-profile" id="stProfileBody"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="bulk" id="stPaneBulk" hidden>
+      <div class="st-profile" id="stBulkBody"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="crops" id="stPaneCrops" hidden>
+      <div class="st-profile" id="stCropsBody"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="tags" id="stPaneTags" hidden>
+      <div class="st-profile" id="stTagsBody"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="models" id="stPaneModels" hidden>
+      <div class="st-profile" id="stModelsBody"></div>
+    </section>
+
+    <section class="st-pane" data-sttab="import" id="stPaneImport" hidden>
+      <div class="st-profile" id="stImportBody"></div>
+    </section>
+  </main>
+
+  <!-- crop picture · the bucket drawer, one row at a time -->
+  <aside class="bucket-drawer" id="stCropDrawer" hidden>
+    <div class="bucket-drawer-head">
+      <h3 id="stCropDrawerName">crop</h3>
+      <button class="ghost-btn neutral icon-only" id="stCropDrawerClose" type="button" title="Close">
+        <i class="fa fa-xmark" aria-hidden="true"></i>
       </button>
     </div>
-  </div>
-
-  <!-- ── panel · jobs ── -->
-  <div class="db-panel" id="stPanelJobs">
-    <div class="db-actions">
-      <label class="st-upload">
-        <i class="fa fa-file-arrow-up" aria-hidden="true"></i>
-        <span id="stUploadLabel">Choose a PDF or image…</span>
-        <input type="file" id="stFile" accept=".pdf,.png,.jpg,.jpeg,.webp">
-      </label>
+    <div class="bucket-drawer-body">
+      <img id="stCropDrawerImg" alt="Crop preview">
+      <div class="st-crop-meta" id="stCropDrawerMeta"></div>
     </div>
-    <div class="db-grid-wrap" id="stJobs"></div>
-  </div>
-
-  <!-- ── panel · profile ── -->
-  <div class="db-panel" id="stPanelProfile" hidden>
-    <div class="st-profile" id="stProfileBody"></div>
-  </div>
-
-  <!-- ── panel · bulk (layer1/layer2) ── -->
-  <div class="db-panel" id="stPanelBulk" hidden>
-    <div class="st-profile" id="stBulkBody"></div>
-  </div>
-
-  <!-- ── panel · crops ── -->
-  <div class="db-panel" id="stPanelCrops" hidden>
-    <div class="st-profile" id="stCropsBody"></div>
-  </div>
-
-  <!-- ── panel · tags ── -->
-  <div class="db-panel" id="stPanelTags" hidden>
-    <div class="st-profile" id="stTagsBody">
-      <p class="empty">Loading tag list…</p>
-    </div>
-  </div>
-
-  <!-- ── panel · models ── -->
-  <div class="db-panel" id="stPanelModels" hidden>
-    <div class="st-profile" id="stModelsBody"></div>
-  </div>
-
-  <!-- ── panel · import ── -->
-  <div class="db-panel" id="stPanelImport" hidden>
-    <div class="st-profile" id="stImportBody"></div>
-  </div>
+  </aside>
 </section>
 
 <!-- ════════════ VIEW 4 · CREDENTIALS (key pool + routing health) ════════════ -->
@@ -478,6 +409,10 @@ window.MathJax = {
         </div>
         <div class="cred-body">
           <div id="credKeys" class="cred-keys"></div>
+          <div class="cred-sub-row">
+            <span class="cred-sub">models</span>
+            <div id="credModelToggles" class="model-toggles"></div>
+          </div>
           <p class="cred-note" id="credIdleNote" hidden>
             ⏸ The Gemini pool is idle — extraction currently runs via a
             built-in 9router provider. Keys and ladder are kept, just unused.
@@ -503,6 +438,10 @@ window.MathJax = {
         <div class="cred-body">
           <div id="routerSummary"></div>
           <div id="credKeys9r" class="cred-keys"></div>
+          <div class="cred-sub-row">
+            <span class="cred-sub">models</span>
+            <div id="cred9rModelToggles" class="model-toggles"></div>
+          </div>
         </div>
       </div>
     </section>
@@ -622,7 +561,7 @@ window.MathJax = {
   <div class="db-panel" id="dbPanelGrid">
     <div class="db-actions">
       <input id="dbSearch" class="db-search" type="search"
-             placeholder="Search every column…" spellcheck="false" autocomplete="off">
+             aria-label="Search" spellcheck="false" autocomplete="off">
       <select id="dbLimit" class="db-limit" title="Rows per page">
         <option value="100" selected>latest 100</option>
         <option value="250">latest 250</option>
@@ -656,7 +595,7 @@ window.MathJax = {
         </select>
       </div>
       <textarea id="sqlInput" class="db-sql-in" rows="10" spellcheck="false"
-                placeholder="SELECT * FROM questions ORDER BY created_at DESC LIMIT 20;"></textarea>
+                aria-label="SQL"></textarea>
     </div>
     <div class="db-sql-result" id="sqlResult"></div>
   </div>
@@ -744,17 +683,15 @@ window.MathJax = {
         <select id="ocrSel" class="cred-in"></select>
         <div class="cred-prov-status" id="ocrProviderStatus" hidden></div>
         <label class="cred-label" for="ocrLabel">Label <span class="cred-sub">name shown in the selector</span></label>
-        <input id="ocrLabel" class="cred-in" spellcheck="false" autocomplete="off" placeholder="9router">
+        <input id="ocrLabel" class="cred-in" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="ocrRouterUrl">Base URL</label>
-        <input id="ocrRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off"
-               placeholder="http://localhost:20128/v1">
+        <input id="ocrRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="ocrRouterKey">API key <span class="cred-sub">optional for local servers</span></label>
         <input id="ocrRouterKey" class="cred-in mono" type="password" spellcheck="false"
                autocomplete="new-password" placeholder="— not set —">
         <label class="secret-clear"><input id="ocrRouterKeyClear" type="checkbox"> Clear stored OCR key on save</label>
         <label class="cred-label" for="ocrRouterModel">Model name</label>
-        <input id="ocrRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off"
-               placeholder="e.g. qwen2.5-vl · gpt-4o-mini · gemma-3-12b">
+        <input id="ocrRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off">
         <button class="ghost-btn neutral sm" id="ocrAddProvider" type="button">Add provider</button>
         <button class="ghost-btn neutral sm" id="ocrProviderTest" type="button"
                 title="One real model call — reply snippet and latency. Spends a few tokens.">
@@ -765,14 +702,14 @@ window.MathJax = {
         <label class="cred-label" for="credSel">Saved provider <span class="cred-sub">per-section list · switching never touches Extraction</span></label>
         <select id="credSel" class="cred-in"></select>
         <label class="cred-label" for="credLabel">Label <span class="cred-sub">name shown in the selector</span></label>
-        <input id="credLabel" class="cred-in" spellcheck="false" autocomplete="off" placeholder="9router">
+        <input id="credLabel" class="cred-in" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credRouterUrl">Base URL</label>
-        <input id="credRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="http://localhost:20128/v1">
+        <input id="credRouterUrl" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credRouterKey">API key <span class="cred-sub">optional for local servers</span></label>
         <input id="credRouterKey" class="cred-in mono" type="password" spellcheck="false" autocomplete="new-password" placeholder="— not set —">
         <label class="secret-clear"><input id="credRouterKeyClear" type="checkbox"> Clear stored revision key on save</label>
         <label class="cred-label" for="credRouterModel">Model name</label>
-        <input id="credRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="OCR-Quest">
+        <input id="credRouterModel" class="cred-in mono" spellcheck="false" autocomplete="off">
         <button class="ghost-btn neutral sm" id="credAddProvider" type="button">Add provider</button>
         <button class="ghost-btn neutral sm" id="credProviderTest" type="button"
                 title="One real model call — reply snippet and latency. Spends a few tokens.">
@@ -782,13 +719,13 @@ window.MathJax = {
       <div class="cred-form" data-form="pool" hidden>
         <label class="cred-label" for="credLadder">Model ladder <span class="cred-sub">oldest first · every key walks the whole ladder, stepping up only on failure</span></label>
         <textarea id="credLadder" class="cred-in mono" rows="2" spellcheck="false"
-                  placeholder="gemini-3.5-flash, gemini-3.6-flash, …" dir="ltr"></textarea>
+                  dir="ltr"></textarea>
       </div>
       <div class="cred-form" data-form="supabase" hidden>
         <label class="cred-label" for="credSupaUrl">Project URL</label>
-        <input id="credSupaUrl" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="https://xxxx.supabase.co">
+        <input id="credSupaUrl" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credSupaBucket">Bucket</label>
-        <input id="credSupaBucket" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="konkour-pages">
+        <input id="credSupaBucket" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credSupaKey">Service key</label>
         <input id="credSupaKey" class="cred-in mono" type="password" spellcheck="false"
                 autocomplete="new-password" placeholder="— not set —">
@@ -796,19 +733,18 @@ window.MathJax = {
       </div>
       <div class="cred-form" data-form="postgres" hidden>
         <label class="cred-label" for="credPgHost">Host</label>
-        <input id="credPgHost" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="localhost">
+        <input id="credPgHost" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credPgPort">Port</label>
-        <input id="credPgPort" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="5432">
+        <input id="credPgPort" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credPgDb">Database</label>
-        <input id="credPgDb" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="postgres">
+        <input id="credPgDb" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credPgUser">User</label>
-        <input id="credPgUser" class="cred-in mono" spellcheck="false" autocomplete="off" placeholder="postgres">
+        <input id="credPgUser" class="cred-in mono" spellcheck="false" autocomplete="off">
         <label class="cred-label" for="credPgPass">Password</label>
         <input id="credPgPass" class="cred-in mono" type="password" spellcheck="false"
                autocomplete="new-password" placeholder="— not set —">
         <label class="cred-label" for="credPgSsl">SSL mode</label>
-        <input id="credPgSsl" class="cred-in mono" spellcheck="false" autocomplete="off"
-               placeholder="disable · allow · prefer · require">
+        <input id="credPgSsl" class="cred-in mono" spellcheck="false" autocomplete="off">
       </div>
     </div>
     <div class="db-modal-foot">
@@ -832,11 +768,11 @@ window.MathJax = {
         <fieldset class="proxy-req">
           <legend>Required</legend>
           <label class="cred-label" for="pxName">Profile name</label>
-          <input id="pxName" class="cred-in" placeholder="home" autocomplete="off">
+          <input id="pxName" class="cred-in" autocomplete="off">
           <label class="cred-label" for="pxHost">Host</label>
-          <input id="pxHost" class="cred-in mono" placeholder="127.0.0.1" spellcheck="false" autocomplete="off">
+          <input id="pxHost" class="cred-in mono" spellcheck="false" autocomplete="off">
           <label class="cred-label" for="pxPort">Port</label>
-          <input id="pxPort" class="cred-in mono" placeholder="8080" spellcheck="false" autocomplete="off">
+          <input id="pxPort" class="cred-in mono" spellcheck="false" autocomplete="off">
         </fieldset>
         <fieldset class="proxy-opt">
           <legend>Optional</legend>

@@ -62,8 +62,28 @@ RATE_LIMIT_COOLDOWN = 75
 MODEL_COOLDOWN = 6 * 3600
 # Free-tier daily request cap per key × model when Google does not tell us
 # better (it never does — there is no such endpoint for plain API keys).
-# GEMINI_MODEL_DAY_LIMIT in .env tunes it.
+# GEMINI_MODEL_DAY_LIMIT in .env tunes the shared cap.
 DAY_LIMIT_DEFAULT = 20
+# Models whose own RPD differs from the shared cap. flash-lite is the cheap
+# 500/day rung the studio tests against; GEMINI_MODEL_DAY_LIMITS
+# ("model:limit,model:limit") overrides this table without a code change.
+MODEL_DAY_LIMITS = {"gemini-3.5-flash-lite": 500}
+
+
+def _model_day_limits() -> dict:
+    """The per-model caps: the built-in table plus .env overrides."""
+    limits = dict(MODEL_DAY_LIMITS)
+    raw = os.getenv("GEMINI_MODEL_DAY_LIMITS", "")
+    for pair in raw.split(","):
+        name, _, value = pair.partition(":")
+        name = name.strip()
+        if not name:
+            continue
+        try:
+            limits[name] = max(1, int(value.strip()))
+        except ValueError:
+            continue
+    return limits
 # Soft penalty window for key-level faults (bad key, rate limit,
 # geo block). Deliberately separate from the hard cooldown: once
 # that expires the key is eligible again, but a fresh blip must
@@ -308,15 +328,24 @@ class GeminiRouter:
         except OSError:
             pass
 
-    def day_limit(self):
-        """Cap of successful sends per key × model per day (free tier is
-        ~20; Google sometimes lets a few more through — the bar simply
-        overflows past 100% when that happens)."""
+    def day_limit(self, model: str = ""):
+        """Cap of sends per key × model per day. A model with its own RPD
+        (flash-lite: 500) answers with that; everything else uses
+        GEMINI_MODEL_DAY_LIMIT. The bar simply overflows past 100% when
+        Google lets more through than the table says."""
+        if model:
+            own = _model_day_limits().get(model)
+            if own is not None:
+                return own
         try:
             return max(1, int(os.getenv("GEMINI_MODEL_DAY_LIMIT",
                                         str(DAY_LIMIT_DEFAULT))))
         except ValueError:
             return DAY_LIMIT_DEFAULT
+
+    def model_limits(self) -> dict:
+        """Every per-model cap the UI needs for its bars."""
+        return _model_day_limits()
 
     def _usage_load(self):
         if self._usage_loaded:
@@ -439,16 +468,20 @@ class GeminiRouter:
     def _usage_of(self, key):
         self._usage_load()
         limit = self.day_limit()
+        limits = self.model_limits()
         today = self._today()
         with self._lock:
             if today != self._usage_day:
-                return {"day": today, "limit": limit, "models": {}}
-            return {"day": self._usage_day, "limit": limit,
+                return {"day": today, "limit": limit, "limits": limits,
+                        "models": {}}
+            return {"day": self._usage_day, "limit": limit, "limits": limits,
                     "models": dict(self._usage.get(self._key_hash(key), {}))}
 
     def _spent_today(self, key, model):
+        """True once this key × model has used ITS OWN cap today."""
         u = self._usage_of(key)
-        return u["models"].get(model, 0) >= u["limit"]
+        limit = self.day_limit(model)
+        return u["models"].get(model, 0) >= limit
 
     # ------------------------------------------------------------- selection
     def _plan(self, cfg, now, keys=None):
@@ -482,8 +515,10 @@ class GeminiRouter:
                     continue
                 blocked = st.get("blocked", {})
                 last = st.get("ok_model", "")
+                enabled = getattr(cfg, "gemini_enabled_models", None)
                 ladder = [m for m in cfg.gemini_model_ladder
-                          if now >= blocked.get(m, 0.0)
+                          if (enabled is None or m in enabled)
+                          and now >= blocked.get(m, 0.0)
                           and not self._spent_today(key, m)]
                 if not ladder:
                     continue
@@ -589,7 +624,8 @@ class GeminiRouter:
     # ---------------------------------------------------------- main call
     def call(self, cfg, prompt, data_b64, mime_type,
              temperature=0.1, max_tokens=16384, retries=None,
-             on_problem=None, on_route=None):
+             on_problem=None, on_route=None, labels=None,
+             json_mode=False, thinking=None):
         """Run real work through the best key×model, rotating on failure.
 
         Returns (parsed_json, raw_text, route) where `route` is
@@ -643,7 +679,8 @@ class GeminiRouter:
                     parsed, text, usage = call_gemini(
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
-                        retries=retries,
+                        retries=retries, labels=labels, json_mode=json_mode,
+                        thinking=thinking,
                         on_problem=self._problem_cb(on_problem, label, model),
                         on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0
@@ -701,7 +738,8 @@ class GeminiRouter:
 
     def call_pinned(self, cfg, key, prompt, data_b64, mime_type,
                     temperature=0.1, max_tokens=16384, retries=None,
-                    on_problem=None, on_route=None):
+                    on_problem=None, on_route=None, labels=None,
+                    json_mode=False, thinking=None):
         """Same contract as call(), but PINNED to one key: it walks only that
         key's own ladder (blocked models / spent day caps / sticky model all
         honoured) and never rotates to another key. Does NOT touch
@@ -737,7 +775,8 @@ class GeminiRouter:
                     parsed, text, usage = call_gemini(
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
-                        retries=retries,
+                        retries=retries, labels=labels, json_mode=json_mode,
+                        thinking=thinking,
                         on_problem=self._problem_cb(on_problem, label, model),
                         on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0

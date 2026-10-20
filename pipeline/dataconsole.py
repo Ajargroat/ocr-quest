@@ -1,5 +1,5 @@
 """Data Console backend — schema-aware browsing, safe row actions and a
-guarded SQL editor over the five pipeline tables (see pipeline.backups.TABLES).
+guarded SQL editor over the pipeline tables (see pipeline.backups.TABLES).
 
 Safety model
 ------------
@@ -7,8 +7,8 @@ Safety model
   information_schema and are matched against a fixed allowlist before being
   interpolated, so no raw user string ever becomes an identifier.
 * The SQL editor accepts exactly ONE statement whose first verb is
-  SELECT / WITH / INSERT / UPDATE / DELETE and which references only the five
-  known tables (plus read-only information_schema). UPDATE/DELETE additionally
+  SELECT / WITH / INSERT / UPDATE / DELETE and which references only the
+  allowed tables (plus read-only information_schema). UPDATE/DELETE additionally
   require a WHERE clause. Comments and string literals are stripped before the
   guard inspects the text, so keywords hidden in literals cannot smuggle
   anything through — and anything resembling DDL/DCL/transaction control or an
@@ -173,7 +173,7 @@ def guard_sql(raw):
             continue
         if schema != "public" or table not in TABLES:
             raise GuardError(
-                f"Only the five pipeline tables are reachable here "
+                f"Only the pipeline tables are reachable here "
                 f"(blocked: {ref}).")
     return ("read" if verb in ("select", "with") else "write"), text
 
@@ -264,7 +264,7 @@ class DataConsole:
 
     # ── reads ──────────────────────────────────────────────────────
     def overview(self):
-        """Row counts, column lists and newest-entry time for all five tables,
+        """Row counts, column lists and newest-entry time for all allowed tables,
         which is what the tab's cards and table switcher render."""
         tables = []
         for table in TABLES:

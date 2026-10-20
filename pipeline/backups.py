@@ -21,14 +21,49 @@ import psycopg2
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backups")
 GRAVEYARD_FILE = os.path.join(BACKUP_ROOT, "row_graveyard.jsonl")
 
-# The five tables the Data Console owns. revision_summary has no PK and uses
-# last_at instead of created_at — ordering keys are kept here for both jobs.
-TABLES = ("sources", "questions", "answers", "revision_reports", "revision_summary")
+# The tables the Data Console + the backup job own: all of the new model.
+# revision_summary is the one table without created_at, so it keeps its own
+# ordering key; a table whose created_at is missing is backed up unordered
+# (run_backup guards on that) and one the target DB does not have yet is
+# skipped instead of failing the run.
+TABLES = (
+    # lessons model (root PDF)
+    "courses", "chapters", "lessons", "lesson_blocks", "media_assets",
+    "questions", "question_options", "short_answer_keys",
+    "attempts", "lesson_progress",
+    # OCR side
+    "sources", "answers", "revision_reports", "revision_summary",
+)
 TS_COL = {t: "created_at" for t in TABLES}
 TS_COL["revision_summary"] = "last_at"
 
 SET_NAME_RE = re.compile(r"^\d{8}-\d{6}Z$")
 TABLE_RE = re.compile(r"^[a-z_]+$")
+# The source tree rides along in every set (Q8): the DB only points at it by
+# folder id, so a restore without these files would lose the actual PDFs.
+SOURCES_DIR = "sources"
+
+
+def snapshot_sources(out_dir, root):
+    """Copy the source tree into the set; returns the manifest block."""
+    dest = os.path.join(out_dir, SOURCES_DIR)
+    files = total = 0
+    if not root or not os.path.isdir(root):
+        return {"dir": SOURCES_DIR, "root": root, "files": 0, "bytes": 0}
+    for dirpath, dirnames, names in os.walk(root):
+        dirnames.sort()
+        for name in sorted(names):
+            src = os.path.join(dirpath, name)
+            target = os.path.join(dest, os.path.relpath(src, root))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                shutil.copy2(src, target)
+            except OSError as exc:
+                return {"dir": SOURCES_DIR, "root": root, "files": files,
+                        "bytes": total, "error": str(exc)}
+            files += 1
+            total += os.path.getsize(target)
+    return {"dir": SOURCES_DIR, "root": root, "files": files, "bytes": total}
 
 
 def _env_int(var, default):
@@ -93,6 +128,7 @@ def run_backup(cfg, trigger="weekly"):
         "total_rows": 0,
         "total_bytes": 0,
     }
+    missing = []
     conn = _connect(cfg)
     try:
         with conn.cursor() as cur:
@@ -101,6 +137,9 @@ def run_backup(cfg, trigger="weekly"):
             manifest["server_version"] = vrow[0] if vrow else "unknown"
             for table in TABLES:
                 cols = _table_columns(cur, table)
+                if not cols:      # not in this DB (the old model's rollback)
+                    missing.append(table)
+                    continue
                 ts = TS_COL.get(table)
                 order = f" ORDER BY {ts} DESC NULLS LAST" if ts in cols else ""
                 cur.execute(f"SELECT {', '.join(cols)} FROM public.{table}{order}")
@@ -132,9 +171,13 @@ def run_backup(cfg, trigger="weekly"):
                 manifest["total_rows"] += len(rows)
                 manifest["total_bytes"] += manifest["tables"][table]["sql_bytes"] \
                     + manifest["tables"][table]["json_bytes"]
+            if missing:
+                manifest["missing_tables"] = missing
     finally:
         conn.close()
 
+    manifest["sources"] = snapshot_sources(out_dir, cfg.input_root)
+    manifest["total_bytes"] += manifest["sources"]["bytes"]
     manifest["duration_s"] = round(
         (datetime.now(timezone.utc) - started).total_seconds(), 2)
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:

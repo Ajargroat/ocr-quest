@@ -96,8 +96,8 @@ class RouterTest(unittest.TestCase):
         r = GeminiRouter()
         parsed, _text, route = r.call(make_cfg(), "p", "b", "image/jpeg")
         self.assertEqual(parsed, {"answer": 1})
-        self.assertEqual(fake.calls, [("k1111111111", "gemini-3.5-flash")])
-        self.assertEqual(route["model"], "gemini-3.5-flash")
+        self.assertEqual(fake.calls, [("k1111111111", "gemini-3.5-flash-lite")])
+        self.assertEqual(route["model"], "gemini-3.5-flash-lite")
         self.assertEqual(route["attempts"], 1)
 
     def test_second_call_reuses_cached_pair(self):
@@ -110,27 +110,27 @@ class RouterTest(unittest.TestCase):
     # ---------------------------------------------------- model ladder steps
     def test_model_steps_up_within_the_same_key(self):
         fake = self._use({
-            "k1111111111|gemini-3.5-flash": "model_unavailable",
+            "k1111111111|gemini-3.5-flash-lite": "model_unavailable",
         })
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertEqual(route["model"], "gemini-3.6-flash")
+        self.assertEqual(route["model"], "gemini-3.5-flash")
         self.assertEqual(route["attempts"], 2)
         # the dead model is cached — the next file must not pay for it again
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
 
     def test_empty_reply_steps_ladder_without_caching_death(self):
         """A model that blanks on one page is not 'dead' — but the sticky
         last-good model keeps that key starting one rung higher."""
         fake = self._use({
-            "k1111111111|gemini-3.5-flash": "model_empty",
+            "k1111111111|gemini-3.5-flash-lite": "model_empty",
         })
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertEqual(route["model"], "gemini-3.6-flash")
-        self.assertNotIn("gemini-3.5-flash", r._entry("k1111111111")["blocked"])
+        self.assertEqual(route["model"], "gemini-3.5-flash")
+        self.assertNotIn("gemini-3.5-flash-lite", r._entry("k1111111111")["blocked"])
         # 3.5 is still in key #1's plan (not blocked), behind the sticky pick
         self.assertIn("gemini-3.5-flash",
                       [m for m in r._plan(make_cfg(), time.time())[0][2]])
@@ -138,48 +138,48 @@ class RouterTest(unittest.TestCase):
         r.call(make_cfg(), "p", "b", "image/jpeg")
         # rotation moved the pointer past key #1, so the next call goes to
         # key #2 — but key #1 must never be offered 3.5 first again
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
 
     # ------------------------------------------------------------ key failover
     def test_bad_key_fails_over_to_next_key(self):
-        fake = self._use({"k1111111111|gemini-3.5-flash": "bad_key"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "bad_key"})
         seen = []
         r = GeminiRouter()
         _p, _t, route = r.call(
             make_cfg(), "p", "b", "image/jpeg",
             on_route=lambda *a: seen.append(a))
         self.assertEqual(route["key"], mask("k2222222222"))
-        self.assertEqual(fake.calls, [("k1111111111", "gemini-3.5-flash"),
-                                      ("k2222222222", "gemini-3.5-flash")])
+        self.assertEqual(fake.calls, [("k1111111111", "gemini-3.5-flash-lite"),
+                                      ("k2222222222", "gemini-3.5-flash-lite")])
         # the fault is recorded against the PAIR only — the key never dies,
         # so the pool keeps serving, and the failed pair is never paid twice
         st = r._entry("k1111111111")
         self.assertFalse(st["dead"])
-        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        self.assertGreater(st["blocked"]["gemini-3.5-flash-lite"], time.time())
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
         self.assertTrue(fake.calls)      # the pool is still working
 
     def test_rate_limit_cools_the_pair_and_the_next_key_serves(self):
         fake = self._use({
-            "k1111111111|gemini-3.5-flash": "rate_limit",
+            "k1111111111|gemini-3.5-flash-lite": "rate_limit",
         })
         r = GeminiRouter()
         r.call(make_cfg(), "p", "b", "image/jpeg")
         self.assertEqual(fake.calls,
-                         [("k1111111111", "gemini-3.5-flash"),
-                          ("k2222222222", "gemini-3.5-flash")])
+                         [("k1111111111", "gemini-3.5-flash-lite"),
+                          ("k2222222222", "gemini-3.5-flash-lite")])
         # the fault parks the PAIR (plus a soft penalty) — the key never
         # dies, so even a single-key pool keeps serving its other rungs
         st = r._entry("k1111111111")
         self.assertFalse(st["dead"])
-        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        self.assertGreater(st["blocked"]["gemini-3.5-flash-lite"], time.time())
         self.assertGreater(st["penalty_until"], time.time())
         # the cooled pair is never paid for twice
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
         # once the pair cools down but the soft penalty is live, the key
         # sorts behind every clean key…
         st["blocked"].clear()
@@ -195,26 +195,26 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(fake.calls[0][0], "k1111111111")
 
     def test_quota_spends_the_model_not_the_key(self):
-        """Free-tier day quota is per model: 3.5 being refused must step
-        to 3.6 on the SAME key, not cold-down the whole key for hours."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "quota"})
+        """Free-tier day quota is per model: lite being refused must step
+        to 3.5 on the SAME key, not cold-down the whole key for hours."""
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "quota"})
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertEqual(route["model"], "gemini-3.6-flash")
+        self.assertEqual(route["model"], "gemini-3.5-flash")
         self.assertEqual(route["key"], mask("k1111111111"))
         st = r._entry("k1111111111")
         self.assertFalse(st["dead"])
-        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        self.assertGreater(st["blocked"]["gemini-3.5-flash-lite"], time.time())
         # the refusal IS counted as an attempt (item 1) — it is not a
         # completion, so the key keeps serving on the next rung
         u = r._usage_of("k1111111111")
+        self.assertEqual(u["models"].get("gemini-3.5-flash-lite"), 1)
         self.assertEqual(u["models"].get("gemini-3.5-flash"), 1)
-        self.assertEqual(u["models"].get("gemini-3.6-flash"), 1)
         # the next file must start above the spent rung — 3.5 is never
         # offered to this key again while the pair is parked
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
 
     def test_whole_pool_exhausted_raises_after_bounded_attempts(self):
         dead = {f"{k}|{m}": "model_unavailable"
@@ -286,7 +286,7 @@ class RouterTest(unittest.TestCase):
     def test_failed_key_is_demoted_after_cooldown(self):
         """After the hard cooldown expires, the key is eligible again
         but the soft penalty keeps it behind every clean key."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "bad_key"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "bad_key"})
         r = GeminiRouter()
         r.call(make_cfg(), "p", "b", "image/jpeg")   # k1 fails → k2 ok
         st = r._entry("k1111111111")
@@ -325,7 +325,7 @@ class RouterTest(unittest.TestCase):
 
     # ------------------------------------------------------------- global faults
     def test_tunnel_down_aborts_without_burning_the_pool(self):
-        fake = self._use({"k1111111111|gemini-3.5-flash": "tunnel_down"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "tunnel_down"})
         r = GeminiRouter()
         with self.assertRaises(faults.FaultError) as ctx:
             r.call(make_cfg(), "p", "b", "image/jpeg")
@@ -336,31 +336,41 @@ class RouterTest(unittest.TestCase):
         """A Gemini 403 (permission denied → geo_block) is a per-pair fault:
         the rung is parked and the ladder steps up instead of aborting the
         whole call (Q4). The key itself must never die."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "geo_block"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "geo_block"})
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertEqual(route["model"], "gemini-3.6-flash")
+        self.assertEqual(route["model"], "gemini-3.5-flash")
         st = r._entry("k1111111111")
         self.assertFalse(st["dead"])           # the KEY is fine — the pair isn't
-        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        self.assertGreater(st["blocked"]["gemini-3.5-flash-lite"], time.time())
         # the parked pair is never offered to this key again
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
         self.assertTrue(fake.calls)            # the pool is still working
 
     def test_unknown_fault_parks_the_pair_and_steps_the_ladder(self):
         """`unknown` is neither global nor cached — it must park the pair and
         step the ladder, not abort the call (the old bare-raise fall-through)."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "unknown"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "unknown"})
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertEqual(route["model"], "gemini-3.6-flash")
+        self.assertEqual(route["model"], "gemini-3.5-flash")
         st = r._entry("k1111111111")
-        self.assertGreater(st["blocked"]["gemini-3.5-flash"], time.time())
+        self.assertGreater(st["blocked"]["gemini-3.5-flash-lite"], time.time())
         fake.calls.clear()
         r.call(make_cfg(), "p", "b", "image/jpeg")
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
+
+    def test_enabled_subset_filters_the_plan(self):
+        cfg = make_cfg()
+        cfg.gemini_enabled_models = ("gemini-3.5-flash-lite",)
+        plan = {i: ms for i, _k, ms, _lat, _pen in GeminiRouter()._plan(cfg, 0)}
+        self.assertEqual(plan[0], ["gemini-3.5-flash-lite"])
+        cfg.gemini_enabled_models = None
+        full = {i: ms for i, _k, ms, _lat, _pen in GeminiRouter()._plan(cfg, 0)}[0]
+        self.assertEqual(full[0], "gemini-3.5-flash-lite")
+        self.assertIn("gemini-3.8-flash", full)
 
     def test_missing_pool_raises_immediately(self):
         r = GeminiRouter()
@@ -458,23 +468,38 @@ class RouterTest(unittest.TestCase):
 
     def test_a_spent_model_is_dropped_from_the_plan(self):
         r = GeminiRouter()
-        for _ in range(r.day_limit()):
-            r._count_attempt("k1111111111", "gemini-3.5-flash")
+        for _ in range(r.day_limit("gemini-3.5-flash-lite")):
+            r._count_attempt("k1111111111", "gemini-3.5-flash-lite")
         ladder = dict((i, ms) for i, _k, ms, _lat, _pen in
                       r._plan(make_cfg(keys=("k1111111111",)), 0))[0]
-        self.assertNotIn("gemini-3.5-flash", ladder)
-        self.assertEqual(ladder[0], "gemini-3.6-flash")
+        self.assertNotIn("gemini-3.5-flash-lite", ladder)
+        self.assertEqual(ladder[0], "gemini-3.5-flash")
+
+    def test_each_model_carries_its_own_day_cap(self):
+        """flash-lite is the 500-a-day rung; the shared cap stays 20."""
+        r = GeminiRouter()
+        self.assertEqual(r.day_limit("gemini-3.5-flash-lite"), 500)
+        self.assertEqual(r.day_limit("gemini-3.5-flash"), r.day_limit())
+        self.assertEqual(r.model_limits().get("gemini-3.5-flash-lite"), 500)
+
+    def test_the_day_cap_is_per_model_not_one_number(self):
+        r = GeminiRouter()
+        for _ in range(r.day_limit()):
+            r._count_attempt("k1111111111", "gemini-3.5-flash")
+        self.assertTrue(r._spent_today("k1111111111", "gemini-3.5-flash"))
+        # the same key's flash-lite budget is untouched
+        self.assertFalse(r._spent_today("k1111111111", "gemini-3.5-flash-lite"))
 
     def test_errors_still_increment_the_attempt_count(self):
         """Item 1/Q1: a failed request is a request Google counted, so the
         gauge moves even though the call never completed."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "rate_limit"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "rate_limit"})
         r = GeminiRouter()
         r.call(make_cfg(), "p", "b", "image/jpeg")   # k1 fails, k2 completes
         u1 = r._usage_of("k1111111111")
         u2 = r._usage_of("k2222222222")
-        self.assertEqual(u1["models"]["gemini-3.5-flash"], 1)   # the failed attempt
-        self.assertEqual(u2["models"]["gemini-3.5-flash"], 1)   # the completed one
+        self.assertEqual(u1["models"]["gemini-3.5-flash-lite"], 1)   # the failed attempt
+        self.assertEqual(u2["models"]["gemini-3.5-flash-lite"], 1)   # the completed one
 
     def test_each_retry_inside_call_gemini_counts_once(self):
         """call_gemini retries a transient fault up to NET_RETRIES times;
@@ -489,20 +514,20 @@ class RouterTest(unittest.TestCase):
         r = GeminiRouter()
         r.call(make_cfg(), "p", "b", "image/jpeg")
         self.assertEqual(
-            r._usage_of("k1111111111")["models"]["gemini-3.5-flash"], 3)
+            r._usage_of("k1111111111")["models"]["gemini-3.5-flash-lite"], 3)
 
     def test_a_bare_mark_still_counts_nothing(self):
         """A `_mark` (quota/rate_limit) with no request must leave the gauge
         empty — only real HTTP attempts count (item 1)."""
         r = GeminiRouter()
-        r._mark("k1111111111", "quota", "gemini-3.5-flash")
+        r._mark("k1111111111", "quota", "gemini-3.5-flash-lite")
         self.assertEqual(r._usage_of("k1111111111")["models"], {})
 
     def test_a_failed_pair_never_freezes_the_pool(self):
         """Two keys: the failed pair rotates to the next key and the call
         completes. One key: the pair alone is parked — the key stays alive
         and the next file is served without re-paying the failed pair."""
-        fake = self._use({"k1111111111|gemini-3.5-flash": "rate_limit"})
+        fake = self._use({"k1111111111|gemini-3.5-flash-lite": "rate_limit"})
         r = GeminiRouter()
         _p, _t, route = r.call(make_cfg(), "p", "b", "image/jpeg")
         self.assertEqual(route["key"], mask("k2222222222"))
@@ -515,12 +540,12 @@ class RouterTest(unittest.TestCase):
         _p, _t, route = r1.call(make_cfg(keys=("k1111111111",)), "p", "b",
                                 "image/jpeg")
         self.assertEqual(route["key"], mask("k1111111111"))
-        self.assertNotIn(("k1111111111", "gemini-3.5-flash"), fake.calls)
+        self.assertNotIn(("k1111111111", "gemini-3.5-flash-lite"), fake.calls)
         self.assertTrue(fake.calls)
 
     def test_a_key_with_zero_completed_calls_never_reads_20_over_20(self):
         r = GeminiRouter()
-        r._mark("k1111111111", "quota", "gemini-3.5-flash")   # the old fill bug
+        r._mark("k1111111111", "quota", "gemini-3.5-flash-lite")   # the old fill bug
         u = r._usage_of("k1111111111")
         self.assertLess(u["models"].get("gemini-3.5-flash", 0), u["limit"])
         for used in u["models"].values():
@@ -528,12 +553,12 @@ class RouterTest(unittest.TestCase):
 
     def test_usage_survives_a_new_router_and_never_stores_the_key(self):
         r = GeminiRouter()
-        r._count_attempt("supersecretkey", "gemini-3.5-flash")
+        r._count_attempt("supersecretkey", "gemini-3.5-flash-lite")
         with open(gemini_router.USAGE_PATH) as fh:
             blob = fh.read()
         self.assertNotIn("supersecretkey", blob)
         self.assertEqual(GeminiRouter()._usage_of("supersecretkey")
-                         ["models"]["gemini-3.5-flash"], 1)
+                         ["models"]["gemini-3.5-flash-lite"], 1)
 
     # ----------------------------------------------------------------- mask
     def test_mask_never_leaks_a_usable_key(self):
@@ -650,10 +675,10 @@ class ConfigPoolTest(unittest.TestCase):
         os.environ["GEMINI_API_KEY_ANSWERS"] = "z"
         self.assertEqual(_gemini_pool(), ("z", "q"))
 
-    def test_default_ladder_is_35_to_38_flash(self):
+    def test_default_ladder_is_lite_to_38_flash(self):
         os.environ.pop("GEMINI_MODEL_LADDER", None)
         self.assertEqual(_model_ladder(), DEFAULT_MODEL_LADDER)
-        self.assertEqual(DEFAULT_MODEL_LADDER[0], "gemini-3.5-flash")
+        self.assertEqual(DEFAULT_MODEL_LADDER[0], "gemini-3.5-flash-lite")
         self.assertEqual(DEFAULT_MODEL_LADDER[-1], "gemini-3.8-flash")
 
     def test_legacy_ocr_keys_seed_one_custom_provider(self):
@@ -725,6 +750,88 @@ class TextOnlyGeminiTest(unittest.TestCase):
             gemini.requests.post = real_post
         parts = captured["payload"]["contents"][0]["parts"]
         self.assertEqual(parts, [{"text": "hi"}])
+
+    def test_multiple_images_interleave_labels_and_control_generation(self):
+        captured = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [
+                    {"text": '{"ok": 1}'}]}}]}
+
+        def fake_post(url, json=None, headers=None, timeout=None, proxies=None):
+            captured["payload"] = json
+            return Resp()
+
+        real_post = gemini.requests.post
+        gemini.requests.post = fake_post
+        try:
+            gemini.call_gemini("k", "gemini-3.5-flash", "hi", ["a", "b"],
+                               "image/jpeg", labels=["BAND p1:", "BAND p2:"],
+                               json_mode=True, thinking=0)
+        finally:
+            gemini.requests.post = real_post
+        parts = captured["payload"]["contents"][0]["parts"]
+        self.assertEqual(parts, [
+            {"text": "hi"},
+            {"text": "BAND p1:"},
+            {"inline_data": {"mime_type": "image/jpeg", "data": "a"}},
+            {"text": "BAND p2:"},
+            {"inline_data": {"mime_type": "image/jpeg", "data": "b"}},
+        ])
+        generation = captured["payload"]["generationConfig"]
+        self.assertEqual(generation["responseMimeType"], "application/json")
+        self.assertEqual(generation["thinkingConfig"], {"thinkingBudget": 0})
+
+    def test_a_lite_model_omits_an_explicit_thinking_budget(self):
+        captured = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [
+                    {"text": '{"ok": 1}'}]}}]}
+
+        def fake_post(url, json=None, headers=None, timeout=None, proxies=None):
+            captured["payload"] = json
+            return Resp()
+
+        real_post = gemini.requests.post
+        gemini.requests.post = fake_post
+        try:
+            gemini.call_gemini("k", "gemini-3.5-flash-lite", "hi", "",
+                               "text/plain", thinking=0)
+        finally:
+            gemini.requests.post = real_post
+        self.assertNotIn("thinkingConfig",
+                         captured["payload"]["generationConfig"])
+
+    def test_a_pro_model_keeps_its_default_thinking_budget(self):
+        captured = {}
+
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [
+                    {"text": '{"ok": 1}'}]}}]}
+
+        def fake_post(url, json=None, headers=None, timeout=None, proxies=None):
+            captured["payload"] = json
+            return Resp()
+
+        real_post = gemini.requests.post
+        gemini.requests.post = fake_post
+        try:
+            gemini.call_gemini("k", "gemini-3-pro", "hi", "", "text/plain",
+                               json_mode=True, thinking=0)
+        finally:
+            gemini.requests.post = real_post
+        self.assertNotIn("thinkingConfig",
+                         captured["payload"]["generationConfig"])
 
 
 if __name__ == "__main__":
