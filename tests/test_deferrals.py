@@ -1,4 +1,4 @@
-"""Write-cache (deferrals) and circuit-breaker tests (no network, no database).
+﻿"""Write-cache (deferrals) and circuit-breaker tests (no network, no database).
 
 Run them either way:
     python tests/test_deferrals.py
@@ -14,8 +14,8 @@ from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline import deferrals, runner                                      # noqa: E402
-from pipeline.runner import Hub, _major_db_halt, _process_item              # noqa: E402
+from pipeline import deferrals, faults, runner                          # noqa: E402
+from pipeline.runner import Hub, _major_db_halt, _process_item, blocked_remaining  # noqa: E402
 from pipeline.scanner import SourceItem                                     # noqa: E402
 
 
@@ -56,13 +56,16 @@ class FakeDB:
 class FakeRouter:
     """Stands in for gemini_router.router inside pipeline.runner."""
 
-    def __init__(self, parsed=None):
+    def __init__(self, parsed=None, fault=None):
         self.parsed = parsed if parsed is not None else {
             "questions": [{"question_number": 1, "question_text": "hi"}]}
+        self.fault = fault
 
-    def call(self, cfg, prompt, data_b64, mime, on_problem=None, on_route=None):
+    def call(self, cfg, prompt, data_b64, mime, on_problem=None, on_route=None,
+             **kwargs):
+        if self.fault is not None:
+            raise self.fault
         return self.parsed, {}, {}
-
 
 class CacheCase(unittest.TestCase):
     """Isolates the cache file + retry env for every test."""
@@ -208,6 +211,32 @@ class ProcessItemTest(CacheCase):
         hub = Hub()
         outcome = _process_item(hub, None, FakeDB(), source_item(file_path=self.file_path), 1, 1)
         self.assertEqual(outcome, "failed")
+
+    def test_pool_exhausted_returns_blocked(self):
+        """An exhausted flag on the router's fault means the whole run should
+        stop (Q4) — the file is reported blocked, not merely failed."""
+        flt = faults.fault("quota", "all keys cooling down")
+        flt["exhausted"] = True
+        runner.router = FakeRouter(fault=faults.FaultError(flt, "no pair left"))
+        hub = Hub()
+        outcome = _process_item(hub, None, FakeDB(),
+                                source_item(file_path=self.file_path), 1, 1)
+        self.assertEqual(outcome, "blocked")
+        self.assertTrue(os.path.exists(self.file_path))   # the file is not moved
+        # the same fault WITHOUT the flag is an ordinary failure, not a stop
+        runner.router = FakeRouter(
+            fault=faults.FaultError(faults.fault("quota", "spent"), "spent"))
+        outcome = _process_item(hub, None, FakeDB(),
+                                source_item(file_path=self.file_path), 1, 1)
+        self.assertEqual(outcome, "failed")
+
+
+class BlockedRemainingTest(unittest.TestCase):
+    def test_blocked_remaining_counts_the_failing_file(self):
+        """N = the failing file plus the remaining queue (Q4)."""
+        self.assertEqual(blocked_remaining(50, 1), 50)
+        self.assertEqual(blocked_remaining(50, 50), 1)
+        self.assertEqual(blocked_remaining(50, 51), 0)
 
 
 class MajorHaltTest(CacheCase):

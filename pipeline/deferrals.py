@@ -39,7 +39,7 @@ def save_retries():
 
 
 def retry_wait():
-    """Base seconds between those attempts; grows linearly per attempt."""
+    """Base seconds between those attempts; waits grow exponentially."""
     return max(0.0, float(_num("DB_SAVE_RETRY_WAIT", 5)))
 
 
@@ -140,7 +140,7 @@ def flush(db, log=None, on_applied=None):
                 last = getattr(exc, "fault", None) or faults.classify(exc)
                 last["raw"] = last.get("raw") or str(exc)[:400]
                 if attempt < retries:
-                    wait = base * attempt
+                    wait = faults.backoff_wait(attempt, base)
                     warn(f"  ↳ cached batch {entry.get('rel_path', '?')}: {last['label']} "
                          f"· attempt {attempt}/{retries} failed — retrying in {int(wait)}s")
                     time.sleep(wait)

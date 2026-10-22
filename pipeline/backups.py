@@ -17,18 +17,54 @@ import shutil
 from datetime import datetime, timezone
 
 import psycopg2
+from psycopg2.extras import Json
 
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backups")
 GRAVEYARD_FILE = os.path.join(BACKUP_ROOT, "row_graveyard.jsonl")
 
-# The five tables the Data Console owns. revision_summary has no PK and uses
-# last_at instead of created_at — ordering keys are kept here for both jobs.
-TABLES = ("sources", "questions", "answers", "revision_reports", "revision_summary")
+# The tables the Data Console + the backup job own: all of the new model.
+# revision_summary is the one table without created_at, so it keeps its own
+# ordering key; a table whose created_at is missing is backed up unordered
+# (run_backup guards on that) and one the target DB does not have yet is
+# skipped instead of failing the run.
+TABLES = (
+    # lessons model (root PDF)
+    "courses", "chapters", "lessons", "lesson_blocks", "media_assets",
+    "questions", "question_options", "short_answer_keys",
+    "attempts", "lesson_progress",
+    # OCR side
+    "sources", "answers", "revision_reports", "revision_summary",
+)
 TS_COL = {t: "created_at" for t in TABLES}
 TS_COL["revision_summary"] = "last_at"
 
 SET_NAME_RE = re.compile(r"^\d{8}-\d{6}Z$")
 TABLE_RE = re.compile(r"^[a-z_]+$")
+# The source tree rides along in every set (Q8): the DB only points at it by
+# folder id, so a restore without these files would lose the actual PDFs.
+SOURCES_DIR = "sources"
+
+
+def snapshot_sources(out_dir, root):
+    """Copy the source tree into the set; returns the manifest block."""
+    dest = os.path.join(out_dir, SOURCES_DIR)
+    files = total = 0
+    if not root or not os.path.isdir(root):
+        return {"dir": SOURCES_DIR, "root": root, "files": 0, "bytes": 0}
+    for dirpath, dirnames, names in os.walk(root):
+        dirnames.sort()
+        for name in sorted(names):
+            src = os.path.join(dirpath, name)
+            target = os.path.join(dest, os.path.relpath(src, root))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            try:
+                shutil.copy2(src, target)
+            except OSError as exc:
+                return {"dir": SOURCES_DIR, "root": root, "files": files,
+                        "bytes": total, "error": str(exc)}
+            files += 1
+            total += os.path.getsize(target)
+    return {"dir": SOURCES_DIR, "root": root, "files": files, "bytes": total}
 
 
 def _env_int(var, default):
@@ -39,23 +75,30 @@ def _env_int(var, default):
 
 
 def interval_days():
-    return _env_int("BACKUP_INTERVAL_DAYS", 7)
+    return _env_int("BACKUP_INTERVAL_DAYS", 1)
 
 
 def keep_sets():
-    return _env_int("BACKUP_KEEP", 12)
+    return _env_int("BACKUP_KEEP", 1)
 
 
 def _connect(cfg):
-    conn = psycopg2.connect(
-        host=cfg.postgres_host, port=cfg.postgres_port, dbname=cfg.postgres_db,
-        user=cfg.postgres_user, password=cfg.postgres_password, connect_timeout=10,
-    )
+    kwargs = dict(host=cfg.postgres_host, port=cfg.postgres_port,
+                  dbname=cfg.postgres_db, user=cfg.postgres_user,
+                  password=cfg.postgres_password, connect_timeout=10)
+    if cfg.postgres_sslmode:
+        kwargs["sslmode"] = cfg.postgres_sslmode   # "" → libpq default
+    conn = psycopg2.connect(**kwargs)
     conn.autocommit = True
     return conn
 
 
 def _jsonable(v):
+    """A value JSON can carry as-is.
+
+    jsonb/json columns come back as dict/list — they ARE the JSON, so they
+    pass through untouched (stringifying them would write Python's repr into
+    the snapshot and make the restore unreadable)."""
     from decimal import Decimal
     if isinstance(v, (datetime,)):
         return v.isoformat()
@@ -63,7 +106,27 @@ def _jsonable(v):
         return float(v)
     if isinstance(v, (bytes, bytearray)):
         return v.hex()
+    if isinstance(v, (dict, list, bool, int, float)) or v is None:
+        return v
     return str(v)
+
+
+def _sql_value(v):
+    """A value psycopg2 can adapt for the SQL dump.
+
+    A dict/list needs the JSON adapter: psycopg2 has no default adapter for
+    Python containers ("can't adapt type 'dict'"), and every jsonb column in
+    lesson_blocks/questions/media_assets is exactly that. Json() writes the
+    same literal the API would, so the dump replays into the column
+    unchanged."""
+    if isinstance(v, (dict, list)):
+        return Json(v)
+    return v
+
+
+def _drop_partial(out_dir):
+    """Remove a snapshot directory that never reached its manifest."""
+    shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def _table_columns(cur, table):
@@ -91,7 +154,12 @@ def run_backup(cfg, trigger="weekly"):
         "total_rows": 0,
         "total_bytes": 0,
     }
-    conn = _connect(cfg)
+    missing = []
+    try:
+        conn = _connect(cfg)
+    except Exception:
+        _drop_partial(out_dir)
+        raise
     try:
         with conn.cursor() as cur:
             cur.execute("SHOW server_version")
@@ -99,6 +167,9 @@ def run_backup(cfg, trigger="weekly"):
             manifest["server_version"] = vrow[0] if vrow else "unknown"
             for table in TABLES:
                 cols = _table_columns(cur, table)
+                if not cols:      # not in this DB (the old model's rollback)
+                    missing.append(table)
+                    continue
                 ts = TS_COL.get(table)
                 order = f" ORDER BY {ts} DESC NULLS LAST" if ts in cols else ""
                 cur.execute(f"SELECT {', '.join(cols)} FROM public.{table}{order}")
@@ -120,7 +191,8 @@ def run_backup(cfg, trigger="weekly"):
                     fh.write("-- %s · %s · %d rows · trigger=%s\n" % (
                         name, table, len(rows), trigger))
                     for row in rows:
-                        fh.write(cur.mogrify(template, row).decode("utf-8") + "\n")
+                        params = tuple(_sql_value(v) for v in row)
+                        fh.write(cur.mogrify(template, params).decode("utf-8") + "\n")
 
                 manifest["tables"][table] = {
                     "rows": len(rows),
@@ -130,9 +202,18 @@ def run_backup(cfg, trigger="weekly"):
                 manifest["total_rows"] += len(rows)
                 manifest["total_bytes"] += manifest["tables"][table]["sql_bytes"] \
                     + manifest["tables"][table]["json_bytes"]
+            if missing:
+                manifest["missing_tables"] = missing
+    except Exception:
+        # A set without a manifest is invisible to list_sets() and would never
+        # be rotated away — drop the half-written directory instead of leaking it.
+        _drop_partial(out_dir)
+        raise
     finally:
         conn.close()
 
+    manifest["sources"] = snapshot_sources(out_dir, cfg.input_root)
+    manifest["total_bytes"] += manifest["sources"]["bytes"]
     manifest["duration_s"] = round(
         (datetime.now(timezone.utc) - started).total_seconds(), 2)
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
@@ -181,7 +262,8 @@ def due():
 
 
 def rotate():
-    """Delete all but the newest KEEP backup sets."""
+    """Delete all but the newest KEEP backup sets (KEEP defaults to 1 → only
+    the newest snapshot survives, so every backup deletes the older ones)."""
     sets = list_sets()
     for stale in sets[keep_sets():]:
         path = os.path.join(BACKUP_ROOT, stale["dir"])

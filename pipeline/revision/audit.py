@@ -13,6 +13,7 @@ import re
 
 import requests
 
+from .. import prompts
 from ..utils import to_english_digits
 from .pairing import parse_options_field
 
@@ -69,7 +70,9 @@ def build_audit_prompt(pairs) -> str:
             "raw_ocr_text": (q.get("raw_ocr_text") or "")[:3000],
             "answer_raw_ocr_text": (a.get("raw_ocr_text") or "")[:1500],
         })
-    return PROMPT_HEADER + "INPUT PAIRS:\n" + json.dumps(slim, ensure_ascii=False) + OUTPUT_FORMAT
+    return (prompts.get("revision.audit", PROMPT_HEADER)
+            + "INPUT PAIRS:\n" + json.dumps(slim, ensure_ascii=False)
+            + OUTPUT_FORMAT)
 
 
 def call_router(cfg, prompt: str, retries: int = 2) -> str:

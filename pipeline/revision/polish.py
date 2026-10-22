@@ -7,6 +7,7 @@ Every change is logged as an info-severity repair so it can be reviewed.
 import json
 import re
 
+from ..questions import is_real_bbox
 from ..utils import norm_text, parse_number, to_english_digits, to_persian_digits
 
 MATH_RE = re.compile(r'(\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\$[^$\n]+?\$|\\\([\s\S]+?\\\))')
@@ -195,7 +196,7 @@ def polish_row(q: dict, run_id: str) -> dict:
             bbox = json.loads(bbox)
         except Exception:
             bbox = None
-    has_b = isinstance(bbox, list) and len(bbox) == 4
+    has_b = is_real_bbox(bbox)
     row["has_diagram"] = has_b
     row["diagram_bbox"] = json.dumps(bbox) if has_b else None
     if has_b and not row.get("diagram_url") and row.get("source_storage_url"):

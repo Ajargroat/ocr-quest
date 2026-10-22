@@ -41,9 +41,9 @@ Manually:
 
 ```bash
 python -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/Scripts/pip install -r requirements.txt
 cp .env.example .env   # then fill in credentials
-.venv/bin/python main.py
+.venv/Scripts/python main.py
 ```
 
 ## Configuration
@@ -53,15 +53,19 @@ Main groups:
 
 | Group | Keys | Notes |
 |-------|------|-------|
-| Input tree | `INPUT_ROOT`¹, `MIN_AGE_SECONDS` | watched folder root, defaults to `./konkour-ocr` |
-| Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set |
+| Input tree | `INPUT_ROOT`¹, `MIN_AGE_SECONDS` (default 30 s maturity wait) | watched folder root, defaults to `./konkour-ocr` |
+| Database | `POSTGRES_HOST/PORT/DB/USER/PASSWORD/SSLMODE`, `SUPABASE_URL/SERVICE_KEY/BUCKET` | Supabase is used for image storage when set; blank `SSLMODE` keeps the driver default |
 | Gemini | `GEMINI_API_KEY`, `GEMINI_API_KEY_QUESTIONS/ANSWERS`, `GEMINI_MODEL_QUESTIONS/ANSWERS` | per-lane keys and models |
 | Router | `ROUTER_BASE_URL/API_KEY/MODEL` | optional OpenAI-compatible front for Gemini |
+| Providers / proxy | `EXTRACTION_PROVIDERS`, `EXTRACTION_ACTIVE`, `REVISION_PROVIDERS`, `REVISION_ACTIVE` | written by the dashboard; legacy `ROUTER_*` / `OCR_*` / `GEMINI_API_KEY*` are still read when absent. Named proxy profiles live in a git-ignored local `.proxy-profiles.json` store beside `.env`, not here |
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |
-| Converter | `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_JPEG_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | also read by `docker-compose.converter.yml` |
-| Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | |
+| Studio | `STUDIO_CHUNK_CHARS`, `STUDIO_CHUNK_IMAGES`, `STUDIO_PAGES_PER_CALL`, `STUDIO_BAND_BATCH`, `STUDIO_ORGANIZE`, `STUDIO_VISION_MODEL`, `STUDIO_VISION_LONG_EDGE`, `STUDIO_VISION_QUALITY`, `STUDIO_SOURCE_ROOT`, `STUDIO_CROP_PREFIX` | stage-1 request windows (contiguous pages per extraction call, bounded by chars and page images); pages per vision call (extraction/locate/OCR) and bands per figure pass; vision pages are capped by long edge and JPEG quality, not bytes; sources live in the folder tree (`<INPUT_ROOT>/studio` by default) and the DB references a source by its folder id; only crops go to the bucket under `STUDIO_CROP_PREFIX` (re-crop replaces the same object id) |
+| Converter | `CONVERTER_ENABLED`, `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | the watcher runs inside the app (no Docker); `CONVERTER_ENABLED=0` turns it off; every page JPEG is capped at 200 KB by re-encoding at a lower quality (DPI is never lowered) |
+| Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | dumps the lessons model as JSON + replayable SQL; keeps the newest `BACKUP_KEEP` sets |
+| OCR pages | `OCR_PAGES_PER_CALL` (1..8) | `1` is one picture per call; `2..8` reads that many pages in one request and splits the reply back onto the pages. The pipeline toolbar's "Pages / call" writes it |
+| Assistant | `ASSISTANT_PROVIDERS`, `ASSISTANT_MODEL`, `ASSISTANT_EFFORT`, `ASSISTANT_URL`, `ASSISTANT_API_KEY` | the floating help chat's own OpenAI-compatible endpoints, never an OCR lane; `ASSISTANT_PROVIDERS` holds several providers (label, base URL, key, model list) and `ASSISTANT_MODEL` picks one as `label::model`; the key stays server-side and the reply is relayed as text + thinking + usage events |
 
 ¹ `INPUT_ROOT` is read from the environment but not listed in `.env.example`; the
 default (`./konkour-ocr`) is used when it is unset.
@@ -78,38 +82,77 @@ konkour-ocr/
 The grade level is optional. Processed sources move to `done/` (failures to
 `failed/`) and are skipped by later scans.
 
-## PDF converter (optional)
+## PDF converter (embedded, no Docker)
 
-```bash
-docker compose -f docker-compose.converter.yml up -d --build
-```
+The PDF→JPEG converter is a background watcher inside the FastAPI app
+(`pipeline/converter.py`): it starts with the server, honours
+`MIN_AGE_SECONDS` so scans never race a live run, and can be switched off
+with `CONVERTER_ENABLED=0`. Tune it with `CONVERTER_*` in `.env`. The old
+`converter/Dockerfile` + `converter/watch.sh` (and
+`docker-compose.converter.yml`) are retired — Docker is no longer required.
 
-See [converter/README.md](converter/README.md) for the folder flow and tuning
-notes. Keep `MIN_AGE_SECONDS` at its default so scans don't race the converter.
+PDFs can also be pushed in from the dashboard: **Upload PDFs** on the
+pipeline page queues files with a `konkour-ocr/{subject}/{grade}/{topic}/
+{question|answer}` destination, extracts them one at a time, and lets you
+cancel or remove queued/failed entries.
+
+Keep `MIN_AGE_SECONDS` at its default (30 s) so scans don't race the converter.
+
+## OCR Studio
+
+Studio turns one PDF into reviewable rows: **Extract** (text layer or OCR, with
+a model re-read of a scrambled text page), **Enrich** (fields, tags, health),
+**Crop** (question boxes and figure crops), then **Inspect / Import**. The stage
+tabs are routed by `#studio/<tab>`; each stage's provider and model are picked
+in the Models tab, and only the Gemini-pool calls take the Studio proxy
+(9router stays loopback).
+
+The text lane is deterministic first: a page whose anchors, options or line
+flow are unsure is re-read by the extract model, one call per such page. The
+Extract tab's **organize** picker chooses that pass per run: `auto` (adaptive,
+the default), `off` (never) or `all pages` (force a full re-read). The env key
+`STUDIO_ORGANIZE` only defines what `auto` may do.
+
+Latency is dominated by the model lanes, not the code: on the reference physics
+booklet (3 dense pages, Gemini 3.5 flash-lite) an enrich call on 9router took
+26-89 s, while one Gemini-pool band batch through a proxy took 23-133 s.
+`STUDIO_PAGES_PER_CALL` and `STUDIO_BAND_BATCH` are the batching levers; the
+studio lanes obey the same `NET_RETRIES` / `NET_RETRY_WAIT` knobs as the
+pipeline. The pipeline tab's proxy check button probes every enabled profile
+before a run, so a dead tunnel is visible before any stage starts.
+
+Health is a triage signal: a row is `ready` when its demanded fields are filled
+and no issue is open. A metadata field the whole document cannot supply (no
+printed institute/year line) is reported once at the job level, not as one
+warning per row. The Inspect strip shows the job's own scorecard (questions,
+four-option sets, topic matches, crop approvals, organizer use) beside the row
+chips (status, topic, missing count, picture provenance).
 
 ## Tests
 
 ```bash
-.venv/bin/python -m unittest discover -s tests
+.venv/Scripts/python -m unittest discover -s tests
 ```
 
-131 tests, no network or database access required (DB-dependent paths are
+207 tests, no network or database access required (DB-dependent paths are
 stubbed or skipped).
 
 ## Project layout
 
 ```text
 main.py            FastAPI app, WebSocket hub, dashboard endpoints
-pipeline/          config, scanner, db, gemini, runner, deferrals,
-                   dataconsole, backups, revision/ (audit, polish, batch, …)
+pipeline/          config, scanner, db, gemini, gemini_router, runner,
+                   converter (embedded PDF watcher), uploads (queue),
+                   deferrals, dataconsole, backups, revision/ (audit, …)
 ui/                dashboard front-end (static, served by main.py)
-converter/         Docker PDF→JPEG watcher
 tests/             unittest suite
 tools/ocr.ps1     PowerShell controller (ocr start/stop/status/open)
 ```
 
 ## Local state (intentionally not committed)
 
-`.env`, `backups/`, `.gemini-usage.json`, `.pending-deferrals.json*`,
-`.venv/`, and `__pycache__/` are git-ignored. The pending-deferrals file is a
-write-cache replayed into Postgres at the start of the next run.
+`.env`, `backups/`, `.gemini-usage.json`, `.gemini-calls.json`,
+`.pending-deferrals.json*`, `.venv/`, and `__pycache__/` are git-ignored. The
+pending-deferrals file is a write-cache replayed into Postgres at the start of
+the next run; `.gemini-calls.json` is the per-call usage history behind the
+credentials usage reports (tokens, latency, masked key per send).

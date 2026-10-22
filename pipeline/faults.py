@@ -9,7 +9,28 @@ exception chain — exception type names, error wording, HTTP status and the
 Google error JSON — and maps it to one fault kind carrying a short label
 and actionable advice, which the runner forwards to the dashboard.
 """
+import os
 import re
+
+
+def backoff_wait(attempt, base=None, cap=None):
+    """Exponential backoff: short first wait, doubling, capped (Q8).
+
+    ``base`` defaults to NET_RETRY_WAIT (compat, default 5s); ``cap``
+    defaults to NET_RETRY_CAP (default 120s). Attempt is 1-based, so
+    the sequence is base, 2*base, 4*base, … capped.
+    """
+    if base is None:
+        try:
+            base = max(0.0, float(os.getenv("NET_RETRY_WAIT", "5")))
+        except ValueError:
+            base = 5.0
+    if cap is None:
+        try:
+            cap = max(0.0, float(os.getenv("NET_RETRY_CAP", "120")))
+        except ValueError:
+            cap = 120.0
+    return min(cap, base * (2 ** (max(1, attempt) - 1)))
 
 # group = colour family the UI uses for the chip (net/bill/auth/srv/model/…)
 KINDS = {

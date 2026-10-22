@@ -1,10 +1,160 @@
 """All Postgres operations: upserts for sources/questions/answers
-and the context fetch used by the answer branch."""
+and the context fetch used by the answer branch.
+
+The SQL targets the merged model the studio schema defines: the lessons
+`questions` table (BIGSERIAL `id`) extended with the OCR columns, where the old
+`<sha1>-q<N>` id lives in `legacy_id`, the OCR text in `prompt` and a
+question's picture in the `media_images` array (Q12 interface). The Python key
+names the rest of the pipeline speaks (`question_text`, `diagram_url`,
+`diagram_bbox`) are kept - only the columns moved.
+"""
+import json
+import posixpath
+import re
+
 import psycopg2
 
 from .config import Config
+from .questions import is_real_bbox
 from .scanner import SourceItem
-import json
+
+# The Supabase storage URL shape of a legacy diagram url: everything after the
+# bucket name is the object path.
+_STORAGE_OBJECT = re.compile(r"/storage/v1/object/(?:public/)?[^/]+/(.+)$")
+
+
+def folder_id(rel_path):
+    """Folder-tree id for a source: the directory a scanned file sits in.
+
+    The scanner's source id is sha1(rel_path); the DB also points at the folder
+    itself so a Database viewer can locate the file on disk (Q8).
+    """
+    folder = posixpath.dirname((rel_path or "").replace("\\", "/"))
+    return folder or None
+
+
+def storage_object_name(url):
+    """The bucket object path inside a storage URL, or None when there is none.
+
+    A legacy url ending in `<bucket>/unknown` names no usable object (the
+    broken proxy url the migration repairs, C2b), so it counts as "no picture".
+    """
+    match = _STORAGE_OBJECT.search(url or "")
+    if not match:
+        return None
+    name = match.group(1)
+    if name == "unknown" or name.endswith("/unknown"):
+        return None
+    return name
+
+
+def _bbox_value(raw):
+    """A real [x0, y0, x1, y1] bbox or None - the all-zero placeholder Gemini
+    emits for a figure-less question is not a bbox."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return None
+    return raw if is_real_bbox(raw) else None
+
+
+def _json_list(raw):
+    """A JSON array of dicts from a str/list value; [] for anything else."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    return [dict(entry) for entry in raw if isinstance(entry, dict)]
+
+
+def question_type(raw_type, options_json):
+    """The lessons question type: the row's own, else derived from its options.
+
+    No options means a short answer; every OCR question carries at most one
+    correct label, so `mcq_multi` would be invented data (C2b).
+    """
+    if raw_type:
+        return raw_type
+    options = options_json
+    if isinstance(options, str):
+        try:
+            options = json.loads(options)
+        except ValueError:
+            options = []
+    return "mcq_single" if options else "short_answer"
+
+
+def media_from_diagram(diagram_url, diagram_bbox):
+    """The legacy diagram spec as a media_images array (Q12 interface).
+
+    Returns ``(entries, missing)``; ``missing`` is True when the legacy url
+    names no usable object, i.e. the picture cannot be rendered at all.
+    """
+    name = storage_object_name(diagram_url)
+    if not name:
+        return [], True
+    return [{"object": name, "bbox": _bbox_value(diagram_bbox), "page": 1}], False
+
+
+def media_images_value(row):
+    """The media_images JSON for one question row (the upsert side).
+
+    A studio-importer row already carries the array; an OCR row still carries
+    diagram_url/diagram_bbox, which is that same single entry.
+    """
+    media = row.get("media_images")
+    if media:
+        return media if isinstance(media, str) else json.dumps(
+            media, ensure_ascii=False)
+    if not row.get("diagram_url") and not row.get("diagram_bbox"):
+        return "[]"
+    entries, _ = media_from_diagram(row.get("diagram_url"),
+                                    row.get("diagram_bbox"))
+    return json.dumps(entries, ensure_ascii=False)
+
+
+def media_images_update(row):
+    """The media_images value for one revision update.
+
+    The revision lane still speaks its own keys - diagram_bbox (JSON text or
+    None), diagram_url, has_diagram - and pins them in tests. The array the row
+    was read with is reused, so a question with several pictures is never
+    narrowed to one entry: only the first entry is patched.
+    """
+    media = _json_list(row.get("media_images"))
+    url = row.get("diagram_url")
+    name = storage_object_name(url)
+    if not media:
+        if not row.get("has_diagram"):
+            return "[]"
+        entries, _ = media_from_diagram(url, row.get("diagram_bbox"))
+        return json.dumps(entries, ensure_ascii=False)
+    entry = dict(media[0])
+    bbox = _bbox_value(row.get("diagram_bbox"))
+    if bbox is not None:
+        entry["bbox"] = bbox
+    elif not row.get("has_diagram"):
+        entry["bbox"] = None
+    if name:
+        entry["object"] = name
+    media[0] = entry
+    return json.dumps(media, ensure_ascii=False)
+
+
+def set_media_bbox(media, index, bbox):
+    """Rewrites the bbox of one entry in a media_images array.
+
+    A new list is returned and the input is left untouched, so the caller keeps
+    the array it just read.
+    """
+    out = _json_list(media)
+    if 0 <= index < len(out):
+        out[index]["bbox"] = bbox
+    return out
 
 
 class Database:
@@ -14,14 +164,15 @@ class Database:
 
     # ── connection handling ────────────────────────────────────────
     def _connect(self):
-        self._conn = psycopg2.connect(
-            host=self.cfg.postgres_host,
-            port=self.cfg.postgres_port,
-            dbname=self.cfg.postgres_db,
-            user=self.cfg.postgres_user,
-            password=self.cfg.postgres_password,
-            connect_timeout=10,
-        )
+        kwargs = dict(host=self.cfg.postgres_host,
+                      port=self.cfg.postgres_port,
+                      dbname=self.cfg.postgres_db,
+                      user=self.cfg.postgres_user,
+                      password=self.cfg.postgres_password,
+                      connect_timeout=10)
+        if self.cfg.postgres_sslmode:
+            kwargs["sslmode"] = self.cfg.postgres_sslmode   # "" → libpq default
+        self._conn = psycopg2.connect(**kwargs)
         self._conn.autocommit = True
 
     def _execute(self, sql, params=None, fetch=False):
@@ -45,13 +196,54 @@ class Database:
     def ping(self):
         self._execute("SELECT 1")
 
+    def fetch_period_counts(self, date_from=None, date_to=None):
+        """Pipeline period stats from data the DB already stores (Q4).
+
+        No schema change: counts over created_at on questions/answers plus
+        the live sources total. date_from/date_to are ISO date strings or
+        None (all-time). Returns {questions, answers, errors, files}.
+        "errors" counts rows flagged 'rejected' in review; "files" is the
+        sources total (the run's file unit).
+        """
+        def _count(table, extra="", params=()):
+            sql = f"SELECT COUNT(*) FROM public.{table} WHERE 1=1"
+            args = []
+            if date_from:
+                sql += f" AND created_at::date >= %s::date"
+                args.append(str(date_from))
+            if date_to:
+                sql += f" AND created_at::date <= %s::date"
+                args.append(str(date_to))
+            if extra:
+                sql += " " + extra
+                args.extend(params)          # extra's placeholders come last
+            try:
+                rows = self._execute(sql, tuple(args), fetch=True) or [(0,)]
+            except Exception:
+                return 0
+            return int(rows[0][0] or 0)
+
+        questions = _count("questions")
+        answers = _count("answers")
+        errors = _count("questions", "AND review_status = 'rejected'")
+        files = _count("sources")
+        # Question/Answer *file* counts come from sources.type ("سوال"/"پاسخ" —
+        # scanner.TYPE_DIRS), so all five period cards are DB-sourced (D3).
+        question_files = _count("sources", "AND type = %s", ("سوال",))
+        answer_files = _count("sources", "AND type = %s", ("پاسخ",))
+        return {"questions": questions, "answers": answers,
+                "errors": errors, "files": files, "total": files,
+                "question_files": question_files, "answer_files": answer_files,
+                "succeeded": questions + answers}
+
     # ── sources ────────────────────────────────────────────────────
     def upsert_source(self, item: SourceItem, storage_url: str):
         sql = """
-        INSERT INTO sources (id, file_name, mime_type, file_size_bytes,
+        INSERT INTO sources (id, folder_id, file_name, mime_type, file_size_bytes,
                              storage_url, subject, grade, topic, type)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         ON CONFLICT (id) DO UPDATE SET
+          folder_id       = EXCLUDED.folder_id,
           file_name       = EXCLUDED.file_name,
           mime_type       = EXCLUDED.mime_type,
           file_size_bytes = EXCLUDED.file_size_bytes,
@@ -61,48 +253,98 @@ class Database:
           topic           = EXCLUDED.topic,
           type            = EXCLUDED.type
         """
+        # folder_id is NOT NULL: a row without a folder (the studio importer's
+        # sources carry no rel_path) keeps an empty id rather than failing.
         self._execute(sql, (
-            item.source_id, item.file_name, item.mime_type, item.file_size,
-            storage_url, item.subject, item.grade, item.topic, item.type,
+            item.source_id, folder_id(item.rel_path) or "", item.file_name,
+            item.mime_type, item.file_size, storage_url, item.subject,
+            item.grade, item.topic, item.type,
         ))
 
     # ── questions ──────────────────────────────────────────────────
     def upsert_questions(self, rows):
+        # rows keep the OCR key "question_text"; the lessons table names that
+        # column "prompt". The old text id goes to legacy_id - `id` is now the
+        # BIGSERIAL the DB owns, and the unique key is legacy_id instead.
         sql = """
-        INSERT INTO questions (id, source_id, question_number, question_text,
-                               options, subject, topic, tags, difficulty,
-                               review_status, raw_ocr_text, diagram_url,
-                               diagram_bbox, grade, corp, year)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON CONFLICT (id) DO UPDATE SET
+        INSERT INTO questions (legacy_id, type, prompt, source_id, question_number,
+                               options, media_images, subject, topic, grade, corp,
+                               year, difficulty, tags, review_status, raw_ocr_text,
+                               content_hash, split, duplicate, unreadable, created_at)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                COALESCE(%s, now()))
+        ON CONFLICT (legacy_id) DO UPDATE SET
+          type            = EXCLUDED.type,
+          prompt          = EXCLUDED.prompt,
           source_id       = EXCLUDED.source_id,
           question_number = EXCLUDED.question_number,
-          question_text   = EXCLUDED.question_text,
           options         = EXCLUDED.options,
+          media_images    = EXCLUDED.media_images,
           subject         = EXCLUDED.subject,
           topic           = EXCLUDED.topic,
-          tags            = EXCLUDED.tags,
-          difficulty      = EXCLUDED.difficulty,
-          review_status   = EXCLUDED.review_status,
-          raw_ocr_text    = EXCLUDED.raw_ocr_text,
-          diagram_url     = EXCLUDED.diagram_url,
-          diagram_bbox    = EXCLUDED.diagram_bbox,
           grade           = EXCLUDED.grade,
           corp            = EXCLUDED.corp,
-          year            = EXCLUDED.year
+          year            = EXCLUDED.year,
+          difficulty      = EXCLUDED.difficulty,
+          tags            = EXCLUDED.tags,
+          review_status   = EXCLUDED.review_status,
+          raw_ocr_text    = EXCLUDED.raw_ocr_text,
+          content_hash    = EXCLUDED.content_hash,
+          split           = EXCLUDED.split,
+          duplicate       = EXCLUDED.duplicate,
+          unreadable      = EXCLUDED.unreadable
         """
         for r in rows:
             self._execute(sql, (
-                r["id"], r["source_id"], r["question_number"], r["question_text"],
-                r["options"], r["subject"], r["topic"], r["tags"], r["difficulty"],
-                r["review_status"], r["raw_ocr_text"], r["diagram_url"],
-                r["diagram_bbox"], r["grade"], r["corp"], r["year"],
+                r["id"], question_type(r.get("type"), r.get("options")),
+                r["question_text"], r["source_id"], r["question_number"],
+                r["options"] or "[]", media_images_value(r), r["subject"],
+                r["topic"], r["grade"], r["corp"], r["year"], r["difficulty"],
+                r["tags"], r["review_status"], r["raw_ocr_text"],
+                r.get("content_hash"), r.get("split"),
+                bool(r.get("duplicate")), bool(r.get("unreadable")),
+                r.get("created_at"),
             ))
+
+    # ── one bucket object's DB context (bucket drawer, item 12) ─────
+    def fetch_source_detail(self, source_id):
+        """The source row plus its linked questions and answers, for the
+        Database tab's bucket drawer. `source_id` is the storage object name
+        (storage.list_objects returns those as `name`)."""
+        src = self._execute(
+            "SELECT id, file_name, mime_type, file_size_bytes, storage_url, "
+            "subject, grade, topic, type, folder_id FROM public.sources "
+            "WHERE id = %s", (source_id,), fetch=True) or []
+        source = None
+        if src:
+            r = src[0]
+            source = {"id": r[0], "file_name": r[1], "mime_type": r[2],
+                      "file_size_bytes": r[3], "storage_url": r[4],
+                      "subject": r[5],
+                      "grade": str(r[6]) if r[6] is not None else None,
+                      "topic": r[7], "type": r[8], "folder_id": r[9]}
+        qs = self._execute(
+            "SELECT id, question_number, prompt AS question_text, review_status "
+            "FROM public.questions WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        ans = self._execute(
+            "SELECT id, question_number, answer_explanation, review_status "
+            "FROM public.answers WHERE source_id = %s "
+            "ORDER BY question_number", (source_id,), fetch=True) or []
+        return {
+            "source": source,
+            "questions": [{"id": r[0], "question_number": r[1],
+                           "question_text": r[2], "review_status": r[3]}
+                          for r in qs],
+            "answers": [{"id": r[0], "question_number": r[1],
+                         "answer_explanation": r[2], "review_status": r[3]}
+                        for r in ans],
+        }
 
     # ── context for the answer branch ('Fetch Questions' node) ─────
     def fetch_context_questions(self, subject, topic, grade):
         sql = """
-        SELECT id, question_number, question_text, options, corp, year
+        SELECT id, question_number, prompt AS question_text, options, corp, year
         FROM public.questions
         WHERE subject = %s AND topic = %s AND grade = %s
         """
@@ -117,21 +359,32 @@ class Database:
 
     # ── answers ────────────────────────────────────────────────────
     def upsert_answers(self, rows):
+        # question_id is a bigint in the new model: the row's id (a legacy
+        # "<sha1>-q<N>" text id, or the question's own id) is resolved inline
+        # and the text value is kept in legacy_question_id so nothing is lost.
         sql = """
-        INSERT INTO answers (id, source_id, question_id, question_number,
+        INSERT INTO answers (id, legacy_id, source_id, question_id,
+                             legacy_question_id, question_number,
                              answer_explanation, correct_option_label,
-                             correct_option_text, assets, subject, topic,
-                             corp, year, difficulty, tags, review_status,
-                             raw_ocr_text, content_hash, grade)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                             correct_option_text, assets, media_images, subject,
+                             topic, corp, year, difficulty, tags, review_status,
+                             raw_ocr_text, content_hash, grade, created_at)
+        VALUES (%s,%s,%s,
+                (SELECT id FROM public.questions
+                  WHERE legacy_id = %s OR id::text = %s),
+                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                COALESCE(%s, now()))
         ON CONFLICT (id) DO UPDATE SET
+          legacy_id            = EXCLUDED.legacy_id,
           source_id            = EXCLUDED.source_id,
           question_id          = EXCLUDED.question_id,
+          legacy_question_id   = EXCLUDED.legacy_question_id,
           question_number      = EXCLUDED.question_number,
           answer_explanation   = EXCLUDED.answer_explanation,
           correct_option_label = EXCLUDED.correct_option_label,
           correct_option_text  = EXCLUDED.correct_option_text,
           assets               = EXCLUDED.assets,
+          media_images         = EXCLUDED.media_images,
           subject              = EXCLUDED.subject,
           topic                = EXCLUDED.topic,
           corp                 = EXCLUDED.corp,
@@ -145,19 +398,22 @@ class Database:
         """
         for r in rows:
             self._execute(sql, (
-                r["id"], r["source_id"], r["question_id"], r["question_number"],
+                r["id"], r["id"], r["source_id"], r["question_id"],
+                r["question_id"], r["question_id"], r["question_number"],
                 r["answer_explanation"], r["correct_option_label"],
-                r["correct_option_text"], r["assets"], r["subject"], r["topic"],
-                r["corp"], r["year"], r["difficulty"], r["tags"],
-                r["review_status"], r["raw_ocr_text"], r["content_hash"],
-                r["grade"],
+                r["correct_option_text"], r["assets"] or "[]",
+                media_images_value(r), r["subject"], r["topic"], r["corp"],
+                r["year"], r["difficulty"], r["tags"], r["review_status"],
+                r["raw_ocr_text"], r["content_hash"], r["grade"],
+                r.get("created_at"),
             ))
 
         # ── QA Studio (review tab) ─────────────────────────────────────
     _REVIEW_SELECT = """
-        SELECT q.id, q.source_id, q.question_number, q.question_text, q.options,
-               q.subject, q.topic, q.grade::float AS grade, q.corp, q.year,
-               q.difficulty, q.review_status, q.diagram_url, q.diagram_bbox, q.tags,
+        SELECT q.id, q.source_id, q.question_number, q.prompt AS question_text,
+               q.options, q.type, q.media_images, q.split, q.duplicate,
+               q.unreadable, q.subject, q.topic, q.grade::float AS grade,
+               q.corp, q.year, q.difficulty, q.review_status, q.tags,
                a.id AS answer_id, a.answer_explanation, a.correct_option_label,
                a.correct_option_text, a.review_status AS answer_review_status
         FROM public.questions q
@@ -165,8 +421,9 @@ class Database:
     """
     _REVIEW_COLS = [
         "id", "source_id", "question_number", "question_text", "options",
+        "type", "media_images", "split", "duplicate", "unreadable",
         "subject", "topic", "grade", "corp", "year", "difficulty",
-        "review_status", "diagram_url", "diagram_bbox", "tags",
+        "review_status", "tags",
         "answer_id", "answer_explanation", "correct_option_label",
         "correct_option_text", "answer_review_status",
     ]
@@ -186,13 +443,10 @@ class Database:
             )
         )"""
 
-    # a question counts as "pictured" when it has a diagram url or a
-    # non-empty, non-zero bbox (column may be text or json — cast to text).
+    # a question counts as "pictured" when its media_images array is non-empty
     _PICTURE_EXISTS = """(
-            q.diagram_url IS NOT NULL
-            OR (q.diagram_bbox IS NOT NULL
-                AND replace(q.diagram_bbox::text, ' ', '')
-                    NOT IN ('null', '[]', '[0,0,0,0]'))
+            jsonb_typeof(q.media_images) = 'array'
+            AND jsonb_array_length(q.media_images) > 0
         )"""
 
     @staticmethod
@@ -213,10 +467,11 @@ class Database:
                           difficulty=None, date_from=None, date_to=None,
                           has_answer=None, has_picture=None):
         sql = """
-            SELECT q.id, q.source_id, q.question_number, q.question_text,
-                   q.options, q.subject, q.topic, q.grade,
-                   q.corp, q.year, q.difficulty, q.review_status,
-                   q.diagram_url, q.diagram_bbox, q.tags, q.raw_ocr_text,
+            SELECT q.id, q.source_id, q.question_number, q.prompt AS question_text,
+                   q.options, q.type, q.media_images, q.split, q.duplicate,
+                   q.unreadable, q.subject, q.topic, q.grade,
+                   q.corp, q.year, q.difficulty, q.review_status, q.tags,
+                   q.raw_ocr_text,
                    to_char(q.created_at, 'YYYY-MM-DD"T"HH24:MI:SS') AS created_at,
                    a.id AS answer_id, a.answer_explanation,
                    a.correct_option_label, a.correct_option_text
@@ -270,8 +525,9 @@ class Database:
 
         cols = [
             "id", "source_id", "question_number", "question_text", "options",
+            "type", "media_images", "split", "duplicate", "unreadable",
             "subject", "topic", "grade", "corp", "year", "difficulty",
-            "review_status", "diagram_url", "diagram_bbox", "tags", "raw_ocr_text",
+            "review_status", "tags", "raw_ocr_text",
             "created_at",
             "answer_id", "answer_explanation", "correct_option_label", "correct_option_text"
         ]
@@ -382,10 +638,16 @@ class Database:
         )
 
     # ── Revision agent ───────────────────────────────────────────
+    # diagram_bbox/diagram_url stay in the payload: the revision lane speaks
+    # those keys and tests pin them. They are now views of media_images, whose
+    # raw text rides along so an update patches the array it read.
     _Q_REVISION_SELECT = """
-        SELECT q.id, q.source_id, q.question_number, q.question_text, q.options,
-               q.difficulty, q.raw_ocr_text, q.diagram_bbox, q.diagram_url, q.tags,
-               q.corp, q.year,
+        SELECT q.id, q.source_id, q.question_number, q.prompt AS question_text,
+               q.options, q.difficulty, q.raw_ocr_text,
+               COALESCE(q.media_images -> 0 -> 'bbox', 'null'::jsonb)::text
+                   AS diagram_bbox,
+               q.media_images -> 0 ->> 'object' AS diagram_url,
+               q.media_images::text AS media_images, q.tags, q.corp, q.year,
                COALESCE(q.subject, s.subject) AS subject,
                COALESCE(q.topic, s.topic)     AS topic,
                COALESCE(q.grade, s.grade)     AS grade,
@@ -396,9 +658,9 @@ class Database:
     """
     _Q_REVISION_COLS = [
         "id", "source_id", "question_number", "question_text", "options",
-        "difficulty", "raw_ocr_text", "diagram_bbox", "diagram_url", "tags",
-        "corp", "year", "subject", "topic", "grade", "source_storage_url",
-        "correct_option_label", "correct_option_text",
+        "difficulty", "raw_ocr_text", "diagram_bbox", "diagram_url",
+        "media_images", "tags", "corp", "year", "subject", "topic", "grade",
+        "source_storage_url", "correct_option_label", "correct_option_text",
     ]
 
     _A_REVISION_SELECT = """
@@ -480,10 +742,9 @@ class Database:
         # status columns are frozen while a human holds the row ('approved')
         sql = """
             UPDATE public.questions SET
-              question_number = %s, question_text = %s, options = %s,
+              question_number = %s, prompt = %s, options = %s,
               correct_option_label = %s, correct_option_text = %s,
-              difficulty = %s, tags = %s, has_diagram = %s,
-              diagram_url = %s, diagram_bbox = %s,
+              difficulty = %s, tags = %s, media_images = %s,
               subject = %s, topic = %s, grade = %s, corp = %s, year = %s,
               needs_review      = CASE WHEN revision_status = 'approved'
                                        THEN needs_review ELSE %s END,
@@ -499,8 +760,7 @@ class Database:
             self._execute(sql, (
                 u.get("question_number"), u.get("question_text"), u.get("options"),
                 u.get("correct_option_label"), u.get("correct_option_text"),
-                u.get("difficulty"), u.get("tags"), u.get("has_diagram"),
-                u.get("diagram_url"), u.get("diagram_bbox"),
+                u.get("difficulty"), u.get("tags"), media_images_update(u),
                 u.get("subject"), u.get("topic"), u.get("grade"),
                 u.get("corp"), u.get("year"),
                 bool(u.get("needs_review")), u.get("revision_status"),
@@ -584,7 +844,7 @@ class Database:
                        a.correct_option_label, a.correct_option_text, a.subject,
                        a.topic, a.grade::text AS grade, a.difficulty, a.corp, a.year,
                        a.revision_status, a.needs_review, a.revision_notes,
-                       a.revised_at, q.question_text AS question_text,
+                       a.revised_at, q.prompt AS question_text,
                        q.options AS options,
                        q.correct_option_label AS q_correct_option_label
                 FROM public.answers a
@@ -608,7 +868,8 @@ class Database:
                 "all":      "WHERE q.revision_status IS NOT NULL",
             }.get(view, "WHERE q.needs_review = TRUE OR q.revision_status = 'needs_human'")
             sql = f"""
-                SELECT q.id, q.question_number, q.question_text, q.options, q.subject,
+                SELECT q.id, q.question_number, q.prompt AS question_text,
+                       q.options, q.subject,
                        q.topic, q.grade::text AS grade, q.difficulty, q.corp, q.year,
                        q.revision_status, q.needs_review, q.revision_notes,
                        q.revised_at, q.correct_option_label,
@@ -689,17 +950,66 @@ class Database:
         else:
             raise ValueError("Invalid action.")
 
-    def update_diagram_bbox(self, question_id, bbox):
-        """Saves a manually corrected bbox [ymin, xmin, ymax, xmax] (0-1000).
-        Also repairs diagram_url from the source row if it was missing/broken."""
-        sql = """
-            UPDATE public.questions SET
-              diagram_bbox = %s,
-              has_diagram  = TRUE,
-              diagram_url  = COALESCE(
-                  (SELECT storage_url FROM public.sources
-                   WHERE id = questions.source_id),
-                  diagram_url)
-            WHERE id = %s
+    def update_media_bbox(self, question_id, index, bbox):
+        """Saves a manually corrected bbox [ymin, xmin, ymax, xmax] (0-1000)
+        onto one entry of the question's media_images array."""
+        rows = self._execute(
+            "SELECT media_images FROM public.questions WHERE id = %s",
+            (question_id,), fetch=True) or []
+        media = set_media_bbox(rows[0][0] if rows else [], int(index), bbox)
+        self._execute(
+            "UPDATE public.questions SET media_images = %s WHERE id = %s",
+            (json.dumps(media, ensure_ascii=False), question_id))
+
+    def fetch_media_row(self, question_id):
+        """One question's picture context for the QBank crop editor.
+
+        Read-only: the stored media array, the legacy id (a crop's object name)
+        and the page the picture was cut from - `sources.storage_url`, which is
+        still how a legacy row points at its page JPEG in the bucket.
         """
-        self._execute(sql, (json.dumps(bbox), question_id))
+        rows = self._execute(
+            "SELECT q.id, q.legacy_id, q.source_id, q.media_images, "
+            "       s.storage_url, s.file_name "
+            "  FROM public.questions q "
+            "  LEFT JOIN public.sources s ON s.id = q.source_id "
+            " WHERE q.id = %s", (question_id,), fetch=True) or []
+        if not rows:
+            return None
+        qid, legacy_id, source_id, media, source_url, file_name = rows[0]
+        return {"id": str(qid), "legacy_id": legacy_id,
+                "source_id": source_id, "media": _json_list(media),
+                "source_url": source_url, "source_file": file_name}
+
+    def clear_zero_bboxes(self, limit=100):
+        """Backfill: drop the all-zero placeholder bbox ([0,0,0,0]) Gemini used
+        to emit for figure-less questions from the most recent `limit` rows
+        that still carry it, so those pictures keep their whole-source entry.
+        Re-runnable - once clean it updates 0 rows."""
+        sql = """
+        WITH z AS (
+            SELECT q.id FROM public.questions q
+            WHERE EXISTS (
+                SELECT 1 FROM jsonb_array_elements(q.media_images) e
+                WHERE replace((e -> 'bbox')::text, ' ', '') = '[0,0,0,0]'
+            )
+            ORDER BY q.created_at DESC
+            LIMIT %s
+        )
+        UPDATE public.questions q
+           SET media_images = COALESCE((
+                   SELECT jsonb_agg(
+                              CASE WHEN replace((e.value -> 'bbox')::text, ' ', '')
+                                        IN ('null', '[0,0,0,0]')
+                                   THEN jsonb_set(e.value, '{bbox}', 'null'::jsonb)
+                                   ELSE e.value END
+                              ORDER BY e.ordinality)
+                   FROM jsonb_array_elements(q.media_images)
+                        WITH ORDINALITY AS e(value, ordinality)
+               ), '[]'::jsonb)
+          FROM z
+         WHERE q.id = z.id
+        RETURNING q.id
+        """
+        rows = self._execute(sql, (int(limit),), fetch=True) or []
+        return len(rows)

@@ -1,6 +1,9 @@
 """Loads every setting from the .env file into one typed object."""
+import json
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 # The .env lives next to main.py; pinning the path lets the Credentials tab
@@ -14,17 +17,24 @@ load_dotenv(ENV_PATH)
 # default resolves relative to the project instead of a hard-coded drive letter.
 DEFAULT_INPUT_ROOT = os.path.join(os.path.dirname(ENV_PATH), "konkour-ocr")
 
-# Production model ladder: start at the oldest version and step up, so a
-# working 3.5 is always preferred over 3.6/3.7/3.8. Every key walks the same
-# ladder; advanced users can still override it via GEMINI_MODEL_LADDER in .env
-# (the Credentials tab deliberately offers no picker — there is nothing to
-# choose when every request may need every rung).
-DEFAULT_MODEL_LADDER = ("gemini-3.5-flash", "gemini-3.6-flash",
-                        "gemini-3.7-flash", "gemini-3.8-flash")
+# Production model ladder: cheapest rung first, then step up, so a working
+# flash-lite is always preferred over the full flash versions. Every key walks
+# the same ladder; advanced users can still override it via GEMINI_MODEL_LADDER
+# in .env. Per-model ON/OFF toggles live in GEMINI_MODELS_ENABLED (absent = all
+# on); the router skips disabled rungs.
+DEFAULT_MODEL_LADDER = ("gemini-3.5-flash-lite", "gemini-3.5-flash",
+                        "gemini-3.6-flash", "gemini-3.7-flash",
+                        "gemini-3.8-flash")
 
 
 def _csv(value: str) -> tuple:
     return tuple(part.strip() for part in (value or "").split(",") if part.strip())
+
+
+def _flag(name):
+    """Section enable switch (Q1). Absent key → ON, so an untouched .env keeps
+    running exactly as before; 0/false/off/no are the OFF spellings."""
+    return os.getenv(name, "1").strip().lower() not in ("0", "false", "off", "no")
 
 
 def _gemini_pool() -> tuple:
@@ -50,15 +60,189 @@ def _model_ladder() -> tuple:
     return ladder or DEFAULT_MODEL_LADDER
 
 
-def _router_provider(base_url: str) -> str:
-    """Explicit ROUTER_PROVIDER wins; otherwise infer: loopback URLs are a
-    'local' server, anything else is treated as a hosted OpenAI-compatible
-    endpoint (which usually wants an API key)."""
-    p = os.getenv("ROUTER_PROVIDER", "").strip().lower()
-    if p in ("local", "openai"):
-        return p
-    u = (base_url or "").lower()
-    return "local" if ("localhost" in u or "127.0.0.1" in u or "::1" in u) else "openai"
+def _enabled_models():
+    """Enabled subset of the ladder, or None when unconfigured.
+
+    Absent GEMINI_MODELS_ENABLED means every rung is on (an untouched .env
+    keeps working unchanged). A present value — even empty — is authoritative:
+    only the named models may be used."""
+    raw = os.getenv("GEMINI_MODELS_ENABLED")
+    if raw is None:
+        return None
+    return tuple(dict.fromkeys(_csv(raw)))
+
+
+def _json_list(name):
+    """A JSON array stored in one .env value, or () when absent/unparsable.
+    Never raises: a hand-edited .env must not stop the server booting."""
+    raw = os.getenv(name)
+    if raw is None:
+        return ()
+    try:
+        val = json.loads(raw)
+    except ValueError:
+        return ()
+    return tuple(v for v in val if isinstance(v, dict)) if isinstance(val, list) else ()
+
+
+# Named proxy profiles live in a git-ignored local JSON store beside .env —
+# NOT in .env itself (a profile carries a proxy password; the user asked for
+# a savable local database, not an .env key).
+PROXY_STORE_PATH = os.path.join(os.path.dirname(ENV_PATH), ".proxy-profiles.json")
+
+
+def load_proxy_store():
+    """{'profiles': tuple[dict], 'active': str} from the local JSON store.
+    Never raises: a missing or corrupt file reads as empty."""
+    try:
+        with open(PROXY_STORE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"profiles": (), "active": ""}
+    if not isinstance(data, dict):
+        return {"profiles": (), "active": ""}
+    profs = data.get("profiles")
+    profs = (tuple(p for p in profs if isinstance(p, dict))
+             if isinstance(profs, list) else ())
+    active = data.get("active")
+    return {"profiles": profs, "active": active if isinstance(active, str) else ""}
+
+
+def save_proxy_store(profiles, active):
+    """Write the local proxy-profile store atomically (tmp file + rename)."""
+    tmp = PROXY_STORE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"profiles": list(profiles), "active": active or ""},
+                  fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, PROXY_STORE_PATH)
+
+
+def _providers(name, legacy_base, legacy_key, legacy_model,
+               legacy_flag, legacy_on, legacy_default=""):
+    """Saved custom providers for one section as (label, base_url, api_key,
+    model) dicts — the one "custom provider" kind (label, base URL, API key,
+    model name).
+
+    Q1 read-fallback: the new key wins the moment it exists; until the
+    Credentials tab has written it, a single entry is synthesised from the
+    legacy single-provider keys, exactly like _gemini_pool() does for
+    GEMINI_API_KEYS — an older .env keeps working unchanged. `legacy_on` is
+    the set of legacy flag values that meant "this section runs on its own
+    endpoint" (extraction: openai/local; the Gemini-pool value stays off;
+    revision: any value, including an unset flag the old code guessed from
+    the URL), and `legacy_default` is the old hard-coded base URL (if any)
+    for sections that always had an endpoint."""
+    stored = _json_list(name)
+    if os.getenv(name) is not None:
+        return stored
+    if os.getenv(legacy_flag, "").strip().lower() not in legacy_on:
+        return ()
+    base = os.getenv(legacy_base, legacy_default).strip().rstrip("/")
+    if not base:
+        return ()
+    return ({"label": "default", "base_url": base,
+             "api_key": os.getenv(legacy_key, "").strip(),
+             "model": os.getenv(legacy_model, "").strip()},)
+
+
+def _active(name, providers):
+    """Which saved provider a section has selected.
+
+    Key absent → the first saved (or legacy-synthesised) entry, if one
+    exists. Key present but empty → deliberately nothing: extraction runs
+    on the Gemini key pool, revision has no endpoint selected. The
+    `is not None` split is what keeps "" meaningful."""
+    raw = os.getenv(name)
+    if raw is None:
+        return providers[0].get("label", "") if providers else ""
+    return raw.strip()
+
+
+def _resolve(providers, active):
+    """The active provider dict, or {} when nothing is selected."""
+    for p in providers:
+        if p.get("label") == active:
+            return p
+    return {}
+
+
+def _lane_model(provider):
+    """The model the custom lane actually runs: the provider's `model` when
+    it survives its own per-model toggle, else the first enabled rung of its
+    list (models_enabled is None → every rung is on)."""
+    want = (provider.get("model") or "").strip()
+    men = provider.get("models_enabled")
+    if men is None or want in men:
+        return want
+    allowed = [m for m in (provider.get("models") or []) if m in men]
+    return allowed[0] if allowed else want
+
+
+# The ONE built-in non-Gemini provider (Q2): fixed loopback URL, editable
+# API key, own model list for the model ring. The generic custom-provider
+# kind is deleted — anything stored that is not this entry is discarded.
+NINEROUTER_URL = "http://127.0.0.1:20128/v1"
+
+
+def _migrate_ninerouter(stored):
+    """Coerce one section's stored providers to the single 9router entry.
+
+    Keeps the stored entry that already points at the 9router loopback
+    service (either loopback spelling, or labelled 9router) with the URL
+    pinned to NINEROUTER_URL; every other custom entry is dropped by
+    design (Q2) and named on stdout so the loss is visible, not silent.
+    """
+    kept = {}
+    for p in stored or ():
+        if not isinstance(p, dict):
+            continue
+        url = p.get("base_url") or ""
+        if ("127.0.0.1:20128" in url or "localhost:20128" in url
+                or p.get("label") == "9router"):
+            if not kept:
+                models = p.get("models")
+                men = p.get("models_enabled")
+                kept = {"label": "9router", "base_url": NINEROUTER_URL,
+                        "api_key": p.get("api_key", ""),
+                        "model": p.get("model", ""),
+                        "models": list(models) if isinstance(models, list) else [],
+                        "models_enabled": [str(m) for m in men] if isinstance(men, list) else None}
+        else:
+            print(f"[config] dropping non-9router provider "
+                  f"'{p.get('label', '')}' ({url}) — custom kind removed (Q2)")
+    return (kept,) if kept else ()
+
+
+def _legacy_proxy_url():
+    """One-time upgrade path for the old single proxy URL (Q5).
+
+    The retired key is matched by SHAPE (`*_PROXY_URL`), never by spelling
+    it out: acceptance 7 wants that whole key family gone from pipeline/."""
+    for key, val in os.environ.items():
+        if key.endswith("_PROXY_URL") and val.strip():
+            return val.strip()
+    return ""
+
+
+def seed_proxy_profile():
+    """Q5 one-time upgrade: when the old single proxy URL is set and no
+    profile list exists yet, return exactly one profile derived from it.
+    Returns () otherwise, so a later profile edit is never overwritten."""
+    if load_proxy_store()["profiles"]:
+        return ()
+    raw = _legacy_proxy_url()
+    if not raw:
+        return ()
+    u = urlparse(raw if "://" in raw else "http://" + raw)
+    if not u.hostname:
+        return ()
+    return ({"name": "Default",
+             "host": u.hostname,
+             "port": str(u.port or ""),
+             "scheme": (u.scheme or "http").lower(),
+             "user": u.username or "",
+             "password": u.password or ""},)
+
 
 @dataclass
 class Config:
@@ -72,24 +256,174 @@ class Config:
     postgres_db: str
     postgres_user: str
     postgres_password: str
+    postgres_sslmode: str          # "" → psycopg2/libpq default, unchanged
     gemini_key_pool: tuple
     gemini_key_names: tuple
     gemini_model_ladder: tuple
     host: str
     port: int
-    router_provider: str
+    router_provider: str           # resolved revision engine: 'custom' | ''
     router_base_url: str
     router_api_key: str
     router_model: str
+    ocr_provider: str              # resolved extraction engine: 'gemini' | 'custom'
+    ocr_base_url: str
+    ocr_api_key: str
+    ocr_model: str
+    # Saved custom providers per section + which one is live (TASK 2/3).
+    extraction_providers: tuple
+    extraction_active: str         # "" → the Gemini key pool
+    revision_providers: tuple
+    revision_active: str           # "" → no revision endpoint selected
+    # Named proxy profiles for the pipeline tab; proxy_active "" = direct (Q4).
+    proxy_profiles: tuple
+    proxy_active: str
     revision_batch_limit: int
     revision_chunk_size: int
     revision_scan_chunk: int
+    converter_enabled: bool = True
+    # Section enable switches (Q1) + presentation-only DB list (Q2).
+    gemini_pool_enabled: bool = True
+    ninerouter_enabled: bool = True
+    revision_provider_enabled: bool = True
+    supabase_enabled: bool = True
+    db_connections: tuple = ()
+    # Studio-local provider list + per-stage actives (independent of the
+    # pipeline tab's lists). "" actives: extract → Gemini pool, enrich → none.
+    # Studio proxy: a profile name from the shared store, "" → direct.
+    # Trailing + defaulted so older direct Config(...) constructions keep working.
+    studio_providers: tuple = ()
+    studio_extract_active: str = ""
+    studio_enrich_active: str = ""
+    studio_vision_active: str = ""
+    # Optional Gemini model for the vision stage ("" -> the router ladder).
+    studio_vision_model: str = ""
+    studio_proxy: str = ""
+    gemini_enabled_models: tuple | None = None
+    # Stage-1 request windows (Q1/Q10): chars per text chunk, images per call.
+    # pages_per_call is the transport batch (OCR and locate); band_batch is the
+    # figure pass's bands per request.
+    studio_chunk_chars: int = 24000
+    studio_chunk_images: int = 3
+    studio_pages_per_call: int = 3
+    studio_band_batch: int = 6
+    # Re-read a low-confidence text page with the extract model (image + the
+    # PDF's own text) instead of trusting the text layer's scrambled order.
+    studio_organize: int = 1
+    # Vision pages are capped by pixels, not bytes: a sharp 3000 px page is
+    # smaller than the old q20 4968 px one and gives every model more to see.
+    studio_vision_long_edge: int = 3000
+    studio_vision_quality: int = 88
+    # Workstream B: the folder-tree root the DB's folder ids point at, and the
+    # bucket prefix standalone crops are uploaded under (Q8/Q11/Q3).
+    studio_source_root: str = ""
+    studio_crop_prefix: str = "crops"
+    # One pinned Gemini model per surface ("" -> walk the whole ladder). The
+    # picker offers "All" + the ladder models ENABLED in Credentials, so a
+    # single model can be exercised on its own instead of the round-robin.
+    gemini_pin: str = ""
+    studio_gemini_pin: str = ""
+    # How many consecutive page images of one paper the pipeline sends in a
+    # single OCR call (1 = the classic one picture per call).
+    ocr_pages_per_call: int = 1
+    # The floating AI assistant: its own OpenAI-compatible providers (one or
+    # many), each with a key and a model list, plus the one active model and
+    # its thinking level (never the OCR lanes). All empty -> "not configured".
+    assistant_url: str = ""
+    assistant_key: str = ""
+    assistant_model: str = ""        # "label::model" once a list is saved
+    assistant_providers: tuple = ()
+    assistant_effort: str = ""       # "" = the provider's own default
 
 
 def load_config() -> Config:
+    # Extraction: the Gemini pool unless the built-in 9router is selected.
+    # The generic custom-provider kind is gone (Q2) — whatever is stored is
+    # coerced to the single 9router entry, other entries discarded.
+    ext_providers = _migrate_ninerouter(_providers(
+        "EXTRACTION_PROVIDERS", "OCR_BASE_URL",
+        "OCR_API_KEY", "OCR_MODEL",
+        "OCR_PROVIDER", ("openai", "local")))
+    ext_active = _active("EXTRACTION_ACTIVE", ext_providers)
+    # Revision: same single-kind model; the legacy default (the 9router
+    # loopback service) still keeps an endpoint selected for old .env files.
+    rev_providers = _migrate_ninerouter(_providers(
+        "REVISION_PROVIDERS", "ROUTER_BASE_URL",
+        "ROUTER_API_KEY", "ROUTER_MODEL",
+        "ROUTER_PROVIDER", ("local", "openai", ""),
+        legacy_default="http://localhost:20128/v1"))
+    rev_active = _active("REVISION_ACTIVE", rev_providers)
+    # Q2 self-heal: migration may have dropped the entry the stored active
+    # label pointed at (or an old "default" legacy label). A truthy-but-unknown
+    # label can never resolve, so fall back to the kept entry (usually the
+    # migrated 9router) or "" — never leave a dangling pointer that 400s
+    # every credentials save. A deliberate "" (Gemini pool / no endpoint)
+    # is meaningful and stays untouched.
+    _ext_labels = {p.get("label", "") for p in ext_providers}
+    if ext_active and ext_active not in _ext_labels:
+        ext_active = ext_providers[0].get("label", "") if ext_providers else ""
+    _rev_labels = {p.get("label", "") for p in rev_providers}
+    if rev_active and rev_active not in _rev_labels:
+        rev_active = rev_providers[0].get("label", "") if rev_providers else ""
+    ext = _resolve(ext_providers, ext_active)
+    rev = _resolve(rev_providers, rev_active)
+    _proxy_store = load_proxy_store()
+    # Studio-local providers: same single-kind (9router) coercion as the
+    # pipeline sections, but a separate list. Absent keys mean "" (Gemini
+    # pool for extract, none for enrich) — _active() would default to the
+    # first entry, which must not pre-select 9router before the user chooses.
+    studio_providers = _migrate_ninerouter(_json_list("STUDIO_PROVIDERS"))
+    _studio_labels = {p.get("label", "") for p in studio_providers}
+    studio_extract_active = (os.getenv("STUDIO_EXTRACT_ACTIVE") or "").strip()
+    if studio_extract_active not in _studio_labels:
+        studio_extract_active = ""
+    studio_enrich_active = (os.getenv("STUDIO_ENRICH_ACTIVE") or "").strip()
+    if studio_enrich_active not in _studio_labels:
+        studio_enrich_active = ""
+    studio_vision_active = (os.getenv("STUDIO_VISION_ACTIVE") or "").strip()
+    if studio_vision_active not in _studio_labels:
+        studio_vision_active = ""
+    studio_vision_model = (os.getenv("STUDIO_VISION_MODEL") or "").strip()
+    studio_proxy = (os.getenv("STUDIO_PROXY") or "").strip()
+    if studio_proxy and studio_proxy not in {p.get("name", "")
+                                            for p in _proxy_store["profiles"]}:
+        studio_proxy = ""
+    input_root = os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT)
+    source_root = (os.getenv("STUDIO_SOURCE_ROOT") or "").strip() \
+        or os.path.join(input_root, "studio")
+    crop_prefix = (os.getenv("STUDIO_CROP_PREFIX") or "crops").strip().strip("/")
+    pages_per_call = max(1, min(8, int(os.getenv("STUDIO_PAGES_PER_CALL", "3"))))
+    # The pipeline's own pages-per-call: how many consecutive page images of
+    # one paper go into a single OCR call (1 keeps the classic behaviour).
+    ocr_pages_per_call = max(1, min(8, int(os.getenv("OCR_PAGES_PER_CALL", "1"))))
+    band_batch = max(1, min(12, int(os.getenv("STUDIO_BAND_BATCH", "6"))))
+    organize = 1 if os.getenv("STUDIO_ORGANIZE", "1").strip() not in (
+        "0", "false", "False", "no", "off", "") else 0
+    vision_edge = max(800, min(5000, int(os.getenv("STUDIO_VISION_LONG_EDGE",
+                                                   "3000"))))
+    vision_quality = max(50, min(95, int(os.getenv("STUDIO_VISION_QUALITY",
+                                                    "88"))))
+    chunk_images = max(1, min(12, int(os.getenv("STUDIO_CHUNK_IMAGES",
+                                                str(pages_per_call)))))
+    ladder = _model_ladder()
+    enabled_models = _enabled_models()
+
+    def _model_pin(name):
+        """A pinned ladder model, or "" (walk the ladder).
+
+        A pin that is no longer on the ladder — or was switched OFF in the
+        credential section — self-heals to "" instead of leaving a lane that
+        can never plan a call."""
+        want = (os.getenv(name) or "").strip()
+        if not want or want not in ladder:
+            return ""
+        if enabled_models is not None and want not in enabled_models:
+            return ""
+        return want
+
     return Config(
-        input_root=os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT),
-        min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "60")),
+        input_root=input_root,
+        min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
         supabase_url=os.getenv("SUPABASE_URL", "").rstrip("/"),
         supabase_key=os.getenv("SUPABASE_SERVICE_KEY", ""),
         supabase_bucket=os.getenv("SUPABASE_BUCKET", "konkour-pages"),
@@ -98,18 +432,64 @@ def load_config() -> Config:
         postgres_db=os.getenv("POSTGRES_DB", "postgres"),
         postgres_user=os.getenv("POSTGRES_USER", "postgres"),
         postgres_password=os.getenv("POSTGRES_PASSWORD", ""),
+        postgres_sslmode=os.getenv("POSTGRES_SSLMODE", "").strip(),
         # Multi-key / multi-model Gemini routing (see pipeline.gemini_router).
         gemini_key_pool=_gemini_pool(),
         gemini_key_names=_csv(os.getenv("GEMINI_KEY_NAMES", "")),
-        gemini_model_ladder=_model_ladder(),
+        gemini_model_ladder=ladder,
+        gemini_enabled_models=enabled_models,
+        gemini_pin=_model_pin("GEMINI_MODEL_PIN"),
+        studio_gemini_pin=_model_pin("STUDIO_GEMINI_MODEL_PIN"),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
-        router_base_url=os.getenv("ROUTER_BASE_URL", "http://localhost:20128/v1"),
-        router_provider=_router_provider(os.getenv("ROUTER_BASE_URL",
-                                                   "http://localhost:20128/v1")),
-        router_api_key=os.getenv("ROUTER_API_KEY", ""),
-        router_model=os.getenv("ROUTER_MODEL", "OCR-Quest"),
+        # Resolved views: consumers (runner, vision, revision/audit) keep
+        # reading cfg.router_* / cfg.ocr_* with no signature change; the
+        # per-section provider lists above are what the Credentials tab edits.
+        # 'local' and 'openai' are one kind now — 'custom' (TASK item 2).
+        router_provider="custom" if rev else "",
+        router_base_url=rev.get("base_url", ""),
+        router_api_key=rev.get("api_key", ""),
+        router_model=_lane_model(rev),
+        ocr_provider="gemini" if not ext else "custom",
+        ocr_base_url=ext.get("base_url", ""),
+        ocr_api_key=ext.get("api_key", ""),
+        ocr_model=_lane_model(ext),
+        extraction_providers=ext_providers,
+        extraction_active=ext_active,
+        revision_providers=rev_providers,
+        revision_active=rev_active,
+        studio_providers=studio_providers,
+        studio_extract_active=studio_extract_active,
+        studio_enrich_active=studio_enrich_active,
+        studio_vision_active=studio_vision_active,
+        studio_vision_model=studio_vision_model,
+        studio_proxy=studio_proxy,
+        studio_chunk_chars=int(os.getenv("STUDIO_CHUNK_CHARS", "24000")),
+        studio_chunk_images=chunk_images,
+        studio_pages_per_call=pages_per_call,
+        ocr_pages_per_call=ocr_pages_per_call,
+        studio_band_batch=band_batch,
+        studio_organize=organize,
+        studio_vision_long_edge=vision_edge,
+        studio_vision_quality=vision_quality,
+        studio_source_root=source_root,
+        studio_crop_prefix=crop_prefix or "crops",
+        proxy_profiles=_proxy_store["profiles"],
+        proxy_active=_proxy_store["active"],
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),
         revision_chunk_size=int(os.getenv("REVISION_CHUNK_SIZE", "8")),
         revision_scan_chunk=int(os.getenv("REVISION_SCAN_CHUNK", "50")),
+        converter_enabled=os.getenv("CONVERTER_ENABLED", "1").strip().lower()
+        not in ("", "0", "false", "no", "off"),
+        gemini_pool_enabled=_flag("GEMINI_POOL_ENABLED"),
+        ninerouter_enabled=_flag("NINEROUTER_ENABLED"),
+        revision_provider_enabled=_flag("REVISION_PROVIDER_ENABLED"),
+        supabase_enabled=_flag("SUPABASE_ENABLED"),
+        db_connections=_json_list("DB_CONNECTIONS"),
+        assistant_url=(os.getenv("ASSISTANT_URL") or "").strip(),
+        assistant_key=(os.getenv("ASSISTANT_API_KEY") or "").strip(),
+        assistant_model=(os.getenv("ASSISTANT_MODEL") or "").strip(),
+        assistant_providers=tuple(p for p in _json_list("ASSISTANT_PROVIDERS")
+                                  if isinstance(p, dict)),
+        assistant_effort=(os.getenv("ASSISTANT_EFFORT") or "").strip().lower(),
     )

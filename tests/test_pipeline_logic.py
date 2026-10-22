@@ -11,8 +11,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from pipeline.answers import (build_answer_prompt, finalize_answer_rows,      # noqa: E402
-                              prepare_answer_rows)
+from pipeline.answers import (ANSWER_TEMPLATE, MAX_BANK_CHARS,                  # noqa: E402
+                              MAX_PROMPT_CANDIDATES, build_answer_prompt,
+                              finalize_answer_rows, prepare_answer_rows)
 from pipeline.gemini import extract_json                                     # noqa: E402
 from pipeline.questions import build_question_rows, normalize_bbox, normalize_options
 from pipeline.revision.audit import build_audit_prompt, merge_audit, parse_ai_json   # noqa: E402
@@ -122,6 +123,12 @@ class TestQuestionRows(unittest.TestCase):
         self.assertIsNone(normalize_bbox("garbage"))
         self.assertIsNone(normalize_bbox(None))
 
+    def test_normalize_bbox_treats_all_zero_as_no_picture(self):
+        self.assertIsNone(normalize_bbox([0, 0, 0, 0]))
+        self.assertIsNone(normalize_bbox("[0,0,0,0]"))
+        self.assertIsNone(normalize_bbox("[0, 0, 0, 0]"))
+        self.assertEqual(normalize_bbox([0, 1, 2, 3]), [0, 1, 2, 3])
+
 
 class TestAnswerLinking(unittest.TestCase):
     def setUp(self):
@@ -137,6 +144,37 @@ class TestAnswerLinking(unittest.TestCase):
         self.assertNotIn("__CANDIDATES__", prompt)
         self.assertIn('"question_number": 1', prompt)
         self.assertIn("گزینه یک طولانی", prompt)
+
+    def test_prompt_caps_the_candidate_bank(self):
+        """Item 9: the embedded candidate bank is capped and its text clipped,
+        so a topic with hundreds of questions cannot balloon the answer prompt
+        past ~75k tokens (finalize_answer_rows still sees the full bank)."""
+        many = [{"question_number": i, "question_text": "q" * 900,
+                 "options": [{"label": "1", "text": "o" * 900}],
+                 "corp": "c", "year": "y"}
+                for i in range(1, MAX_PROMPT_CANDIDATES + 50)]
+        prompt = build_answer_prompt(many)
+        self.assertIn('"question_number": 1', prompt)          # kept
+        self.assertNotIn('"question_number": %d' % (MAX_PROMPT_CANDIDATES + 49),
+                         prompt)                               # dropped past the cap
+        self.assertIn("…", prompt)                             # long text clipped
+
+    def test_prompt_bank_stays_within_a_char_budget(self):
+        """C3-3: the embedded bank is bounded by a total character budget, so a
+        topic with hundreds of questions cannot balloon the answer call — the
+        prompt stays a plausible few thousand tokens (~15k before, ~2-3k now),
+        instead of the count cap alone which still reached ~15k."""
+        huge = [{"question_number": i, "question_text": "q" * 900,
+                 "options": [{"label": str(j), "text": "o" * 900}
+                             for j in range(4)],
+                 "corp": "c", "year": "y"}
+                for i in range(1, 400)]
+        prompt = build_answer_prompt(huge)
+        # the bank cannot exceed its budget (one entry may overshoot the edge)
+        self.assertLessEqual(len(prompt),
+                             len(ANSWER_TEMPLATE) + MAX_BANK_CHARS + 1000)
+        # …so even a 400-question topic stays a plausible per-call size
+        self.assertLess(len(prompt), 10000)          # ~2.5-5k tokens at worst
 
     def test_linking_rules(self):
         parsed = {"answers": [
