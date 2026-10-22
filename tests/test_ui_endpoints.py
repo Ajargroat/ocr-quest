@@ -1,4 +1,4 @@
-"""Offline tests for the UI-facing endpoints added by the 2026-10-06 task.
+﻿"""Offline tests for the UI-facing endpoints added by the 2026-10-06 task.
 
 Covers the three dashboard surfaces that had no coverage yet:
   GET  /api/stats?period=…   — period stats (Q4/Q11, no schema change)
@@ -249,3 +249,27 @@ class UploadEndpoints(UIEndpointCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PipelinePagesEndpoint(UIEndpointCase):
+    """The pipeline toolbar's pages-per-call selector (one-picture-at-a-time
+    used to be the only mode; the value is the OCR_PAGES_PER_CALL setting)."""
+
+    def test_pages_per_call_round_trips_and_clamps(self):
+        main.cfg = main.load_config()
+        client = self.client()
+        res = client.get("/api/pipeline/settings")
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["pages_per_call"], 1)
+        self.assertEqual(res.json()["max_pages"], 8)
+        res = client.post("/api/pipeline/settings", json={"pages_per_call": 4})
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()["pages_per_call"], 4)
+        self.assertEqual(main.cfg.ocr_pages_per_call, 4)
+        with open(self._env_path, encoding="utf-8") as fh:
+            self.assertIn("OCR_PAGES_PER_CALL=4", fh.read())
+        # an out-of-range value clamps instead of reaching the lane
+        res = client.post("/api/pipeline/settings", json={"pages_per_call": 99})
+        self.assertEqual(res.json()["pages_per_call"], 8)
+        res = client.post("/api/pipeline/settings", json={"pages_per_call": 0})
+        self.assertEqual(res.json()["pages_per_call"], 1)

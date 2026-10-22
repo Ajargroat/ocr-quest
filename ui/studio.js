@@ -8,7 +8,7 @@
    the WS dispatcher's `studioFeed` hook. */
 const StudioState = { loaded:false, wired:false, jobs:[], job:null, detail:null,
                       tags:null, tagDraft:null, models:null, bulk:null, block:null,
-                      tab:'jobs', cropPage:null, drawerKey:null,
+                      tab:'jobs', cropPage:null, drawerKey:null, organize:'auto',
                       tagScope:'corps', tagSubject:'', tagGrade:'' };
 const ST_KEEP = '__KEEP__';   // same sentinel the credentials tab sends (main.py KEEP)
 
@@ -58,6 +58,14 @@ function studioWireOnce(){
   document.querySelectorAll('#stTabs .rail-btn').forEach(b =>
     b.onclick = () => studioPanel(b.dataset.sttab));
   $('stCropDrawerClose').onclick = () => stCropDrawerClose();
+  $('stJobModalClose').onclick = () => stJobClose();
+  $('stJobModal').onclick = e => { if (e.target === $('stJobModal')) stJobClose(); };
+  $('stJobTabs').querySelectorAll('.rail-btn').forEach(b => b.onclick = () => {
+    StJob.tab = b.dataset.stjob;
+    stJobRender();
+  });
+  $('stJobSave').onclick = () => stJobSave();
+  stEditWireOnce();
   $('stRefresh').onclick = () => {
     studioLoadJobs();
     studioLoadBulk();
@@ -69,11 +77,13 @@ function studioWireOnce(){
     if (f) studioUpload(f);
     e.target.value = '';
   };
+  stLogWire();
 }
 
 /* stage tabs · exactly one pane is visible; #studio/<tab> keeps the deep link
    working (app.js panelFromHash) */
-const ST_TABS = ['jobs', 'profile', 'bulk', 'crops', 'tags', 'models', 'import'];
+const ST_TABS = ['jobs', 'profile', 'bulk', 'crops', 'inspect', 'tags',
+                 'models', 'import'];
 
 function studioPanel(name, silent){
   if (!ST_TABS.includes(name)) name = 'jobs';
@@ -84,7 +94,9 @@ function studioPanel(name, silent){
     p.hidden = p.dataset.sttab !== name);
   if (name === 'tags') studioRenderTags();
   if (name === 'models') studioRenderModels();
-  if (name === 'bulk' || name === 'crops' || name === 'import') studioLoadBulk();
+  if (name === 'bulk' || name === 'crops' || name === 'import'
+      || name === 'inspect') studioLoadBulk();
+  if (name === 'profile') studioRenderProfile();
   if (!silent) history.replaceState(null, '', '#studio/' + name);
 }
 
@@ -99,6 +111,17 @@ async function studioLoadJobs(){
     studioSelectJob(StudioState.jobs[0].id, { keepPanel: true });
 }
 
+/* Which artifacts a row shows as icons, and which pop-up tab each opens.
+   Profile / Extract / Crops / Models — one file at a time, own model each. */
+const ST_ART = [
+  ['profile', 'fa-id-card', 'profile'],
+  ['layer1', 'fa-layer-group', 'extract'],
+  ['layer2', 'fa-list-check', 'extract'],
+  ['geometry', 'fa-crop-simple', 'crops'],
+  ['review', 'fa-eye', 'crops'],
+  ['imports', 'fa-database', 'extract'],
+];
+
 function studioRenderJobs(){
   const wrap = $('stJobs');
   const jobs = StudioState.jobs;
@@ -108,16 +131,18 @@ function studioRenderJobs(){
   }
   const rows = jobs.map(j => {
     const art = j.artifacts || {};
-    const chips = ['profile','layer1','layer2','geometry','review','imports']
-      .map(k => '<span class="st-art ' + (art[k] ? 'on' : 'off') + '">' + k + '</span>')
-      .join('');
+    const icons = ST_ART.map(([key, icon, tab]) =>
+      '<button type="button" class="st-art-i' + (art[key] ? ' on' : '')
+      + '" data-job="' + stEsc(j.id) + '" data-jobtab="' + tab + '"'
+      + ' title="' + stEsc(key) + '" aria-label="' + stEsc(key) + '">'
+      + '<i class="fa ' + icon + '" aria-hidden="true"></i></button>').join('');
     const active = StudioState.job === j.id ? ' active' : '';
     return '<tr class="st-row' + active + '" data-job="' + stEsc(j.id) + '">'
       + '<td><b>' + stEsc(j.name) + '</b><span class="st-sub">' + stEsc(j.id) + '</span></td>'
       + '<td>' + (j.kind ? '<span class="chip s-ocr">' + stEsc(j.kind) + '</span>' : '—') + '</td>'
       + '<td>' + stEsc(j.subject || '—') + '</td>'
       + '<td>' + stEsc((j.compilation || '—').replace(/_/g, ' ')) + '</td>'
-      + '<td class="st-art-cell">' + chips + '</td>'
+      + '<td class="st-art-cell">' + icons + '</td>'
       + '<td>' + (j.blocks != null ? stNum(j.blocks) : '—') + '</td>'
       + '<td>' + stFmt(j.created_at) + '</td>'
       + '<td class="st-row-actions">'
@@ -136,9 +161,248 @@ function studioRenderJobs(){
   wrap.querySelectorAll('.st-del').forEach(b => b.onclick = e => {
     e.stopPropagation(); studioDelete(b.dataset.job);
   });
+  wrap.querySelectorAll('[data-jobtab]').forEach(b => b.onclick = e => {
+    e.stopPropagation(); stJobOpen(b.dataset.job, b.dataset.jobtab);
+  });
   wrap.querySelectorAll('.st-row').forEach(tr => tr.onclick = () => {
     studioSelectJob(tr.dataset.job);
   });
+}
+
+/* ── one file's own pop-up · the row's artifact icons ──
+   profile · extract (layer1/layer2 + stage runs) · crops (review state) ·
+   models (this FILE's provider + model, independent of the next file). */
+const StJob = { job: null, tab: 'profile', data: null };
+
+function stJobOpen(job, tab){
+  StJob.job = job;
+  StJob.tab = tab || 'profile';
+  $('stJobModal').hidden = false;
+  stJobLoad();
+}
+
+function stJobClose(){ $('stJobModal').hidden = true; StJob.job = null; }
+
+async function stJobLoad(){
+  const job = StJob.job;
+  if (!job) return;
+  try {
+    StJob.data = await studioApi('/api/studio/jobs/' + encodeURIComponent(job) + '/lane');
+  } catch (e){ StJob.data = { error: e.message }; }
+  stJobRender();
+}
+
+function stJobPaintTabs(){
+  document.querySelectorAll('#stJobTabs .rail-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.stjob === StJob.tab));
+}
+
+function stJobRender(){
+  const d = StJob.data || {};
+  const body = $('stJobModalBody');
+  const err = $('stJobErr');
+  if (err) err.hidden = true;
+  stJobPaintTabs();
+  const job = d.job || {};
+  $('stJobModalTitle').textContent = job.name || StJob.job || '';
+  $('stJobSave').hidden = StJob.tab !== 'models';
+  if (d.error){
+    body.innerHTML = '<div class="db-empty db-err">' + stEsc(d.error) + '</div>';
+    return;
+  }
+  if (StJob.tab === 'profile') body.innerHTML = stJobProfileHtml(d);
+  else if (StJob.tab === 'extract') body.innerHTML = stJobExtractHtml(d);
+  else if (StJob.tab === 'crops') body.innerHTML = stJobCropsHtml(d);
+  else body.innerHTML = stJobModelsHtml(d);
+  stJobWire();
+}
+
+function stJobProfileHtml(d){
+  const job = d.job || {};
+  const stats = [['kind', job.kind], ['compilation', job.compilation],
+    ['subject', job.subject], ['blocks', job.blocks], ['figures', job.figures],
+    ['imported', job.imported], ['created', stFmt(job.created_at)]];
+  const art = job.artifacts || {};
+  return '<div class="st-job-grid">'
+    + '<div class="st-col">' + (stStats(stats) || '') + '</div>'
+    + '<div class="st-col"><div class="st-art-cell">' + ST_ART.map(([key, icon]) =>
+        '<span class="st-art ' + (art[key] ? 'on' : 'off') + '">'
+        + '<i class="fa ' + icon + '" aria-hidden="true"></i> ' + stEsc(key) + '</span>').join('')
+    + '</div></div></div>'
+    + '<div class="st-job-foot">'
+    + '<button class="ghost-btn neutral sm" data-job-run="probe" type="button">re-probe</button>'
+    + '<button class="ghost-btn neutral sm" data-job-open="profile" type="button">full profile</button>'
+    + '</div>';
+}
+
+function stJobExtractHtml(d){
+  const blocks = d.blocks || [];
+  const stats = d.stats || {};
+  const stages = d.stages || {};
+  const lane = d.lane || {};
+  const counts = [['blocks', blocks.length],
+    ['questions', blocks.filter(b => b.kind === 'question').length],
+    ['answers', blocks.filter(b => b.kind === 'answer_key_entry').length],
+    ['importable', blocks.filter(b => b.importable).length],
+    ['stat calls', stats.calls]];
+  const stageRow = (stage, label) => {
+    const s = stages[stage] || {};
+    return '<tr><td>' + stEsc(label) + '</td><td>' + stEsc(s.label || '—') + '</td>'
+      + '<td class="mono">' + stEsc(s.model || (s.provider ? '—' : 'all')) + '</td></tr>';
+  };
+  const rows = blocks.map(b =>
+    '<tr><td class="mono">' + stEsc(b.key || '') + '</td>'
+    + '<td>' + stEsc(b.kind || '') + '</td>'
+    + '<td class="mono">' + stEsc(b.number != null ? b.number : '—') + '</td>'
+    + '<td class="mono">' + stEsc(b.page != null ? b.page : '—') + '</td>'
+    + '<td>' + stStatusChip(b.status) + '</td>'
+    + '<td>' + (b.picture ? '<span class="st-art ' + (b.picture_ok ? 'on' : 'off') + '">picture</span>' : '—') + '</td>'
+    + '<td>' + (b.importable ? '<span class="st-art on">ready</span>'
+        : '<span class="st-art off" title="' + stEsc(b.why) + '">blocked</span>') + '</td></tr>').join('');
+  return '<div class="st-col">' + (stStats(counts) || '')
+    + '<div class="st-job-lane">' + '<b>' + stEsc(lane.provider_label || 'stage default') + '</b>'
+    + '<span class="st-sub">this file' + (lane.prompt ? ' · own prompt' : '') + '</span></div>'
+    + '<div class="st-table-wrap st-job-table"><table class="st-table"><thead><tr>'
+    + '<th>Stage</th><th>source</th><th>model</th></tr></thead><tbody>'
+    + stageRow('extract', 'extract') + stageRow('enrich', 'enrich') + stageRow('vision', 'locate')
+    + '</tbody></table></div>'
+    + (rows ? '<div class="st-table-wrap st-job-table"><table class="st-table"><thead><tr>'
+      + '<th>Block</th><th>kind</th><th>#</th><th>page</th><th>status</th><th>picture</th><th>import</th>'
+      + '</tr></thead><tbody>' + rows + '</tbody></table></div>' : '')
+    + '<div class="st-job-foot">'
+    + '<button class="ghost-btn neutral sm" data-job-run="extract" type="button">Extract</button>'
+    + '<button class="ghost-btn neutral sm" data-job-run="enrich" type="button">Enrich</button>'
+    + '<button class="ghost-btn neutral sm" data-job-run="geometry" type="button">Locate</button>'
+    + '</div></div>';
+}
+
+function stJobCropsHtml(d){
+  const blocks = (d.blocks || []).filter(b => b.picture);
+  const counts = [['pictures', blocks.length],
+    ['approved', blocks.filter(b => b.picture_ok).length],
+    ['pending', blocks.filter(b => !b.picture_ok).length]];
+  const rows = blocks.map(b =>
+    '<tr><td class="mono">' + stEsc(b.key || '') + '</td>'
+    + '<td class="mono">' + stEsc(b.number != null ? b.number : '—') + '</td>'
+    + '<td class="mono">' + stEsc(b.page != null ? b.page : '—') + '</td>'
+    + '<td>' + (b.picture_ok ? '<span class="st-art on">approved</span>'
+        : '<span class="st-art off">review</span>') + '</td>'
+    + '<td><button class="ghost-btn neutral sm" data-job-crop="' + stEsc(b.key) + '" type="button">'
+    + 'picture</button></td></tr>').join('');
+  return '<div class="st-col">' + (stStats(counts) || '')
+    + (rows ? '<div class="st-table-wrap st-job-table"><table class="st-table"><thead><tr>'
+      + '<th>Block</th><th>#</th><th>page</th><th>state</th><th></th></tr></thead><tbody>'
+      + rows + '</tbody></table></div>' : '')
+    + '<div class="st-job-foot">'
+    + '<button class="ghost-btn neutral sm" data-job-panel="crops" type="button">crops desk</button>'
+    + '<button class="ghost-btn neutral sm" data-job-panel="inspect" type="button">inspect</button>'
+    + '</div></div>';
+}
+
+function stJobModelsHtml(d){
+  const lane = d.lane || {};
+  const stages = d.stages || {};
+  const sources = d.sources || [];
+  const pool = [['', 'Gemini pool']].concat(sources.map(p => [p.label, p.label]));
+  const models = {};
+  sources.forEach(p => {
+    const stage = Object.values(stages).find(s => s.provider === p.label);
+    models[p.label] = p.models.length ? p.models : (stage && stage.model ? [stage.model] : []);
+  });
+  const cur = lane.provider || '';
+  const pick = models[cur] || [];
+  const srcOpts = pool.map(([v, l]) => '<option value="' + stEsc(v) + '"'
+    + (v === cur ? ' selected' : '') + '>' + stEsc(l) + '</option>').join('');
+  const modelOpts = srcOpts ? (cur ? pick.map(m => '<option value="' + stEsc(m) + '"'
+      + (m === (stages.extract || {}).model ? ' selected' : '') + '>' + stEsc(m) + '</option>').join('')
+      : '<option value="">all</option>') : '';
+  const stageRow = (stage, label) => {
+    const s = stages[stage] || {};
+    return '<label class="st-field"><span>' + stEsc(label) + '</span>'
+      + '<input type="text" dir="ltr" readonly value="'
+      + stEsc((s.label || 'Gemini pool') + (s.model ? ' · ' + s.model : '')) + '"></label>';
+  };
+  return '<div class="st-col">'
+    + '<label class="st-field"><span>this file runs on</span>'
+    + '<select id="stJobSource" data-job-source>' + srcOpts + '</select></label>'
+    + '<label class="st-field"><span>model</span>'
+    + '<select id="stJobModel" data-job-model>' + modelOpts + '</select></label>'
+    + '<label class="st-field"><span>own prompt · spare</span>'
+    + '<textarea data-autofit rows="2" dir="auto" data-job-prompt>'
+    + stEsc(lane.prompt || '') + '</textarea></label>'
+    + '</div>'
+    + '<div class="st-col">'
+    + stageRow('extract', 'extract') + stageRow('enrich', 'enrich') + stageRow('vision', 'locate')
+    + '</div>';
+}
+
+function stJobWire(){
+  const body = $('stJobModalBody');
+  body.querySelectorAll('[data-job-run]').forEach(b => b.onclick = async () => {
+    await studioSelectJob(StJob.job, { keepPanel: true });
+    await studioRunStage(b.dataset.jobRun, b.dataset.jobRun);
+    stJobLoad();
+  });
+  body.querySelectorAll('[data-job-open]').forEach(b => b.onclick = () => {
+    const job = StJob.job;
+    stJobClose();
+    studioSelectJob(job).then(() => studioPanel(b.dataset.jobOpen));
+  });
+  body.querySelectorAll('[data-job-panel]').forEach(b => b.onclick = () => {
+    const job = StJob.job, panel = b.dataset.jobPanel;
+    stJobClose();
+    studioSelectJob(job, { keepPanel: true }).then(() => studioPanel(panel));
+  });
+  body.querySelectorAll('[data-job-crop]').forEach(b => b.onclick = () => {
+    stJobClose();
+    stCropDrawerOpen(b.dataset.jobCrop);
+  });
+  const src = body.querySelector('[data-job-source]');
+  if (src) src.onchange = () => stJobModelRefresh();
+  stAutofit(body);
+}
+
+function stJobModelRefresh(){
+  const body = $('stJobModalBody');
+  const d = StJob.data || {};
+  const src = body.querySelector('[data-job-source]');
+  const sel = body.querySelector('[data-job-model]');
+  if (!src || !sel) return;
+  const label = src.value;
+  const provider = (d.sources || []).find(p => p.label === label);
+  const stage = Object.values(d.stages || {}).find(s => s.provider === label);
+  const models = label ? (provider && provider.models.length ? provider.models
+    : (stage && stage.model ? [stage.model] : [])) : [];
+  sel.innerHTML = label
+    ? (models.length ? models.map(m => '<option value="' + stEsc(m) + '">' + stEsc(m) + '</option>').join('')
+                    : '<option value="">—</option>')
+    : '<option value="">all</option>';
+}
+
+async function stJobSave(){
+  const body = $('stJobModalBody');
+  const err = $('stJobErr');
+  const src = body.querySelector('[data-job-source]');
+  const model = body.querySelector('[data-job-model]');
+  const prompt = body.querySelector('[data-job-prompt]');
+  if (!src) return;
+  try {
+    const d = await studioJson('/api/studio/jobs/' + encodeURIComponent(StJob.job) + '/lane', {
+      provider: src.value,
+      prompt: prompt ? prompt.value : '',
+    });
+    if (d.ok === false) throw new Error(d.error || 'save failed');
+    if (src.value && model && model.value){
+      StudioState.models = await studioJson('/api/studio/models/pick', {
+        label: src.value, model: model.value });
+    }
+    StJob.data = d;
+    stJobRender();
+    toast('File lane saved.');
+  } catch (e){
+    if (err){ err.hidden = false; err.textContent = e.message; }
+    else toast('Save failed: ' + e.message);
+  }
 }
 
 async function studioSelectJob(id, opts){
@@ -150,6 +414,7 @@ async function studioSelectJob(id, opts){
   studioRenderProfile();
   studioLoadBulk();
   stSetRail(d.job);
+  if (ST_LOG.job !== id) stLogLoad(id);
   if (!(opts && opts.keepPanel)) studioPanel('profile');
 }
 
@@ -283,6 +548,7 @@ async function studioUpload(file){
     await studioLoadJobs();
     if (d.job) studioSelectJob(d.job.id);
   } catch (e){
+    stLogFail('upload failed: ' + e.message);
     toast('Upload failed: ' + e.message);
   } finally {
     $('stUploadLabel').textContent = 'Choose a PDF or image…';
@@ -295,6 +561,7 @@ async function studioDelete(id){
     await fetch('/api/studio/jobs/' + encodeURIComponent(id), { method:'DELETE' });
     if (StudioState.job === id){ StudioState.job = null; StudioState.detail = null;
       $('stCrumb').textContent = ''; studioRenderProfile(); }
+    if (ST_LOG.job === id) stLogReset(null);
     await studioLoadJobs();
     toast('Job deleted.');
   } catch (e){ toast('Delete failed: ' + e.message); }
@@ -494,6 +761,8 @@ async function studioLoadModels(){
   } catch (e){ StudioState.models = { error: e.message }; }
 }
 
+/* each provider owns a MODEL LIST; the model select picks its default, and a
+   single file can override that pick in its own row pop-up (Models tab) */
 function studioRenderModels(){
   const body = $('stModelsBody');
   const m = StudioState.models;
@@ -501,28 +770,42 @@ function studioRenderModels(){
     body.innerHTML = m && m.error ? '<div class="db-empty db-err">' + stEsc(m.error) + '</div>' : '';
     return;
   }
-  const rows = (m.providers || []).map((p, i) =>
-    '<div class="st-tagrow"><b>' + stEsc(p.label || '') + '</b>'
-    + '<span class="st-art ' + (p.api_key_set ? 'on' : 'off') + '">'
-    + (p.api_key_set ? 'key set' : 'no key') + '</span>'
-    + '<input type="password" data-mkey="' + i + '" value="" aria-label="api key" autocomplete="off">'
-    + '<input type="text" dir="ltr" data-mmodel="' + i + '" value="' + stEsc(p.model || '') + '" aria-label="model">'
-    + '<input type="text" dir="ltr" data-mmodels="' + i + '" value="' + stEsc((p.models || []).join(', ')) + '" aria-label="models">'
-    + '<button class="ghost-btn neutral sm" data-del-prov="' + i + '" type="button">remove</button></div>').join('');
+  const rows = (m.providers || []).map((p, i) => {
+    const models = (p.models || []).slice();
+    if (p.model && !models.includes(p.model)) models.unshift(p.model);
+    const opts = models.map(v => '<option value="' + stEsc(v) + '"'
+      + (v === (p.model || '') ? ' selected' : '') + '>' + stEsc(v) + '</option>').join('');
+    return '<div class="st-prov" data-prov="' + i + '">'
+      + '<div class="st-prov-head"><b>' + stEsc(p.label || '') + '</b>'
+      + '<span class="st-art ' + (p.api_key_set ? 'on' : 'off') + '">'
+      + (p.api_key_set ? 'key set' : 'no key') + '</span>'
+      + '<span class="st-gap"></span>'
+      + '<button class="ghost-btn neutral sm" data-del-prov="' + i + '" type="button">remove</button></div>'
+      + '<label class="st-field"><span>api key</span>'
+      + '<input type="password" data-mkey="' + i + '" value="" autocomplete="off"></label>'
+      + '<label class="st-field"><span>models · one per line</span>'
+      + '<textarea data-autofit dir="ltr" rows="1" data-mmodels="' + i + '">'
+      + stEsc(models.join('\n')) + '</textarea></label>'
+      + '<label class="st-field"><span>default model</span><select data-mmodel="' + i + '">'
+      + (opts || '<option value="">—</option>') + '</select></label></div>';
+  }).join('');
   const pick = (labels, cur, emptyLabel) =>
     '<option value="">' + stEsc(emptyLabel) + '</option>' + labels.map(l =>
       '<option value="' + stEsc(l) + '"' + (l === cur ? ' selected' : '') + '>' + stEsc(l) + '</option>').join('');
   const labels = (m.providers || []).map(p => p.label).filter(Boolean);
   body.innerHTML =
-    '<div class="st-col"><h3>Providers</h3><div>' + rows + '</div>'
-    + '<button class="ghost-btn neutral sm" data-add-prov type="button">add 9router</button></div>'
+    '<div class="st-col"><div class="st-models-grid">' + rows + '</div>'
+    + '<button class="ghost-btn neutral sm" data-add-prov type="button">add provider</button></div>'
     + '<div class="st-col"><h3>Stages</h3>'
     + '<label class="st-field"><span>extract</span><select data-mextract>'
     + pick(labels, m.extract_active, 'Gemini pool') + '</select></label>'
     + '<label class="st-field"><span>enrich</span><select data-menrich>'
     + pick(labels, m.enrich_active, 'none') + '</select></label>'
     + '<label class="st-field"><span>locate</span><select data-mvision>'
-    + pick(labels, m.vision_active, 'Gemini pool') + '</select></label></div>'
+    + pick(labels, m.vision_active, 'Gemini pool') + '</select></label>'
+    + '<label class="st-field"><span>gemini model</span><select data-mgem>'
+    + pick(m.gemini_models || [], m.gemini_pin, 'All models')
+    + '</select></label></div>'
     + '<div class="st-col"><h3>Proxy</h3>'
     + '<label class="st-field"><span>proxy</span><select data-mproxy>'
     + [''].concat(m.proxy_profiles || []).map(p =>
@@ -530,15 +813,19 @@ function studioRenderModels(){
         + stEsc(p || 'Direct') + '</option>').join('') + '</select></label></div>'
     + '<div class="st-profile-foot"><span class="st-warn" data-models-err hidden></span>'
     + '<button class="ghost-btn neutral" data-models-save type="button">Save models</button></div>';
+  stAutofit(body);
   body.onclick = e => {
     const b = e.target.closest('button');
     if (!b || !body.contains(b)) return;
     if (b.hasAttribute('data-add-prov')){
-      const cur = StudioState.models.providers || [];
-      if (!cur.some(p => p.label === '9router'))
-        cur.push({ label: '9router', base_url: 'http://127.0.0.1:20128/v1',
-                   api_key_set: false, model: '', models: [] });
-      studioRenderModels();
+      studioSaveModels().then(() => {
+        const cur = (StudioState.models && StudioState.models.providers) || [];
+        if (!cur.some(p => p.label === '9router')){
+          cur.push({ label: '9router', base_url: 'http://127.0.0.1:20128/v1',
+                     api_key_set: false, model: '', models: [] });
+          studioRenderModels();
+        }
+      });
     }
     else if (b.hasAttribute('data-del-prov')){
       StudioState.models.providers.splice(+b.dataset.delProv, 1);
@@ -557,7 +844,7 @@ async function studioSaveModels(){
     return { label: p.label, base_url: p.base_url || 'http://127.0.0.1:20128/v1',
              api_key: typed || (p.api_key_set ? ST_KEEP : ''),
              model: at('data-mmodel', i).trim(),
-             models: at('data-mmodels', i).split(',').map(s => s.trim()).filter(Boolean) };
+             models: at('data-mmodels', i).split('\n').map(s => s.trim()).filter(Boolean) };
   });
   const sel = attr => { const el = body.querySelector('[' + attr + ']'); return el ? el.value : ''; };
   const err = body.querySelector('[data-models-err]');
@@ -565,10 +852,13 @@ async function studioSaveModels(){
     const d = await studioJson('/api/studio/models', {
       providers, extract_active: sel('data-mextract'),
       enrich_active: sel('data-menrich'), vision_active: sel('data-mvision'),
+      gemini_pin: sel('data-mgem'),
       proxy: sel('data-mproxy') });
+    if (d.ok === false) throw new Error(d.error || 'save failed');
     StudioState.models = d;
     studioRenderModels();
     toast('Studio models saved.');
+    return d;
   } catch (e){
     if (err){ err.hidden = false; err.textContent = e.message; }
     else toast('Save failed: ' + e.message);
@@ -602,14 +892,19 @@ async function studioLoadBulk(){
   const id = StudioState.job;
   if (!id){
     StudioState.bulk = null;
+    StImport.rows = null;
     studioRenderBulk(); studioRenderCrops(); studioRenderImport();
+    studioRenderInspect();
     return;
   }
   try {
     StudioState.bulk = await studioApi('/api/studio/jobs/'
       + encodeURIComponent(id) + '/bulk');
   } catch (e){ StudioState.bulk = { error: e.message }; }
+  // the Import table lists rows, not a count — they ride on the bulk payload
+  await studioLoadImportRows();
   studioRenderBulk(); studioRenderCrops(); studioRenderImport();
+  studioRenderInspect();
 }
 
 async function studioRunStage(stage, label){
@@ -617,8 +912,13 @@ async function studioRunStage(stage, label){
   if (!id) return;
   stBusy(true, label + ' running…');
   try {
+    const opts = { method:'POST' };
+    if (stage === 'extract'){
+      opts.headers = { 'content-type':'application/json' };
+      opts.body = JSON.stringify({ organize: StudioState.organize || 'auto' });
+    }
     const d = await studioApi('/api/studio/jobs/' + encodeURIComponent(id)
-      + '/' + stage, { method:'POST' });
+      + '/' + stage, opts);
     await studioLoadJobs();
     await studioSelectJob(id, { keepPanel:true });
     toast(label + ': ' + stStageNote(d));
@@ -689,6 +989,719 @@ async function studioSaveBatching(){
   } catch (e){ toast('Batching save failed: ' + e.message); }
 }
 
+/* ── Inspect panel · the local-first editing desk ──
+   Edit a question row or replace its picture, then approve the whole batch
+   once. Nothing leaves the browser until approval: text/field edits sit in
+   localStorage, pictures sit in the job's own workspace/drafts folder —
+   never the bucket, never the database. Approval uploads each picture ALREADY
+   CROPPED (the reviewer cuts it in their own editor, so there is no browser
+   cropper to exploit) and imports every ready row in ONE pass. */
+const ST_INSPECT_LIMIT = 400;
+const StInspect = { job: null, edits: {}, crops: {}, timer: 0 };
+
+const stInspectStoreKey = job => 'studio.inspect.' + String(job || '');
+
+function stInspectLoad(){
+  const job = StudioState.job || '';
+  if (StInspect.job === job) return;
+  StInspect.job = job;
+  StInspect.edits = {};
+  StInspect.crops = {};
+  if (!job) return;
+  try{
+    const raw = localStorage.getItem(stInspectStoreKey(job));
+    const d = raw ? JSON.parse(raw) : null;
+    if (d && typeof d === 'object'){
+      if (d.edits && typeof d.edits === 'object') StInspect.edits = d.edits;
+      if (d.crops && typeof d.crops === 'object') StInspect.crops = d.crops;
+    }
+  }catch(e){ /* a corrupt draft is not worth breaking the panel for */ }
+}
+
+function stInspectSave(){
+  const job = StInspect.job;
+  if (!job) return;
+  const flush = () => {
+    StInspect.timer = 0;
+    try{
+      localStorage.setItem(stInspectStoreKey(job), JSON.stringify({
+        edits: StInspect.edits, crops: StInspect.crops }));
+    }catch(e){ toast('Local draft is full — approve the batch to free it'); }
+  };
+  if (StInspect.timer) clearTimeout(StInspect.timer);
+  StInspect.timer = setTimeout(flush, 250);
+}
+
+function stInspectPatch(key){ return StInspect.edits[key] || {}; }
+
+function stInspectValue(block, field){
+  const patch = stInspectPatch(block.key);
+  if (patch[field] !== undefined && patch[field] !== null) return patch[field];
+  const value = block[field];
+  return value == null ? '' : value;
+}
+
+function stInspectDraftCount(){
+  return Object.keys(StInspect.edits).length + Object.keys(StInspect.crops).length;
+}
+
+function stInspectJobs(){
+  /* StudioState.bulk is the whole /bulk reply, so the blocks hang off .view */
+  const view = StudioState.bulk && StudioState.bulk.view;
+  if (!view) return [];
+  const blocks = (view.blocks || []).filter(b => b.kind === 'question');
+  return blocks.slice(0, ST_INSPECT_LIMIT);
+}
+
+/* ── Inspect list · one row per question ──
+   Every row carries its own edit and approve: Edit opens the focused pop-up
+   (auto-fitting text boxes, the picture with box sliders), Approve commits
+   that row's local draft now. "Approve all" stays for a whole batch. */
+function stInspectRow(block){
+  const key = block.key || '';
+  const draft = (StInspect.edits[key] || {});
+  const edited = Object.keys(draft).length > 0;
+  const crop = block.crop || {};
+  const prov = crop.source === 'model'
+    ? '<span class="st-art plain">model \u00b7 review</span>'
+    : (crop.source === 'asset' ? '<span class="st-art plain">asset</span>' : '');
+  const pic = crop.needed
+    ? ('<span class="st-art ' + (crop.approved || crop.external ? 'on' : 'off')
+       + '">picture</span>' + prov)
+    : '';
+  const missing = (block.missing || []).length;
+  const missingChip = missing
+    ? '<span class="st-art off" title="' + stEsc((block.missing || []).join(' '))
+      + '">' + stNum(missing) + '</span>'
+    : '—';
+  const topic = stInspectValue(block, 'topic');
+  const text = stInspectValue(block, 'text');
+  const opts = stInspectValue(block, 'options');
+  const tr = document.createElement('tr');
+  tr.className = 'st-insp-row' + (edited ? ' edited' : '');
+  tr.dataset.key = key;
+  tr.ondblclick = ev => {
+    if (ev.target.closest('button, a, input, select, textarea')) return;
+    stEditOpen(key);
+  };
+  tr.innerHTML =
+    '<td class="mono">' + stEsc(block.number != null ? String(block.number) : '—') + '</td>'
+    + '<td class="mono">' + stEsc(block.page != null ? String(block.page) : '—') + '</td>'
+    + '<td>' + (block.status ? stStatusChip(block.status) : '—') + '</td>'
+    + '<td class="st-insp-text" dir="auto">' + mdHtml(String(text || '')) + '</td>'
+    + '<td class="st-insp-topic" dir="auto">' + stEsc(topic || '—') + '</td>'
+    + '<td class="mono">' + stEsc(Array.isArray(opts) ? opts.length : 0) + '</td>'
+    + '<td>' + missingChip + '</td>'
+    + '<td>' + (pic || '—') + '</td>'
+    + '<td><span class="st-art on" data-insp-edited' + (edited ? '' : ' hidden') + '>edited</span></td>'
+    + '<td class="st-row-actions">'
+    + '<button class="ghost-btn neutral sm" data-insp-edit="' + stEsc(key) + '" type="button">edit</button>'
+    + '<button class="ghost-btn neutral sm" data-insp-ok="' + stEsc(key) + '" type="button">approve</button>'
+    + '</td>';
+  return tr;
+}
+
+function stInspectMark(){
+  const wrap = $('stInspectBody');
+  if (!wrap) return;
+  wrap.querySelectorAll('.st-insp-row').forEach(tr => {
+    const edited = !!StInspect.edits[tr.dataset.key];
+    tr.classList.toggle('edited', edited);
+    const chip = tr.querySelector('[data-insp-edited]');
+    if (chip) chip.hidden = !edited;
+  });
+  const count = wrap.querySelector('[data-insp-count]');
+  if (count) count.textContent = stNum(stInspectDraftCount());
+  const stage = $('stEditHint');
+  if (stage && StEdit.key) stage.textContent = stEditDirty() ? 'unsaved' : '';
+}
+
+async function stInspectReset(){
+  const job = StInspect.job;
+  if (!job) return;
+  const keys = Object.keys(StInspect.crops);
+  await Promise.all(keys.map(key => fetch('/api/studio/jobs/'
+    + encodeURIComponent(job) + '/draft/crop/' + encodeURIComponent(key),
+    { method: 'DELETE' }).catch(() => null)));
+  StInspect.edits = {};
+  StInspect.crops = {};
+  try{ localStorage.removeItem(stInspectStoreKey(job)); }catch(e){}
+  studioRenderInspect();
+  toast('Local drafts cleared');
+}
+
+async function stInspectApprove(btn, keys){
+  const job = StInspect.job || StudioState.job;
+  if (!job) return;
+  if (!Object.keys(StInspect.edits).length && !Object.keys(StInspect.crops).length){
+    toast('No local drafts to approve');
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    const edits = {};
+    Object.keys(StInspect.edits).forEach(k => {
+      if (!keys || keys.includes(k)) edits[k] = StInspect.edits[k];
+    });
+    const d = await studioJson('/api/studio/jobs/' + encodeURIComponent(job)
+      + '/commit', { edits: edits, crops: {}, target: 'supabase' });
+    if (!d.ok) throw new Error(d.error || 'commit failed');
+    if (keys) keys.forEach(k => { delete StInspect.edits[k]; });
+    else StInspect.edits = {};
+    StInspect.crops = {};
+    stInspectSave();
+    if (!Object.keys(StInspect.edits).length && !Object.keys(StInspect.crops).length){
+      try{ localStorage.removeItem(stInspectStoreKey(job)); }catch(e){}
+    }
+    const report = d.report || {};
+    toast('Imported ' + stNum(report.questions || 0) + ' question(s) · '
+      + stNum(report.answers || 0) + ' answer(s) · '
+      + stNum(d.uploads || 0) + ' picture(s)');
+    await studioLoadBulk();
+  }catch(e){ toast('Approve failed: ' + e.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+function stInspectScorecard(){
+  const d = StudioState.bulk || {};
+  const sc = d.scorecard || ((d.view || {}).scorecard);
+  if (!sc) return document.createElement('div');
+  const conf = sc.layout_confidence == null ? null
+    : Number(sc.layout_confidence).toFixed(2);
+  const meta = (sc.metadata_missing || []).join(' ');
+  const chips = [
+    ['blocks', stNum(sc.blocks), ''],
+    ['prose', sc.prose ? stNum(sc.prose) : '', ''],
+    ['ready', stNum(sc.ready), sc.ready ? 'ok' : 'plain'],
+    ['warn', stNum(sc.warn), sc.warn ? 'warn' : 'plain'],
+    ['4 opts', stNum(sc.four_options) + ' / ' + stNum(sc.questions),
+     sc.questions && sc.four_options === sc.questions ? 'ok' : 'warn'],
+    ['topics', stNum(sc.topics_known) + ' / ' + stNum(sc.questions),
+     sc.questions && sc.topics_known === sc.questions ? 'ok' : 'warn'],
+    ['crops', stNum(sc.crops_approved) + ' / ' + stNum(sc.crops),
+     sc.crops && sc.crops_approved === sc.crops ? 'ok' : 'warn'],
+    ['LLM', stNum(sc.organized), sc.organized ? '' : 'plain'],
+  ];
+  if (conf) chips.push(['layout', conf, Number(conf) >= 1 ? 'ok' : 'warn']);
+  if (meta) chips.push(['metadata', meta, 'plain']);
+  const strip = document.createElement('div');
+  strip.className = 'st-tools st-scorecard';
+  strip.innerHTML = stStats(chips);
+  return strip;
+}
+
+function studioRenderInspect(){
+  const wrap = $('stInspectBody');
+  if (!wrap) return;
+  stInspectLoad();
+  const job = StudioState.job;
+  if (!job || !StudioState.bulk){
+    wrap.replaceChildren();
+    return;
+  }
+  const staged = (StudioState.bulk && StudioState.bulk.drafts) || {};
+  Object.keys(staged).forEach(key => {
+    if (!StInspect.crops[key]) StInspect.crops[key] = staged[key].at || 1;
+  });
+  const blocks = stInspectJobs();
+  if (!blocks.length){
+    wrap.replaceChildren();
+    return;
+  }
+  const bar = document.createElement('div');
+  bar.className = 'st-inspect-bar';
+  const count = stInspectDraftCount();
+  bar.innerHTML = '<span class="st-stat' + (count ? ' warn' : '')
+    + '"><em>drafts</em><b data-insp-count>' + stNum(count) + '</b></span>'
+    + '<span class="st-gap"></span>'
+    + '<button class="ghost-btn neutral sm" data-insp-clear type="button">reset</button>'
+    + '<button class="ghost-btn neutral" data-insp-apply type="button">approve all</button>';
+  const host = document.createElement('div');
+  host.className = 'st-table-wrap st-insp-table';
+  const table = document.createElement('table');
+  table.className = 'st-table';
+  table.innerHTML = '<thead><tr><th>#</th><th>page</th><th>status</th>'
+    + '<th>question</th><th>topic</th><th>opts</th><th>missing</th>'
+    + '<th>picture</th><th></th><th></th></tr></thead><tbody></tbody>';
+  const tbody = table.querySelector('tbody');
+  blocks.forEach(block => tbody.appendChild(stInspectRow(block)));
+  host.appendChild(table);
+  wrap.replaceChildren(stInspectScorecard(), bar, host);
+
+  bar.querySelector('[data-insp-clear]').onclick = () => stInspectReset();
+  bar.querySelector('[data-insp-apply]').onclick = e => stInspectApprove(e.currentTarget);
+  tbody.querySelectorAll('[data-insp-edit]').forEach(b => b.onclick = () =>
+    stEditOpen(b.dataset.inspEdit));
+  tbody.querySelectorAll('[data-insp-ok]').forEach(b => b.onclick = () =>
+    stInspectApprove(b, [b.dataset.inspOk]));
+  typesetMath(host);
+}
+
+/* ── the question editor · auto-fitting boxes + picture box sliders ──
+   Textareas grow with their text (no scrollbar, no resize handle), the
+   picture shows the page with its current box, and four range pairs move the
+   box edges in the page's own 0-1000 space. */
+const StEdit = { key: null, snapshot: null, box: [0, 0, 1000, 1000],
+                 touched: false, enabled: false, drag: null, ro: null,
+                 previewTimer: 0 };
+const ST_EDIT_FIELDS = [['number', 'number'], ['label', 'label'], ['subject', 'subject'],
+  ['topic', 'topic'], ['corp', 'corp'], ['year', 'year'], ['grade', 'grade'],
+  ['difficulty', 'difficulty']];
+/* The crop square's own limits: 2 % of the page is the smallest cut worth
+   making, and the arrow keys nudge by the values below. */
+const ST_BOX_MIN = 20;
+const stEditClamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+function stEditBlock(key){
+  return stInspectJobs().find(b => b.key === key) || null;
+}
+
+function stEditCurrent(block, field){
+  const el = document.querySelector('#stEditBody [data-efield="' + field + '"]');
+  if (el) return el.value;
+  return stInspectValue(block, field);
+}
+
+function stEditSnapshot(block){
+  const out = {};
+  ST_EDIT_FIELDS.concat([['text', 'text'], ['options', 'options']]).forEach(([f]) => {
+    const el = document.querySelector('#stEditBody [data-efield="' + f + '"]');
+    if (!el) return;
+    out[f] = f === 'options'
+      ? el.value.split('\n').map(s => s.trim()).filter(Boolean)
+      : el.value;
+  });
+  out.bbox = StEdit.box.map(v => Math.round(v));
+  return out;
+}
+
+function stEditDirty(){
+  if (!StEdit.key || !StEdit.snapshot) return false;
+  const block = stEditBlock(StEdit.key);
+  if (!block) return false;
+  const now = stEditSnapshot(block);
+  return JSON.stringify(now) !== JSON.stringify(StEdit.snapshot);
+}
+
+function stEditBoxes(){
+  return ['y0', 'x0', 'y1', 'x1'].map(n =>
+    document.querySelector('#stEditBody [data-box="' + n + '"]')).filter(Boolean);
+}
+
+/* ── the crop square ──
+   The square lives in the page's own 0-1000 space, so what it carries IS the
+   bbox the importer uses - there is no second conversion anywhere. The page
+   is drawn with object-fit:contain, so the square is placed from the rendered
+   image rect instead of the stage: it stays glued to the paper at any window
+   size, and the scrim around it shows exactly what gets cut. */
+function stEditBoxNorm(raw){
+  let v = Array.isArray(raw) ? raw.map(Number) : [];
+  if (v.length !== 4 || !v.every(Number.isFinite)) v = [0, 0, 1000, 1000];
+  const y0 = stEditClamp(v[0], 0, 1000), y1 = stEditClamp(v[2], 0, 1000);
+  const x0 = stEditClamp(v[1], 0, 1000), x1 = stEditClamp(v[3], 0, 1000);
+  return [Math.min(y0, y1), Math.min(x0, x1), Math.max(y0, y1), Math.max(x0, x1)];
+}
+
+function stEditBoxFit(raw){
+  const box = stEditBoxNorm(raw);
+  [0, 1].forEach(lo => {
+    const hi = lo + 2;
+    if (box[hi] - box[lo] >= ST_BOX_MIN) return;
+    box[hi] = Math.min(1000, box[lo] + ST_BOX_MIN);
+    box[lo] = Math.max(0, box[hi] - ST_BOX_MIN);
+  });
+  return box;
+}
+
+/* where the page actually sits inside its stage (object-fit:contain) */
+function stEditStageRect(){
+  const stage = $('stEditStage'), img = $('stEditPage');
+  if (!stage || !img) return null;
+  const cw = stage.clientWidth, ch = stage.clientHeight;
+  const nw = img.naturalWidth || 0, nh = img.naturalHeight || 0;
+  if (!cw || !ch || !nw || !nh) return null;
+  const scale = Math.min(cw / nw, ch / nh);
+  const w = nw * scale, h = nh * scale;
+  return { w: w, h: h, left: (cw - w) / 2, top: (ch - h) / 2 };
+}
+
+/* the one place the square's numbers are written: sliders, outputs and box
+   position all follow StEdit.box, so they can never disagree */
+function stEditBoxApply(raw){
+  StEdit.box = stEditBoxFit(raw);
+  stEditBoxes().forEach((r, i) => {
+    r.value = String(Math.round(StEdit.box[i]));
+    const out = document.querySelector('#stEditBody [data-box-out="' + r.dataset.box + '"]');
+    if (out) out.textContent = String(Math.round(StEdit.box[i]));
+  });
+  stEditBoxPaint();
+}
+
+function stEditBoxPaint(){
+  const box = document.getElementById('stEditBox');
+  const rect = stEditStageRect();
+  if (!box || !rect) return;
+  const [y0, x0, y1, x1] = StEdit.box;
+  box.style.left = (rect.left + x0 / 1000 * rect.w) + 'px';
+  box.style.top = (rect.top + y0 / 1000 * rect.h) + 'px';
+  box.style.width = ((x1 - x0) / 1000 * rect.w) + 'px';
+  box.style.height = ((y1 - y0) / 1000 * rect.h) + 'px';
+}
+
+function stEditGrab(e){
+  if (!StEdit.enabled || (e.button != null && e.button !== 0)) return;
+  const rect = stEditStageRect();
+  if (!rect) return;
+  const handle = e.target && e.target.closest ? e.target.closest('[data-h]') : null;
+  e.preventDefault();
+  StEdit.drag = { mode: handle ? 'resize' : 'move',
+                  corner: handle ? handle.dataset.h : '',
+                  cx: e.clientX, cy: e.clientY,
+                  box: StEdit.box.slice(), rect: rect };
+  document.addEventListener('pointermove', stEditDragMove);
+  document.addEventListener('pointerup', stEditDragEnd);
+  document.addEventListener('pointercancel', stEditDragEnd);
+}
+
+function stEditDragMove(e){
+  const g = StEdit.drag;
+  if (!g) return;
+  const dx = (e.clientX - g.cx) / g.rect.w * 1000;
+  const dy = (e.clientY - g.cy) / g.rect.h * 1000;
+  let y0 = g.box[0], x0 = g.box[1], y1 = g.box[2], x1 = g.box[3];
+  if (g.mode === 'move'){
+    const w = x1 - x0, h = y1 - y0;
+    x0 = stEditClamp(x0 + dx, 0, 1000 - w); x1 = x0 + w;
+    y0 = stEditClamp(y0 + dy, 0, 1000 - h); y1 = y0 + h;
+  } else {
+    if (g.corner.indexOf('n') !== -1) y0 = stEditClamp(y0 + dy, 0, y1 - ST_BOX_MIN);
+    else y1 = stEditClamp(y1 + dy, y0 + ST_BOX_MIN, 1000);
+    if (g.corner.indexOf('w') !== -1) x0 = stEditClamp(x0 + dx, 0, x1 - ST_BOX_MIN);
+    else x1 = stEditClamp(x1 + dx, x0 + ST_BOX_MIN, 1000);
+  }
+  stEditTouch();
+  stEditBoxApply([y0, x0, y1, x1]);
+}
+
+function stEditDragEnd(){
+  if (!StEdit.drag) return;
+  StEdit.drag = null;
+  document.removeEventListener('pointermove', stEditDragMove);
+  document.removeEventListener('pointerup', stEditDragEnd);
+  document.removeEventListener('pointercancel', stEditDragEnd);
+}
+
+/* arrow keys nudge the square (Shift = coarse), so the box stays reachable
+   without a pointer */
+function stEditKey(e){
+  if (!StEdit.enabled) return;
+  const step = e.shiftKey ? 20 : 4;
+  const nudge = { ArrowUp: [0, -step], ArrowDown: [0, step],
+                  ArrowLeft: [-step, 0], ArrowRight: [step, 0] }[e.key];
+  if (!nudge) return;
+  e.preventDefault();
+  const [y0, x0, y1, x1] = StEdit.box;
+  const w = x1 - x0, h = y1 - y0;
+  const ny = stEditClamp(y0 + nudge[1], 0, 1000 - h);
+  const nx = stEditClamp(x0 + nudge[0], 0, 1000 - w);
+  stEditTouch();
+  stEditBoxApply([ny, nx, ny + h, nx + w]);
+}
+
+/* any hand on the square or a field means the draft is no longer saved */
+function stEditTouch(){
+  StEdit.touched = true;
+  const hint = $('stEditHint');
+  if (hint) hint.textContent = 'unsaved';
+}
+
+/* the picture the square cut, shown under the page */
+function stEditCropPaint(url){
+  const wrap = document.querySelector('#stEditBody .st-edit-croppic');
+  const img = document.getElementById('stEditCrop');
+  if (!wrap || !img) return;
+  if (url) img.src = url;
+  wrap.hidden = !img.getAttribute('src');
+}
+
+/* Text boxes size to their own text: one line of chrome minimum, the content
+   height otherwise. A box inside .st-edit-long lets CSS fill the column
+   instead, so nothing here fights it. */
+function stAutofit(root){
+  (root || document).querySelectorAll('textarea[data-autofit]').forEach(area => {
+    if (area.closest('.st-edit-long')){ area.style.height = ''; return; }
+    area.rows = 1;
+    area.style.height = 'auto';
+    area.style.height = Math.max(area.scrollHeight + 2, 34) + 'px';
+  });
+}
+
+/* the editor's rendered pane: what the text / options actually look like once
+   MathJax and the Markdown table pass have done their work. It repaints while
+   the reviewer types, so the draft is judged by its output, not its source. */
+function stEditPreviewHtml(field, raw){
+  if (field === 'options'){
+    const lines = String(raw || '').split('\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.length) return '';
+    return '<ul class="opts">' + lines.map((line, i) => {
+      const m = line.match(/^\s*([^)\.ـ:]{1,3})\s*[\)\.ـ:]\s*(.*)$/);
+      const label = m ? m[1] : String(i + 1);
+      const text = m ? m[2] : line;
+      return '<li><span class="opt-label">' + stEsc(label)
+        + '</span><span class="opt-text">' + mdHtml(text) + '</span></li>';
+    }).join('') + '</ul>';
+  }
+  return mdHtml(raw);
+}
+
+function stEditPreviewPaint(){
+  const body = $('stEditBody');
+  if (!body) return;
+  body.querySelectorAll('[data-efield-preview]').forEach(box => {
+    const field = box.dataset.efieldPreview;
+    const area = body.querySelector('[data-efield="' + field + '"]');
+    box.innerHTML = area ? stEditPreviewHtml(field, area.value) : '';
+    typesetMath(box);
+  });
+}
+
+function stEditPreviewSoon(){
+  if (StEdit.previewTimer) clearTimeout(StEdit.previewTimer);
+  StEdit.previewTimer = setTimeout(() => {
+    StEdit.previewTimer = 0;
+    stEditPreviewPaint();
+  }, 260);
+}
+
+function stEditOpen(key){
+  const block = stEditBlock(key);
+  if (!block) return;
+  const job = StInspect.job;
+  const staged = StInspect.crops[key];
+  const crop = block.crop || {};
+  const page = crop.page || block.page;
+  const draftUrl = '/api/studio/jobs/' + encodeURIComponent(job)
+    + '/draft/crop/' + encodeURIComponent(key);
+  const pic = staged ? draftUrl + '?v=' + encodeURIComponent(staged)
+    : (crop.exists ? '/api/studio/jobs/' + encodeURIComponent(job)
+      + '/crop/' + encodeURIComponent(key) : '');
+  const preview = page ? '/api/studio/jobs/' + encodeURIComponent(job)
+    + '/preview/' + encodeURIComponent(page) : '';
+  StEdit.key = key;
+  /* the square starts on the row's own box, so opening a crop shows the cut
+     that is already stored, not a guess */
+  StEdit.box = stEditBoxFit(stInspectPatch(key).bbox
+    || (crop.needed ? crop.bbox : null) || block.bbox || [0, 0, 1000, 1000]);
+  StEdit.enabled = !!crop.needed;
+  StEdit.touched = false;
+  StEdit.drag = null;
+  const field = (f, label) => '<label class="st-field"><span>' + label + '</span>'
+    + '<input type="text" dir="auto" data-efield="' + f + '" value="'
+    + stEsc(String(stEditValue(block, f) == null ? '' : stEditValue(block, f))) + '"></label>';
+  const area = (f, label) => {
+    const raw = stInspectValue(block, f);
+    const val = Array.isArray(raw) ? raw.join('\n') : (raw == null ? '' : String(raw));
+    return '<div class="st-edit-pair">'
+      + '<label class="st-field"><span>' + label + '</span>'
+      + '<textarea data-autofit data-efield="' + f + '" rows="1" dir="auto">' + stEsc(val) + '</textarea></label>'
+      + '<div class="st-field st-edit-preview"><span>rendered</span>'
+      + '<div class="st-edit-render" data-efield-preview="' + f + '" dir="auto"></div></div>'
+      + '</div>';
+  };
+  const slider = (idx, name, label) => '<label class="st-slider"><span>' + label + '</span>'
+    + '<input type="range" min="0" max="1000" step="1" data-box="' + name + '" data-idx="' + idx
+    + '" value="' + stEsc(String(StEdit.box[idx] != null ? StEdit.box[idx] : 0)) + '">'
+    + '<b data-box-out="' + name + '">' + stEsc(String(StEdit.box[idx] != null ? StEdit.box[idx] : 0)) + '</b></label>';
+  $('stEditTitle').textContent = 'Q' + (block.number != null ? block.number : '\u2014')
+    + (page ? ' \u00b7 page ' + page : '');
+  $('stEditBody').innerHTML =
+    '<div class="st-edit-grid">'
+    + '<div class="st-edit-left">'
+    +   '<div class="st-edit-fields">'
+    +     ST_EDIT_FIELDS.map(([f]) => field(f, f)).join('') + '</div>'
+    +   '<div class="st-edit-long">'
+    +     area('text', 'text') + area('options', 'options') + '</div>'
+    + '</div>'
+    + '<div class="st-edit-right">'
+    +   (preview
+        ? '<div class="st-edit-stage" id="stEditStage">'
+          + '<img id="stEditPage" src="' + stEsc(preview) + '" alt="page">'
+          + '<div class="st-edit-box" id="stEditBox" tabindex="0"'
+          +   (crop.needed ? '' : ' hidden') + '>'
+          +   '<i class="st-edit-handle" data-h="nw"></i>'
+          +   '<i class="st-edit-handle" data-h="ne"></i>'
+          +   '<i class="st-edit-handle" data-h="sw"></i>'
+          +   '<i class="st-edit-handle" data-h="se"></i>'
+          + '</div></div>'
+        : '')
+    +   '<div class="st-edit-boxes">'
+    +     slider(1, 'x0', 'left') + slider(0, 'y0', 'top')
+    +     slider(3, 'x1', 'right') + slider(2, 'y1', 'bottom')
+    +   '</div>'
+    +   (crop.needed ? '' : '<label class="sw"><input type="checkbox" data-edit-pic'
+          + (pic || Object.keys(stInspectPatch(key)).includes('pic') ? ' checked' : '')
+          + '><span class="tr" aria-hidden="true"></span><em>picture</em></label>')
+    +   '<div class="st-edit-croppic"' + (pic ? '' : ' hidden') + '>'
+    +     '<img class="st-edit-crop" id="stEditCrop" src="' + (pic ? stEsc(pic) : '')
+          + '" alt="crop"></div>'
+    +   '<label class="ghost-btn neutral sm st-inspect-pick">' + fi('image')
+    +     '<span>swap picture</span><input type="file" accept="image/*" data-edit-file></label>'
+    + '</div></div>';
+  $('stEditHint').textContent = '';
+  $('stEditModal').hidden = false;
+  stEditWire(block);
+  stAutofit($('stEditBody'));
+  stEditBoxApply(StEdit.box);
+  stEditPreviewPaint();
+  StEdit.snapshot = stEditSnapshot(block);
+}
+
+function stEditValue(block, field){
+  const v = stInspectValue(block, field);
+  return Array.isArray(v) ? v.join('\n') : v;
+}
+
+function stEditWire(block){
+  const body = $('stEditBody');
+  body.querySelectorAll('[data-efield]').forEach(el => {
+    el.oninput = () => {
+      if (el.tagName === 'TEXTAREA') stAutofit(body);
+      if (el.dataset.efield === 'text' || el.dataset.efield === 'options')
+        stEditPreviewSoon();
+      const hint = $('stEditHint');
+      if (hint) hint.textContent = 'unsaved';
+    };
+  });
+  body.querySelectorAll('[data-box]').forEach(r => {
+    r.oninput = () => {
+      stEditTouch();
+      stEditBoxApply(stEditBoxes().map(x => parseInt(x.value, 10) || 0));
+    };
+  });
+  const page = document.getElementById('stEditPage');
+  if (page){
+    page.onload = () => stEditBoxPaint();
+    if (page.complete && page.naturalWidth) stEditBoxPaint();
+  }
+  const stage = $('stEditStage');
+  if (stage && window.ResizeObserver){
+    if (StEdit.ro) StEdit.ro.disconnect();
+    StEdit.ro = new ResizeObserver(() => stEditBoxPaint());
+    StEdit.ro.observe(stage);
+  }
+  const box = document.getElementById('stEditBox');
+  if (box){
+    box.onpointerdown = stEditGrab;
+    box.onkeydown = stEditKey;
+  }
+  const toggle = body.querySelector('[data-edit-pic]');
+  if (toggle){
+    toggle.onchange = () => {
+      StEdit.enabled = toggle.checked;
+      StEdit.touched = toggle.checked;
+      const hint = $('stEditHint');
+      if (hint) hint.textContent = toggle.checked ? 'unsaved' : '';
+      if (box) box.hidden = !toggle.checked;
+      if (toggle.checked) stEditBoxApply(StEdit.box);
+    };
+  }
+  const file = body.querySelector('[data-edit-file]');
+  if (file) file.onchange = () => stEditSwapPicture(file, block);
+}
+
+async function stEditSwapPicture(input, block){
+  const chosen = input.files && input.files[0];
+  const key = block.key;
+  if (!chosen || !key) return;
+  input.value = '';
+  try {
+    const form = new FormData();
+    form.append('file', chosen, chosen.name || 'crop.jpg');
+    const res = await fetch('/api/studio/jobs/' + encodeURIComponent(StInspect.job)
+      + '/draft/crop/' + encodeURIComponent(key), { method: 'POST', body: form });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    StInspect.crops[key] = d.at || Date.now();
+    stInspectSave();
+    stEditOpen(key);
+    stInspectMark();
+  }catch(e){ toast('Picture failed: ' + e.message); }
+}
+
+function stEditClose(){
+  if (StEdit.previewTimer){ clearTimeout(StEdit.previewTimer); StEdit.previewTimer = 0; }
+  stEditDragEnd();
+  if (StEdit.ro){ StEdit.ro.disconnect(); StEdit.ro = null; }
+  $('stEditModal').hidden = true;
+  StEdit.key = null;
+  StEdit.snapshot = null;
+  StEdit.touched = false;
+  StEdit.enabled = false;
+}
+
+async function stEditSave(){
+  const key = StEdit.key;
+  const block = key ? stEditBlock(key) : null;
+  if (!block) { stEditClose(); return; }
+  const btn = $('stEditSave');
+  if (btn) btn.disabled = true;
+  try {
+    const patch = StInspect.edits[key] || (StInspect.edits[key] = {});
+    ['text', 'options'].concat(ST_EDIT_FIELDS.map(([f]) => f)).forEach(f => {
+      const el = document.querySelector('#stEditBody [data-efield="' + f + '"]');
+      if (!el) return;
+      if (f === 'options'){
+        const list = el.value.split('\n').map(s => s.trim()).filter(Boolean);
+        if (JSON.stringify(list) !== JSON.stringify((block.options || []).map(String)))
+          patch.options = list;
+        else delete patch.options;
+      } else {
+        const val = el.value.trim();
+        const base = block[f] == null ? '' : String(block[f]);
+        if (val !== base) patch[f] = val || null; else delete patch[f];
+      }
+    });
+    /* the square's values ARE the bbox: rounded once, stored with the row's
+       local draft, and cut from the page into the job's drafts folder */
+    const bbox = StEdit.box.map(v => Math.round(v));
+    const baseBox = (block.crop || {}).bbox;
+    const moved = JSON.stringify(bbox) !== JSON.stringify(baseBox);
+    if (moved) patch.bbox = bbox; else delete patch.bbox;
+    if (!Object.keys(patch).length) delete StInspect.edits[key];
+    stInspectSave();
+    if (StEdit.enabled && StEdit.touched && document.getElementById('stEditBox')){
+      const job = encodeURIComponent(StInspect.job);
+      const d = await studioJson('/api/studio/jobs/' + job
+        + '/draft/cut/' + encodeURIComponent(key), { bbox: bbox });
+      if (!d.ok) throw new Error(d.error || 'cut failed');
+      StInspect.crops[key] = d.at || Date.now();
+      stInspectSave();
+      stEditCropPaint(d.url || ('/api/studio/jobs/' + job
+        + '/draft/crop/' + encodeURIComponent(key)
+        + '?v=' + encodeURIComponent(StInspect.crops[key])));
+      StEdit.touched = false;
+    }
+    StEdit.snapshot = stEditSnapshot(block);
+    stInspectMark();
+    $('stEditHint').textContent = 'saved';
+  }catch(e){ toast('Save failed: ' + e.message); }
+  finally { if (btn) btn.disabled = false; }
+}
+
+function stEditWireOnce(){
+  $('stEditClose').onclick = () => stEditClose();
+  $('stEditSave').onclick = () => stEditSave();
+  $('stEditModal').onclick = e => {
+    if (e.target === $('stEditModal')) stEditClose();
+  };
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    if (!$('stEditModal').hidden) stEditClose();
+    else if (!$('stJobModal').hidden) stJobClose();
+  });
+}
+
+
 function studioRenderBulk(){
   const body = $('stBulkBody');
   const d = StudioState.bulk;
@@ -737,9 +1750,20 @@ function studioRenderBulk(){
     + stStats([['ready', stNum(s.ready || 0), 'ok'],
                ['warn', stNum(s.warn || 0), 'warn'],
                ['error', stNum(s.error || 0), 'err']])
+    + '<label class="st-field"><span>organize</span>'
+    + '<select id="stExtractOrganize">'
+    + ['auto','off','all'].map(v => '<option value="' + v + '"'
+        + (v === (StudioState.organize || 'auto') ? ' selected' : '') + '>'
+        + (v === 'all' ? 'all pages' : v) + '</option>').join('')
+    + '</select></label>'
+    + '<button class="ghost-btn neutral" id="stRunExtract" type="button">Extract</button>'
     + '<button class="ghost-btn neutral" id="stRunEnrich" type="button">Enrich</button>'
     + '<button class="ghost-btn neutral" id="stRunGeometry" type="button">Locate</button>'
     + '</div></div>';
+  $('stExtractOrganize').onchange = e => {
+    StudioState.organize = e.target.value;
+  };
+  $('stRunExtract').onclick = () => studioRunStage('extract', 'Extract');
   $('stRunEnrich').onclick = () => studioRunStage('enrich', 'Enrich');
   $('stRunGeometry').onclick = () => studioRunStage('geometry', 'Locate');
   $('stSaveBatching').onclick = () => studioSaveBatching();
@@ -766,6 +1790,17 @@ function stCropPages(){
     .map(p => ({ page: p, blocks: byPage[p] }));
 }
 
+/* provenance: where this block's text and its picture came from */
+function stProvenanceChips(b){
+  const crop = b.crop || {};
+  const chips = [];
+  if (crop.source) chips.push('src ' + crop.source);
+  if (crop.figure) chips.push('fig ' + crop.figure);
+  if (b.organized) chips.push('LLM');
+  return chips.map(c => '<span class="st-art plain">'
+    + stEsc(c) + '</span>').join('');
+}
+
 function stCropRowHtml(b){
   const crop = b.crop || {};
   const num = b.number != null ? b.number : b.order;
@@ -778,6 +1813,7 @@ function stCropRowHtml(b){
     +   '<span class="st-sub">' + stEsc(b.key) + '</span>'
     +   stStatusChip(b.status)
     +   stSplitChip(b)
+    +   stProvenanceChips(b)
     +   (crop.needed
         ? '<span class="st-art ' + (crop.approved ? 'on' : 'off') + '">'
           + (crop.approved ? 'cropped' : 'crop') + '</span>'
@@ -831,13 +1867,27 @@ function studioRenderCrops(){
   const cur = pages.find(p => p.page === StudioState.cropPage);
   const crops = cur.blocks.filter(b => (b.crop || {}).needed);
   const approved = crops.filter(b => (b.crop || {}).approved).length;
+  const every = (((StudioState.bulk || {}).view || {}).blocks || []);
+  const pendingKeys = every.filter(b => (b.crop || {}).needed
+    && (b.crop || {}).approved !== true).map(b => b.key);
   body.innerHTML =
     stStats([['page', stNum(cur.page) + ' / ' + stNum(pages[pages.length - 1].page), ''],
              ['rows', stNum(cur.blocks.length), ''],
              ['crops', stNum(approved) + ' / ' + stNum(crops.length),
               crops.length && approved === crops.length ? 'ok' : (crops.length ? 'warn' : 'plain')]])
+    + ((pendingKeys.length)
+      ? '<div class="st-tools"><button class="ghost-btn neutral"'
+        + ' id="stCropsApproveAll" type="button">Approve all ('
+        + stNum(pendingKeys.length) + ')</button></div>'
+      : '')
     + '<div class="st-crop-list">' + cur.blocks.map(stCropRowHtml).join('') + '</div>'
     + stCropPagebarHtml(pages, cur.page);
+  const approveAll = body.querySelector('#stCropsApproveAll');
+  if (approveAll) approveAll.onclick = () => {
+    const map = {};
+    pendingKeys.forEach(k => { map[k] = { approved: true }; });
+    studioSaveReview({ crops: map });
+  };
   body.querySelectorAll('[data-crop-open]').forEach(b =>
     b.onclick = () => stCropDrawerOpen(b.dataset.cropOpen));
   body.querySelectorAll('[data-crop-save]').forEach(b =>
@@ -975,53 +2025,91 @@ async function stCropDrawerApply(key, host){
 }
 
 /* ── Import panel: target, dry run, continuous import ── */
+/* ── Import panel: the rows a run WILL write, as the database grid ──
+   Target and scope on top, then one table per row (file · question · picture ·
+   verdict) — the reviewer checks the data itself, not a count. */
+const StImport = { rows: null, scope: 'job', busy: false };
+/* column shares for the rows table: the question text takes the slack */
+const ST_IMPORT_COLS = [12, 6, 4, 5, 22, 5, 10, 6, 25, 5];
+
+/* "this file" comes free with the bulk view; "all files" is the only scope
+   that needs its own request */
+async function studioLoadImportRows(){
+  const job = StudioState.job;
+  const d = StudioState.bulk || {};
+  if (!job){ StImport.rows = null; return; }
+  if (StImport.scope !== 'all'){
+    StImport.rows = { rows: d.rows || [], targets: d.targets || [],
+                      totals: d.row_totals || { rows: 0 } };
+    return;
+  }
+  try {
+    StImport.rows = await studioApi('/api/studio/import/rows?job='
+      + encodeURIComponent(job) + '&others=1');
+  } catch (e){ StImport.rows = { error: e.message }; }
+}
+
 function studioRenderImport(){
   const body = $('stImportBody');
   const d = StudioState.bulk;
   if (!d || d.error){ body.innerHTML = ''; return; }
-  const view = d.view || {};
-  const blocks = view.blocks || [];
-  const reasons = {};
-  blocks.forEach(b => {
-    const crop = b.crop || {};
-    let why = null;
-    if (b.kind !== 'question' && b.kind !== 'answer_key_entry') why = 'not a question';
-    else if (b.status === 'error') why = 'flagged';
-    else if (crop.needed && !crop.approved) why = 'crop awaiting approval';
-    if (why) reasons[why] = (reasons[why] || 0) + 1;
-  });
-  const queuedPairs = Object.keys(reasons)
-    .map(k => [k, stNum(reasons[k]), 'warn']);
-  const queued = queuedPairs.length
-    ? stStats([['queued', stNum(Object.values(reasons).reduce((a, b) => a + b, 0)), '']]
-        .concat(queuedPairs)) : '';
+  const data = StImport.rows || {};
+  const rows = data.rows || [];
   const targets = (d.targets || []).map(t => '<option value="' + stEsc(t.id) + '">'
     + stEsc(t.label) + '</option>').join('');
-  const runs = (d.runs || []).slice().reverse().map(r =>
-    '<tr><td>' + stFmt(r.at) + '</td><td>' + stEsc(r.target || '') + '</td>'
-    + '<td>' + stNum(r.questions || 0) + '</td>'
-    + '<td>' + stNum(r.answers || 0) + '</td>'
-    + '<td>' + stNum((r.skipped || []).length) + '</td>'
-    + '<td>' + (r.dry_run ? 'dry' : '—') + '</td></tr>').join('');
+  const scopeOpt = (v, l) => '<option value="' + v + '"'
+    + (v === StImport.scope ? ' selected' : '') + '>' + stEsc(l) + '</option>';
+  const counts = [['rows', rows.length],
+    ['ready', rows.filter(r => r.ok).length],
+    ['blocked', rows.filter(r => !r.ok).length],
+    ['with picture', rows.filter(r => r.has_picture).length]];
+  const body_rows = rows.map((r, i) => {
+    const pic = r.picture === 'none' ? '—'
+      : '<span class="st-art ' + (r.picture === 'approved' ? 'on' : 'off') + '">'
+        + stEsc(r.picture) + '</span>';
+    return '<tr class="st-imp-row' + (r.ok ? '' : ' blocked') + '">'
+      + '<td class="mono">' + stEsc(r.job_name || r.job) + '</td>'
+      + '<td class="mono">' + stEsc(r.key || '') + '</td>'
+      + '<td class="mono">' + stEsc(r.number != null ? String(r.number) : '—') + '</td>'
+      + '<td class="mono">' + stEsc(r.page != null ? String(r.page) : '—') + '</td>'
+      + '<td class="st-imp-text" dir="auto">'
+      +   (r.kind === 'answer_key_entry'
+           ? '<span class="st-art off">answer key</span> ' : '')
+      +   stEsc(String(r.text || '').slice(0, 300)) + '</td>'
+      + '<td>' + (r.options || []).length + '</td>'
+      + '<td>' + pic + '</td>'
+      + '<td>' + (r.answered ? '<span class="st-art on">answer</span>' : '—') + '</td>'
+      + '<td>' + (r.ok ? '<span class="st-art on">ready</span>'
+          : '<span class="st-art off">' + stEsc(r.why || 'blocked') + '</span>') + '</td>'
+      + '<td>' + (r.result ? stStatusChip(r.result === 'ok' ? 'ready' : r.result) : '—') + '</td></tr>';
+  }).join('');
   body.innerHTML =
     '<div class="st-col">'
-    + '<div class="st-profile-grid">'
+    + '<div class="st-import-bar">'
     + '<label class="st-field"><span>target</span><select id="stImportTarget">'
     + targets + '</select></label>'
+    + '<label class="st-field"><span>rows from</span><select id="stImportScope">'
+    + scopeOpt('job', 'this file') + scopeOpt('all', 'all files') + '</select></label>'
     + '<label class="sw"><input type="checkbox" id="stImportDry">'
     + '<span class="tr" aria-hidden="true"></span><em>dry run</em></label>'
+    + '<span class="st-gap"></span>' + (stStats(counts) || '')
+    + '<button class="ghost-btn neutral sm" id="stImportRun" type="button">Import</button>'
     + '</div>'
-    + queued
-    + (runs
-      ? '<div class="st-table-wrap"><table class="st-table"><thead><tr><th>When</th><th>Target</th><th>Q</th>'
-        + '<th>A</th><th>Queued</th><th></th></tr></thead><tbody>' + runs
-        + '</tbody></table></div>'
-      : '')
-    + '<div class="st-profile-foot">'
-    + '<span class="st-warn" id="stImportErr" hidden></span>'
-    + '<button class="ghost-btn neutral" id="stImportRun" type="button">Import</button>'
-    + '</div></div>';
+    + '<div class="st-warn" id="stImportErr" hidden></div>'
+    + '<div class="st-table-wrap st-import-table">'
+    + '<table class="st-table"><colgroup>'
+    + ST_IMPORT_COLS.map(w => '<col style="width:' + w + '%">').join('')
+    + '</colgroup><thead><tr>'
+    + '<th>File</th><th>Blk</th><th>#</th><th>pg</th><th>question</th>'
+    + '<th>opts</th><th>picture</th><th>ans</th><th>verdict</th><th>run</th>'
+    + '</tr></thead><tbody>' + (body_rows || '') + '</tbody></table></div></div>';
   $('stImportRun').onclick = () => studioImportRun();
+  $('stImportScope').onchange = async e => {
+    StImport.scope = e.target.value;
+    await studioLoadImportRows();
+    studioRenderImport();
+  };
+  typesetMath(body);
 }
 
 async function studioImportRun(){
@@ -1078,6 +2166,7 @@ function studioFeed(ev){
     $('stNowChunk').hidden = !chunk;
     stRailActive(ev.stage);
   }
+  if (ev.job && ST_LOG.job === ev.job) stLogLine(ev);
   if (ev.job && ev.level === 'success'){
     studioLoadJobs().catch(() => {});
     if (StudioState.job === ev.job){
@@ -1085,4 +2174,134 @@ function studioFeed(ev){
       studioSelectJob(ev.job, { keepPanel:true }).catch(() => {});
     }
   }
+}
+
+/* ═══════════ LIVE LOG · the studio's own event stream ═══════════
+   The pipeline tab wears a log panel; the studio gets the same surface.
+   Live websocket events stream into it, the job's own log.jsonl rebuilds
+   the history after a reload, and an error line always carries the fault
+   the backend classified - a chip, the advice and the raw text - so a
+   failure is never a bare red sentence. */
+const ST_LOG = { job:null, faults:{}, max:400 };
+
+function stLogNow(){
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+function stLogTime(ts){
+  const m = String(ts || '').match(/(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1] : '';
+}
+
+/* the fault chip - same .ek skin and colour groups as the pipeline log */
+function stLogFaultChip(flt){
+  const chip = document.createElement('span');
+  chip.className = 'ek ' + (flt.group || 'misc');
+  chip.textContent = (flt.emoji ? flt.emoji + ' ' : '')
+    + (flt.label || flt.kind || 'fault');
+  chip.title = flt.hint || '';
+  return chip;
+}
+
+/* one log line: a plain row, or a diagnostic card when a fault is attached */
+function stLogLine(row){
+  const box = $('stLog');
+  if (!box) return;
+  const flt = row.fault || null;
+  const line = document.createElement('div');
+  const t = document.createElement('span');
+  t.className = 't';
+  t.textContent = stLogTime(row.ts) || stLogNow();
+  if (flt){
+    line.className = 'line diag ' + (flt.group || 'misc');
+    const m = document.createElement('span');
+    m.className = 'm';
+    const head = document.createElement('b');
+    head.textContent = row.message || flt.label || '';
+    m.appendChild(head);
+    const where = document.createElement('span');
+    where.className = 'where';
+    where.textContent = ' @ ' + (row.stage || 'studio');
+    m.appendChild(where);
+    if (flt.hint){
+      const raw = document.createElement('span');
+      raw.className = 'raw';
+      raw.textContent = flt.hint;
+      m.appendChild(raw);
+    }
+    line.append(t, stLogFaultChip(flt), m);
+    if (flt.raw) line.title = flt.raw;
+  } else {
+    line.className = 'line lv-' + (row.level || 'info');
+    const m = document.createElement('span');
+    m.className = 'm';
+    m.textContent = row.message || '';
+    line.append(t, m);
+  }
+  box.appendChild(line);
+  while (box.children.length > ST_LOG.max) box.removeChild(box.firstChild);
+  box.scrollTop = box.scrollHeight;
+  $('stLogCount').textContent = box.querySelectorAll('.line').length + ' events';
+  if (flt) stLogFaultTally(flt);
+}
+
+/* the fault tally pill - the pipeline's, counted per kind */
+function stLogFaultTally(flt){
+  const kind = flt.kind || 'unknown';
+  ST_LOG.faults[kind] = (ST_LOG.faults[kind] || 0) + 1;
+  const el = $('stDiagCount');
+  const total = Object.values(ST_LOG.faults).reduce((a, b) => a + b, 0);
+  if (!total){ el.hidden = true; return; }
+  el.textContent = '· ' + total + ' fault' + (total > 1 ? 's' : '');
+  el.title = Object.entries(ST_LOG.faults).sort((a, b) => b[1] - a[1])
+    .map(([k, n]) => k.replace(/_/g, ' ') + ' — ' + n).join('  ·  ');
+  el.hidden = false;
+}
+
+/* a studio-side failure: the panel itself could not do its job */
+function stLogFail(message, hint){
+  stLogLine({ ts:stLogNow(), stage:'log', level:'error', message:message,
+              fault:{ kind:'ui', label:'LOG ERROR', group:'misc',
+                      hint:hint || '', raw:message } });
+}
+
+function stLogReset(jobId){
+  ST_LOG.job = jobId || null;
+  ST_LOG.faults = {};
+  const box = $('stLog');
+  if (box) box.innerHTML = '';
+  $('stLogCount').textContent = '';
+  $('stDiagCount').hidden = true;
+}
+
+/* the job's own history - log.jsonl, rebuilt after a reload */
+async function stLogLoad(jobId){
+  stLogReset(jobId);
+  if (!jobId) return;
+  try {
+    const d = await studioApi('/api/studio/jobs/' + encodeURIComponent(jobId)
+      + '/log?limit=300');
+    (d.lines || []).forEach(row => stLogLine(row));
+  } catch (e){
+    stLogFail('log history unavailable: ' + e.message);
+  }
+}
+
+/* the panel's own controls */
+function stLogWire(){
+  $('stLogCopyBtn').onclick = async () => {
+    const txt = ($('stLog').innerText || '').trim();
+    if (!txt){ toast('Log is empty'); return; }
+    try { await navigator.clipboard.writeText(txt); toast('Log copied'); }
+    catch (e){ toast('Copy failed — ' + e); }
+  };
+  $('stLogClearBtn').onclick = () => {
+    const n = $('stLog').querySelectorAll('.line').length;
+    stLogReset(ST_LOG.job);
+    if (n) toast(n + ' event(s) cleared');
+  };
+  $('stLogToggle').onclick = () => {
+    $('stLogPanel').classList.toggle('collapsed');
+  };
 }

@@ -69,9 +69,14 @@ class StudioMarkupTests(unittest.TestCase):
         # ids created dynamically by studio.js itself are not in the HTML
         dynamic = {"stKind", "stComp", "stAnswer", "stSaveProfile", "stReProbe",
                    "stExtract", "stRunEnrich", "stRunGeometry",
+                   "stRunExtract", "stExtractOrganize",
                    "stPagesPerCall", "stBandBatch", "stSaveBatching",
                    "stImportTarget", "stImportDry", "stImportErr", "stImportRun",
-                   "stCropPageIn", "stTagList"}
+                   "stCropPageIn", "stTagList",
+                   # created by the question editor, which builds its own body
+                   "stEditPage", "stEditBox", "stEditStage", "stEditHint",
+                   "stImportScope",
+                   "stJobSource", "stJobModel"}
         missing = sorted(i for i in ids if i not in dynamic and ('id="%s"' % i) not in html)
         self.assertEqual(missing, [], "studio.js binds ids missing from index.html: %s" % missing)
 
@@ -97,6 +102,21 @@ class StudioMarkupTests(unittest.TestCase):
         for phrase in ("pages / call", "bands / call", "studioSaveBatching",
                        "/api/studio/settings"):
             self.assertIn(phrase, js, phrase)
+
+    def test_inspect_tab_edits_locally_and_imports_on_approval(self):
+        """The Inspect desk: local-first drafts, one approval.
+
+        Text/field edits live in localStorage, pictures are staged on the
+        server under the job's own folder, and a single Approve call posts
+        the whole batch to /commit (which uploads them already cropped).
+        """
+        js = _read("studio.js")
+        for phrase in ("StInspect", "localStorage", "studio.inspect.",
+                       "/draft/crop/", "stInspectApprove", "/commit",
+                       "data-insp-edit", "data-insp-ok"):
+            self.assertIn(phrase, js, phrase)
+        # one approval call covers the batch; a row's own approve passes keys
+        self.assertIn("async function stInspectApprove(btn, keys)", js)
 
     def test_no_bare_font_size_literals_in_studio_css(self):
         css = _read("styles.css")
@@ -181,6 +201,13 @@ class StudioUiCropTests(unittest.TestCase):
         # no inline canvas/crop image in the row list any more
         self.assertNotIn('<div class="diag">', js)
 
+    def test_crops_show_provenance_and_an_approve_all_action(self):
+        js = _read("studio.js")
+        self.assertIn("stProvenanceChips", js)
+        self.assertIn("st-art plain", js)
+        self.assertIn("Approve all", js)
+        self.assertIn("stCropsApproveAll", js)
+
     def test_page_number_box_and_arrows(self):
         js = _read("studio.js")
         for need in ("stCropPageIn", "stCropPagebar", 'data-page="-1"',
@@ -235,8 +262,12 @@ class StudioTabTests(unittest.TestCase):
 
     def test_one_pane_visible_at_a_time(self):
         js = _read("studio.js")
-        self.assertIn("const ST_TABS = ['jobs', 'profile', 'bulk', 'crops',"
-                      " 'tags', 'models', 'import']", js)
+        # Every rail button must have a pane and a ST_TABS entry - the rail is
+        # the navigation, so a tab that only exists in the markup is a dead end.
+        for tab in ("jobs", "profile", "bulk", "crops", "inspect", "tags",
+                    "models", "import"):
+            self.assertIn("'%s'" % tab, js[js.index("const ST_TABS"):
+                                          js.index("];", js.index("const ST_TABS"))])
         self.assertIn("p.hidden = p.dataset.sttab !== name", js)
         self.assertIn("'#studio/' + name", js)
         self.assertIn("history.replaceState", js)
@@ -306,6 +337,143 @@ if (stPages({}) !== '') process.exit(3);
         self.assertIn("stRailActive(", body)
 
 
+class StudioScriptParsesTests(unittest.TestCase):
+    """A syntax error in studio.js silently kills the whole page: node --check
+    is the gate (the suite caught a leftover function header once)."""
+
+    def _check(self, name):
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node unavailable")
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "ui", name)
+        proc = subprocess.run([node, "--check", path], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(proc.returncode, 0,
+                         "%s does not parse: %s" % (name, proc.stderr.decode("utf-8", "replace")[:400]))
+
+    def test_studio_js_parses(self):
+        self._check("studio.js")
+
+    def test_app_js_parses(self):
+        self._check("app.js")
+
+
+class StudioInspectAndFileTests(unittest.TestCase):
+    """Inspect is a list with per-row edit/approve; a file's artifacts are icons
+    that open its own pop-up; Import lists the rows themselves."""
+
+    def test_stage_tabs_are_icons_with_hover_titles(self):
+        html = _read("index.html")
+        view = _view(html, "viewStudio")
+        rail = view[view.index('id="stTabs"'):view.index("</div>", view.index('id="stTabs"'))]
+        self.assertNotIn("</button>Upload", rail.replace("\n", ""))
+        self.assertEqual(rail.count("<i class=\"fa "), 8)
+        for tab in ("jobs", "profile", "bulk", "crops", "inspect", "tags",
+                    "models", "import"):
+            self.assertIn('data-sttab="%s"' % tab, rail)
+
+    def test_inspect_rows_carry_status_topic_missing_and_provenance(self):
+        js = _read("studio.js")
+        for phrase in ("st-insp-topic", "stStatusChip(block.status)",
+                       "missingChip", "model \\u00b7 review",
+                       'plain">asset</span>'):
+            self.assertIn(phrase, js, phrase)
+
+    def test_inspect_shows_the_job_scorecard(self):
+        js = _read("studio.js")
+        for phrase in ("stInspectScorecard", "scorecard", "'4 opts'",
+                       "layout_confidence", "metadata_missing",
+                       "st-scorecard"):
+            self.assertIn(phrase, js, phrase)
+
+    def test_extract_runs_with_a_per_run_organize_choice(self):
+        js = _read("studio.js")
+        for phrase in ("stExtractOrganize", "StudioState.organize",
+                       "organize: StudioState.organize || 'auto'"):
+            self.assertIn(phrase, js, phrase)
+
+    def test_inspect_rows_carry_edit_and_approve(self):
+        js = _read("studio.js")
+        for token in ("stInspectRow", "data-insp-edit", "data-insp-ok",
+                      "stEditOpen", "data-insp-apply"):
+            self.assertIn(token, js, token)
+        # the pop-up: auto-fitting boxes and the box moved by ranges
+        for token in ("data-autofit", "stAutofit", "type=\"range\"",
+                      "data-box=", "/preview/", "stEditSwapPicture"):
+            self.assertIn(token, js, token)
+        css = _read("styles.css")
+        for rule in (".st-edit-grid{", ".st-slider{", ".st-edit-box{",
+                     ".st-insp-table{", ".st-edit-fields{"):
+            self.assertIn(rule, css, rule)
+        self.assertIn("textarea{resize:none;overflow:hidden", css)
+
+    def test_inspect_renders_math_and_opens_the_editor_on_double_click(self):
+        js = _read("studio.js")
+        # the question cell is rendered, not escaped raw text, so MathJax sees
+        # the OCR's formulas (with or without the OCR's own $ delimiters)
+        self.assertIn("mdHtml(String(text || ''))", js)
+        self.assertIn("tr.ondblclick = ev =>", js)
+        self.assertIn("stEditOpen(key);", js)
+        # double-clicking a control inside the row keeps its own action
+        self.assertIn("closest('button, a, input, select, textarea')", js)
+        # the pop-up carries the rendered output beside each long box
+        for token in ("stEditPreviewHtml", "stEditPreviewPaint",
+                      "stEditPreviewSoon", "data-efield-preview",
+                      "mdHtml(raw)", "<span>rendered</span>"):
+            self.assertIn(token, js, token)
+        self.assertIn("'<div class=\"st-edit-pair\">'", js)
+        css = _read("styles.css")
+        for rule in (".st-insp-text{", ".st-edit-pair{", ".st-edit-render{"):
+            self.assertIn(rule, css, rule)
+
+    def test_the_edit_popup_drags_a_crop_square_onto_a_page_box(self):
+        js = _read("studio.js")
+        for token in ("StEdit.box", "stEditStageRect", "stEditGrab",
+                      "stEditDragMove", "stEditBoxApply", "stEditBoxFit",
+                      "stEditCropPaint", "ResizeObserver",
+                      'class="st-edit-handle"', 'data-h="nw"', "/draft/cut/"):
+            self.assertIn(token, js, token)
+        # saving turns the square into a bbox, cuts it, and shows the crop
+        self.assertIn("async function stEditSave", js)
+        self.assertIn("const moved = JSON.stringify(bbox)", js)
+        self.assertIn("stEditCropPaint(d.url", js)
+        css = _read("styles.css")
+        for rule in (".st-edit-handle{", "cursor:move", ".st-edit-croppic{",
+                     "object-fit:contain", "min(1560px,97vw)"):
+            self.assertIn(rule, css, rule)
+    def test_a_rows_artifacts_are_icon_tabs_that_open_a_popup(self):
+        html = _read("index.html")
+        js = _read("studio.js")
+        for token in ('data-stjob="profile"', 'data-stjob="extract"',
+                      'data-stjob="crops"', 'data-stjob="models"',
+                      'id="stJobModal"'):
+            self.assertIn(token, html, token)
+        for token in ("ST_ART", "stJobOpen", "/lane", "data-job-source",
+                      "data-job-prompt", "/api/studio/models/pick"):
+            self.assertIn(token, js, token)
+        self.assertNotIn("st-art ${art[k] ? 'on' : 'off'}", js)
+
+    def test_the_import_tab_lists_the_rows_themselves(self):
+        """A table of the rows a run WILL write, never a bare count."""
+
+        js = _read("studio.js")
+        for token in ("/api/studio/import/rows", "st-imp-row", "StImport.scope",
+                      "st-imp-text", "stImportScope"):
+            self.assertIn(token, js, token)
+        css = _read("styles.css")
+        for rule in (".st-import-bar{", ".st-import-table{", ".st-imp-text{"):
+            self.assertIn(rule, css, rule)
+
+    def test_a_provider_offers_its_whole_model_list(self):
+        js = _read("studio.js")
+        body = js[js.index("function studioRenderModels"):js.index("async function studioSaveModels")]
+        self.assertIn("default model", body)
+        self.assertIn("models · one per line", body)
+
+
 class StudioRouteTests(unittest.TestCase):
     def test_studio_routes_are_registered(self):
         import main  # noqa: E402  (offline-safe)
@@ -320,6 +488,9 @@ class StudioRouteTests(unittest.TestCase):
                      "/api/studio/jobs/{job_id}/bulk",
                      "/api/studio/jobs/{job_id}/crop/{key}",
                      "/api/studio/jobs/{job_id}/review",
+                     "/api/studio/jobs/{job_id}/lane",
+                     "/api/studio/jobs/{job_id}/preview/{page}",
+                     "/api/studio/import/rows", "/api/studio/models/pick",
                      "/api/studio/state", "/api/studio/tags",
                      "/api/studio/models", "/api/studio/settings"):
             self.assertIn(want, paths, want)

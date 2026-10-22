@@ -13,8 +13,12 @@ the same idiom as `tests/test_ui_pages.py`. What these pins protect:
 
 Offline, no network, no database.
 """
+import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 
 UI = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ui")
@@ -30,6 +34,68 @@ def _func_body(js, name):
     start = js.index("function %s(" % name)
     nxt = js.find("\nfunction ", start + 1)
     return js[start:nxt if nxt != -1 else len(js)]
+
+
+def _fence_bare(cases):
+    """Run the shipped `fenceBareTex` in node on the given inputs.
+
+    The dashboard carries no JS test runner, so this executes the exact source
+    the browser receives. Returns None when node is unavailable (same skip
+    policy as the syntax check in test_studio_ui)."""
+    node = shutil.which("node")
+    if not node:
+        return None
+    js = _read("app.js")
+    start = js.index("function fenceBareTex(")
+    end = js.index("/* QBank / DB text", start)
+    script = (js[start:end]
+              + "\nconst cases = " + json.dumps(cases, ensure_ascii=False) + ";\n"
+              + "console.log(JSON.stringify(cases.map(c => fenceBareTex(c))));\n")
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                      encoding="utf-8")
+    try:
+        tmp.write(script)
+        tmp.close()
+        proc = subprocess.run([node, tmp.name], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=60)
+        if proc.returncode != 0:
+            raise AssertionError(proc.stderr.decode("utf-8", "replace"))
+        return json.loads(proc.stdout.decode("utf-8"))
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
+class BareTexFencingTests(unittest.TestCase):
+    """OCR sometimes drops the $ around an expression; mdHtml must still show
+    the rendered formula, without touching prose or already-delimited math."""
+
+    def test_bare_tex_is_fenced_and_prose_is_left_alone(self):
+        cases = [
+            "فشار (\\rho = 0/8 \\frac{g}{cm^3}) است",
+            "مقدار $x^2$ ثابت است",
+            "متن ساده 123 است",
+            "بار q_3 در مدار است",
+            "ظرفیت (c_{\\text{آب}} = 4200 \\frac{J}{kg.K}) است",
+        ]
+        out = _fence_bare(cases)
+        if out is None:
+            self.skipTest("node unavailable")
+        self.assertIn("$(\\rho", out[0])
+        self.assertIn("\\frac{g}{cm^3})$", out[0])
+        self.assertEqual(out[1], cases[1])
+        self.assertEqual(out[2], cases[2])
+        self.assertIn("$q_3$", out[3])
+        self.assertIn("$(c_{\\text{آب}} = 4200", out[4])
+        self.assertNotIn("{$", out[4])
+
+    def test_mdhtml_runs_the_bare_tex_pass(self):
+        js = _read("app.js")
+        body = _func_body(js, "mdHtml")
+        self.assertIn("s = fenceBareTex(s);", body)
+        self.assertIn("function fenceBareTex(", js)
 
 
 class QbankRenderPins(unittest.TestCase):

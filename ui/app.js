@@ -641,11 +641,21 @@ function showView(target){
   $('viewStudio').classList.toggle('active', target === 'studio');
   $('viewDatabase').classList.toggle('active', target === 'database');
   $('viewUsage').classList.toggle('active', target === 'usage');
+  $('viewPrompts').classList.toggle('active', target === 'prompts');
   $('viewCredentials').classList.toggle('active', target === 'credentials');
-  if (target === 'usage' && !UsageState.loaded){
+  /* the usage tab is LIVE data: every visit re-reads the call history, so a
+     studio run (or a pipeline run) that happened while another tab was open
+     is there when you look — a load-once tab showed stale numbers. */
+  if (target === 'usage'){
+    const first = !UsageState.loaded;
     UsageState.loaded = true;
-    viewLoading('viewUsage', true);
-    usageRefresh().finally(() => viewLoading('viewUsage', false));
+    UsageState.dirty = false;
+    if (first) viewLoading('viewUsage', true);
+    usageRefresh(first ? () => viewLoading('viewUsage', false) : null);
+  }
+  if (target === 'prompts' && !PromptState.loaded){
+    viewLoading('viewPrompts', true);
+    promptsLoad().finally(() => viewLoading('viewPrompts', false));
   }
   if (target === 'review' && !RState.loaded){
     RState.loaded = true;
@@ -684,7 +694,7 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
    so a view can be shared/bookmarked and a headless screenshot can target one. */
 function viewFromHash(){
   const h = (location.hash || '').replace('#', '').split('/')[0];
-  return ['pipeline','review','studio','database','usage','credentials'].includes(h) ? h : null;
+  return ['pipeline','review','studio','database','usage','prompts','credentials'].includes(h) ? h : null;
 }
 function panelFromHash(){
   const parts = (location.hash || '').replace('#', '').split('/');
@@ -2573,7 +2583,67 @@ async function loadPipeProfiles(){
     sel.value = PipeState.active;
   }catch(e){ /* first paint before the server is up */ }
   credRenderProfiles();
+  pipeGemLoad();
+  pipePagesLoad();
 }
+
+/* ── pages per call · how many page images of ONE paper ride in a single
+   OCR call (the one-by-one engine reads it as OCR_PAGES_PER_CALL). 1 is the
+   classic one-picture-at-a-time lane; the value is saved to .env. */
+async function pipePagesLoad(){
+  const sel = $('pipePagesPerCall');
+  if (!sel) return;
+  try{
+    const d = await (await fetch('/api/pipeline/settings')).json();
+    sel.value = String(Math.max(1, Math.min(8, Number(d.pages_per_call) || 1)));
+  }catch(e){ /* first paint before the server is up */ }
+}
+
+$('pipePagesPerCall').onchange = async () => {
+  const value = Number($('pipePagesPerCall').value) || 1;
+  try{
+    const res = await fetch('/api/pipeline/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pages_per_call: value }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    $('pipePagesPerCall').value = String(d.pages_per_call);
+    toast('Pages per call: ' + d.pages_per_call);
+  }catch(e){ toast('Pages-per-call save failed — ' + e.message); pipePagesLoad(); }
+};
+
+/* ── the Gemini model picker · All (round-robin) or ONE pinned model ──
+   The options are the credential section's ENABLED ladder models, so a
+   single model can be exercised on its own without touching the ladder. */
+async function pipeGemLoad(){
+  const sel = $('pipeGemSel');
+  if (!sel) return;
+  try{
+    const d = await (await fetch('/api/gemini/pin')).json();
+    sel.innerHTML = '';
+    const all = document.createElement('option');
+    all.value = ''; all.textContent = 'All models';
+    sel.appendChild(all);
+    (d.models || []).forEach(m => {
+      const o = document.createElement('option');
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    });
+    sel.value = d.pin || '';
+  }catch(e){ /* first paint before the server is up */ }
+}
+
+$('pipeGemSel').onchange = async () => {
+  const pin = $('pipeGemSel').value;
+  try{
+    const res = await fetch('/api/gemini/pin', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: pin, surface: 'pipeline' }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    toast(pin ? ('Gemini model pinned to ' + pin) : 'Gemini model: all (round-robin)');
+  }catch(e){ toast('Model pin failed — ' + e.message); pipeGemLoad(); }
+};
 
 /* the Credentials › Proxy pane lists each saved profile as a row with a
    test (flask), edit (pen) and delete (trash) control at the RIGHT (item 6) */
@@ -2638,6 +2708,34 @@ $('pipeProxySel').onchange = async () => {
   PipeState.active = $('pipeProxySel').value;
   try{ await pipePost('Proxy profile saved'); }
   catch(e){ toast('Proxy save failed — ' + e); loadPipeProfiles(); }
+};
+
+/* one keyless gateway probe for EVERY enabled profile - no model, no tokens */
+$('pipeProxyCheck').onclick = async () => {
+  const btn = $('pipeProxyCheck');
+  btn.disabled = true;
+  try{
+    const res = await fetch('/api/proxy/check');
+    const d = await res.json();
+    if (!res.ok || !d.ok) throw new Error(d.error || ('HTTP ' + res.status));
+    const rows = d.results || [];
+    if (!rows.length){ toast('No enabled proxy profile'); return; }
+    PipeState.results = PipeState.results || {};
+    rows.forEach(r => {
+      const ok = !!r.ok;
+      PipeState.results[r.name] = ok;
+      const opt = [...$('pipeProxySel').options].find(o => o.value === r.name);
+      if (opt) opt.title = ok ? ('ok - ' + (r.detail || ''))
+                             : ('failed - ' + (r.detail || r.kind));
+    });
+    const line = rows.map(r => r.name + ': '
+      + (r.ok ? 'ok' : ('failed ' + (r.detail || r.kind)))).join(' \u00b7 ');
+    toast('Proxy check \u2014 ' + line);
+  }catch(e){
+    toast('Proxy check failed \u2014 ' + e);
+  }finally{
+    btn.disabled = false;
+  }
 };
 
 /* one keyless googleapis probe through this profile — no model, no tokens */
@@ -2846,6 +2944,124 @@ const DbState = {
 const dbEsc = credEsc;
 const dbBigType = t => /text|json|bytea/.test(t || '');
 
+/* MathJax only typesets delimited math. The OCR sometimes drops the $ around
+   an expression ("\rho = ... \frac{...}{...}"), which then reads as raw LaTeX.
+   A command ("\frac") or a script ("q_3") is a reliable marker; the run grows
+   over its Latin/digits/operators and brace groups until prose (Persian
+   letters) starts again. Delimited math is copied untouched. */
+function fenceBareTex(s){
+  if (!s) return s;
+  const persian = /[\u0600-\u06FF\u0750-\u077F]/;
+  const word = /[A-Za-z0-9]/;
+  const punct = '+-*/().,;:=[]~%\'!?_^';
+  const growLeft = (text, end) => {
+    let pos = end;
+    for (;;){
+      let j = pos;
+      while (j > 0 && (text[j - 1] === ' ' || text[j - 1] === '\t')) j--;
+      if (j === 0) break;
+      const ch = text[j - 1];
+      if (ch === '}'){
+        let depth = 0, k = j - 1;
+        for (; k >= 0; k--){
+          if (text[k] === '}') depth++;
+          else if (text[k] === '{'){ depth--; if (!depth) break; }
+        }
+        if (k < 0) break;
+        let start = k;
+        const cmd = text.slice(0, k).match(/\\[A-Za-z]+$/);
+        if (cmd) start = k - cmd[0].length;
+        pos = start;
+        continue;
+      }
+      if (ch === '\\'){
+        const cmd = text.slice(0, j).match(/\\[A-Za-z]+$/);
+        if (!cmd) break;
+        pos = j - cmd[0].length;
+        continue;
+      }
+      if (word.test(ch)){
+        let k = j;
+        while (k > 0 && word.test(text[k - 1])) k--;
+        pos = k;
+        continue;
+      }
+      if (punct.indexOf(ch) !== -1){
+        const prev = text[j - 2];
+        if ((ch === '.' || ch === ',' || ch === ';' || ch === ':')
+            && prev && persian.test(prev)) break;
+        pos = j - 1;
+        continue;
+      }
+      break;
+    }
+    return pos;
+  };
+  const growRight = (text, start) => {
+    let pos = start;
+    for (;;){
+      let j = pos;
+      while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+      if (j >= text.length) break;
+      const ch = text[j];
+      if (ch === '{'){
+        let depth = 0, k = j;
+        for (; k < text.length; k++){
+          if (text[k] === '{') depth++;
+          else if (text[k] === '}'){ depth--; if (!depth) break; }
+        }
+        if (k >= text.length) break;
+        pos = k + 1;
+        continue;
+      }
+      if (ch === '\\'){
+        const cmd = text.slice(j).match(/^\\[A-Za-z]+/);
+        if (!cmd) break;
+        pos = j + cmd[0].length;
+        continue;
+      }
+      if (word.test(ch)){
+        let k = j;
+        while (k < text.length && word.test(text[k])) k++;
+        pos = k;
+        continue;
+      }
+      if (punct.indexOf(ch) !== -1){
+        const next = text[j + 1];
+        if ((ch === '.' || ch === ',' || ch === ';' || ch === ':')
+            && next && persian.test(next)) break;
+        pos = j + 1;
+        continue;
+      }
+      break;
+    }
+    return pos;
+  };
+  const fencePlain = text => {
+    if (text.indexOf('\\') === -1 && text.indexOf('_') === -1
+        && text.indexOf('^') === -1) return text;
+    const strong = /\\[A-Za-z]+|[_^]\{(?:[^{}]|\{[^{}]*\})*\}|[_^][A-Za-z0-9]/g;
+    let out = '', cursor = 0, m;
+    while ((m = strong.exec(text))){
+      if (m.index < cursor) continue;
+      let start = growLeft(text, m.index);
+      const end = growRight(text, m.index + m[0].length);
+      if (start < cursor) start = cursor;
+      if (end <= start) continue;
+      out += text.slice(cursor, start) + '$' + text.slice(start, end) + '$';
+      cursor = end;
+      strong.lastIndex = end;
+    }
+    return out + text.slice(cursor);
+  };
+  const protectedMath = /\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]/g;
+  let out = '', last = 0, m;
+  while ((m = protectedMath.exec(s))){
+    out += fencePlain(s.slice(last, m.index)) + m[0];
+    last = m.index + m[0].length;
+  }
+  return out + fencePlain(s.slice(last));
+}
 /* QBank / DB text -> HTML: fence bare LaTeX environments, render pipe tables.
    Escapes first, so every '<' the OCR produced stays literal. */
 function mdHtml(raw){
@@ -2872,6 +3088,8 @@ function mdHtml(raw){
         dropped and the TeX runs inline. Escaped \$ survives. */
   s = s.replace(/\$\$([\s\S]*?)\$\$/g,
                 (m, inner) => '$$' + inner.replace(/(^|[^\\])\$/g, '$1') + '$$');
+  /* 1c. a formula that lost its delimiters reads as raw LaTeX: fence the run here. */
+  s = fenceBareTex(s);
   /* 2. pipe tables -> real <table>, so MathJax inside cells still works */
   const lines = s.split('\n'), out = [];
   for (let i = 0; i < lines.length; i++){
@@ -3450,6 +3668,9 @@ function credUsageLive(ev){
   if (!ev || !ev.model) return;
   ACTIVE_MODEL.gemini = ev.model;
   ACTIVE_MODEL.router = ev.model;
+  /* a studio/pipeline call landed — the tab re-reads the history on its next
+     visit, so a run made while another tab was open is never invisible */
+  UsageState.dirty = true;
   if (!$('viewUsage').classList.contains('active')) return;
   usageRefresh();
 }
@@ -3457,8 +3678,11 @@ function credUsageLive(ev){
 /* ── 3 · usage tab: a plot + per-call table (criterion 6) ── */
 const UsageState = { period: '24h', group: 'model', ymode: 'calls',
                      data: null, busy: false, loaded: false };
+/* Prompts view state — declared here (before the deep-link boot) so
+   showView('prompts') can read it on a #prompts URL. */
+const PromptState = { loaded: false, rows: [], busy: false };
 
-async function usageRefresh(){
+async function usageRefresh(after){
   if (UsageState.busy) return;
   UsageState.busy = true;
   try{
@@ -3466,9 +3690,11 @@ async function usageRefresh(){
       '&group=' + encodeURIComponent(UsageState.group) +
       '&y=' + encodeURIComponent(UsageState.ymode));
     UsageState.data = await res.json();
+    UsageState.dirty = false;
   }catch(e){ UsageState.data = null; }
   UsageState.busy = false;
   usageRender(UsageState.data);
+  if (typeof after === 'function') after();
 }
 
 /* the table's Time column follows the chart's day buckets: both are the
@@ -3489,6 +3715,8 @@ function usageRender(data){
   if (!d || !d.ok){
     if (plot) plot.innerHTML = '';
     if (table) table.innerHTML = '';
+    const split = $('usageSplit');
+    if (split){ split.hidden = true; split.innerHTML = ''; }
     usageWire();
     return;
   }
@@ -3497,14 +3725,28 @@ function usageRender(data){
   usagePlot(d.chart);
   const body = rows.length ? rows.map(r => `<tr class="${r.ok ? '' : 'bad'}">
       <td>${credEsc(ptStamp(r.ts))}</td>
+      <td>${credEsc(r.source || 'pipeline')}</td>
       <td class="mono">${credEsc(r.model || '—')}</td>
       <td>${credEsc(r.key_name || '—')}</td>
       <td class="mono">${credEsc(r.key_masked || '—')}</td>
       <td class="num">${(r.tokens_in || 0).toLocaleString()} / ${(r.tokens_out || 0).toLocaleString()}</td>
       <td class="num">${fmtSecs(r.ms)}</td>
     </tr>`).join('')
-    : '<tr><td colspan="6" class="hint">No calls recorded in this period.</td></tr>';
-  if (table) table.innerHTML = `<thead><tr><th>Time (PT)</th><th>Model</th><th>Key name</th><th>Key</th>
+    : '<tr><td colspan="7" class="hint">No calls recorded in this period.</td></tr>';
+  /* per-surface tally (pipeline vs studio) — the answer to "did the studio
+     run show up in the usage data?" without reading the table row by row */
+  const splitBox = $('usageSplit');
+  const bySource = (d.totals && d.totals.by_source) || {};
+  const sources = Object.keys(bySource).sort();
+  if (splitBox){
+    splitBox.hidden = !sources.length;
+    splitBox.innerHTML = sources.map(src =>
+      '<span class="usage-legend-item"><b>' + credEsc(src) + '</b>' +
+      dbEsc(Number(bySource[src].calls || 0).toLocaleString()) + ' calls · ' +
+      dbEsc(Number(bySource[src].tokens || 0).toLocaleString()) + ' tokens</span>').join('');
+  }
+  if (table) table.innerHTML =
+    `<thead><tr><th>Time (PT)</th><th>Source</th><th>Model</th><th>Key name</th><th>Key</th>
       <th class="num">Tokens in / out</th><th class="num">Delay (seconds)</th></tr></thead><tbody>${body}</tbody>`;
   usageWire();
 }
@@ -3851,3 +4093,605 @@ loadCredentials = async function(){
   if (oa) oa.onclick = () => add('extraction');
   if (ca) ca.onclick = () => add('revision');
 })();
+
+/* ── Prompts view: every LLM instruction, editable ──
+   The backend keeps a default per prompt id (pipeline/prompts.py) and an
+   override store beside .gemini-usage.json; an override applies to the very
+   next model call. LOCAL first: nothing here touches the DB. */
+
+async function promptsLoad(){
+  try{
+    const d = await (await fetch('/api/prompts')).json();
+    PromptState.rows = (d && d.prompts) || [];
+    PromptState.loaded = true;
+  }catch(e){ PromptState.rows = []; }
+  promptsRender();
+}
+
+function promptsRender(){
+  const box = $('promptList');
+  if (!box) return;
+  const rows = PromptState.rows || [];
+  const count = $('prCount');
+  if (count) count.textContent = rows.filter(r => r.overridden).length + ' / ' + rows.length + ' edited';
+  if (!rows.length){
+    box.innerHTML = '<div class="db-empty db-err">Prompts unreachable — is the server running?</div>';
+    return;
+  }
+  let group = '';
+  box.innerHTML = rows.map(r => {
+    let head = '';
+    if (r.group !== group){
+      group = r.group;
+      head = '<h3 class="prompt-group">' + credEsc(group) + '</h3>';
+    }
+    return head + '<article class="prompt-card" data-id="' + credEsc(r.id) + '">'
+      + '<header class="prompt-head">'
+      +   '<b>' + credEsc(r.label) + '</b>'
+      +   '<span class="status-chip ' + (r.overridden ? 'sc-pending' : 'sc-approved') + '">'
+      +     (r.overridden ? 'edited' : 'default') + '</span>'
+      +   '<span class="st-gap"></span>'
+      +   '<button class="ghost-btn neutral sm" data-prompt-save type="button">Save</button>'
+      +   '<button class="ghost-btn neutral sm" data-prompt-reset type="button">Reset</button>'
+      + '</header>'
+      + '<textarea class="prompt-text" rows="12" spellcheck="false" dir="ltr">'
+      +   credEsc(r.text) + '</textarea>'
+      + '</article>';
+  }).join('');
+  box.querySelectorAll('.prompt-card').forEach(card => {
+    const id = card.dataset.id;
+    const area = card.querySelector('.prompt-text');
+    const save = card.querySelector('[data-prompt-save]');
+    const reset = card.querySelector('[data-prompt-reset]');
+    if (save) save.onclick = () => promptSave(id, area.value);
+    if (reset) reset.onclick = () => promptReset(id);
+  });
+}
+
+async function promptSave(id, text){
+  try{
+    const res = await fetch('/api/prompts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id, text: text }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    PromptState.rows = d.prompts || PromptState.rows;
+    promptsRender();
+    toast('Prompt saved');
+  }catch(e){ toast('Prompt save failed — ' + e.message); }
+}
+
+async function promptReset(id){
+  try{
+    const res = await fetch('/api/prompts/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: id }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    PromptState.rows = d.prompts || PromptState.rows;
+    promptsRender();
+    toast('Prompt reset to default');
+  }catch(e){ toast('Reset failed — ' + e.message); }
+}
+
+async function promptsResetAll(){
+  try{
+    const res = await fetch('/api/prompts/reset', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    PromptState.rows = d.prompts || PromptState.rows;
+    promptsRender();
+    toast('Every prompt is back to its default');
+  }catch(e){ toast('Reset failed — ' + e.message); }
+}
+
+$('prReload').onclick = () => promptsLoad();
+$('prResetAll').onclick = () => promptsResetAll();
+
+/* ═══════════ ASSISTANT · the floating help chat ═══════════
+   One bubble bottom-right opens a small chat panel. The endpoint/key/model are
+   the assistant's OWN (.env ASSISTANT_*), never the OCR lanes. Replies stream
+   in over /api/assistant/chat as our own SSE: "thinking" and "text" events,
+   rendered as Markdown (tables, lists, code, $$math$$, mermaid diagrams).
+   The composer has a Markdown preview of what the user is typing. */
+const AsstState = { open: false, cfg: null, messages: [], busy: false,
+                    preview: false, mermaid: 'idle' };
+
+const asstEsc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+/* inline markdown over ALREADY-ESCAPED text (so it can never inject HTML) */
+function asstInline(s){
+  return s
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
+             '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
+/* line-based markdown renderer: fenced code (mermaid included), headings,
+   lists, tables, blockquotes, rules, paragraphs. Escapes first. */
+function asstMd(raw){
+  const lines = String(raw == null ? '' : raw).replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let i = 0, list = null, para = [];
+  const flushPara = () => {
+    if (para.length){ out.push('<p>' + para.map(asstInline).join('<br>') + '</p>'); para = []; }
+  };
+  const closeList = () => { if (list){ out.push('</' + list + '>'); list = null; } };
+  while (i < lines.length){
+    const line = lines[i];
+    const fence = line.match(/^\s*```([\w-]*)\s*$/);
+    if (fence){
+      flushPara(); closeList();
+      const lang = (fence[1] || '').toLowerCase();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) body.push(lines[i++]);
+      i++;
+      const text = body.join('\n');
+      if (lang === 'mermaid')
+        out.push('<div class="asst-mermaid" data-src="' + asstEsc(text) + '"></div>');
+      else
+        out.push('<pre class="asst-code"><code>' + asstEsc(text) + '</code></pre>');
+      continue;
+    }
+    if (/^\s*$/.test(line)){ flushPara(); closeList(); i++; continue; }
+    const h = line.match(/^(#{1,4})\s+(.*)$/);
+    if (h){
+      flushPara(); closeList();
+      const n = h[1].length;
+      out.push('<h' + n + '>' + asstInline(asstEsc(h[2])) + '</h' + n + '>');
+      i++; continue;
+    }
+    if (/^\s*([-*+]|\d+[.)])\s+/.test(line)){
+      flushPara();
+      const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const want = ordered ? 'ol' : 'ul';
+      if (list !== want){ closeList(); out.push('<' + want + '>'); list = want; }
+      out.push('<li>' + asstInline(asstEsc(
+        line.replace(/^\s*([-*+]|\d+[.)])\s+/, ''))) + '</li>');
+      i++; continue;
+    }
+    if (/^\s*\|.*\|\s*$/.test(line) && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i + 1] || '')){
+      flushPara(); closeList();
+      const rows = [];
+      const cells = l => l.trim().replace(/^\||\|$/g, '').split('|')
+        .map(c => '<td>' + asstInline(asstEsc(c.trim())) + '</td>').join('');
+      rows.push('<tr>' + cells(line) + '</tr>');
+      i += 2;
+      for (; i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i]); i++)
+        rows.push('<tr>' + cells(lines[i]) + '</tr>');
+      out.push('<table class="md-table"><tbody>' + rows.join('') + '</tbody></table>');
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)){
+      flushPara(); closeList();
+      out.push('<blockquote>' + asstInline(asstEsc(line.replace(/^\s*>\s?/, ''))) + '</blockquote>');
+      i++; continue;
+    }
+    if (/^\s*(---|\*\*\*)\s*$/.test(line)){
+      flushPara(); closeList(); out.push('<hr>'); i++; continue;
+    }
+    para.push(asstEsc(line));
+    i++;
+  }
+  flushPara(); closeList();
+  return out.join('');
+}
+
+/* mermaid is fetched on first use (like MathJax, a CDN script, no build step);
+   a failed load leaves the diagram source as a plain code block. */
+function asstMermaid(scope){
+  const blocks = scope.querySelectorAll('.asst-mermaid[data-src]');
+  if (!blocks.length) return;
+  const run = () => blocks.forEach(b => {
+    if (b.dataset.done) return;
+    b.dataset.done = '1';
+    const src = b.dataset.src;
+    const fallback = () => {
+      b.innerHTML = '<pre class="asst-code"><code>' + asstEsc(src) + '</code></pre>';
+    };
+    if (!window.mermaid){ fallback(); return; }
+    try{
+      window.mermaid.render('asstm' + Math.random().toString(36).slice(2), src)
+        .then(res => { b.innerHTML = res && res.svg ? res.svg : ''; })
+        .catch(fallback);
+    }catch(e){ fallback(); }
+  });
+  if (window.mermaid){ run(); return; }
+  AsstState.pendingMermaid = run;
+  if (AsstState.mermaid !== 'idle') return;
+  AsstState.mermaid = 'loading';
+  const s = document.createElement('script');
+  s.src = 'https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js';
+  s.onload = () => {
+    try{
+      window.mermaid.initialize({ startOnLoad: false,
+        theme: document.documentElement.dataset.theme === 'light' ? 'default' : 'dark' });
+    }catch(e){ /* older mermaid: render still works */ }
+    if (AsstState.pendingMermaid) AsstState.pendingMermaid();
+  };
+  s.onerror = () => {
+    AsstState.mermaid = 'failed';
+    if (AsstState.pendingMermaid) AsstState.pendingMermaid();
+  };
+  document.head.appendChild(s);
+}
+
+/* ── panel chrome ── */
+function asstOpen(on){
+  AsstState.open = on;
+  $('asstPanel').hidden = !on;
+  $('asstBubble').classList.toggle('on', on);
+  if (on){
+    if (!AsstState.cfg) asstCfgLoad();
+    setTimeout(() => { const t = $('asstIn'); if (t) t.focus(); }, 30);
+    asstScroll();
+  }
+}
+
+function asstScroll(){
+  const box = $('asstMsgs');
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+async function asstCfgLoad(){
+  try{
+    const d = await (await fetch('/api/assistant/config')).json();
+    AsstState.cfg = d;
+    asstPickFill(d);
+    const chip = $('asstChip');
+    chip.hidden = false;
+    chip.textContent = d.configured ? (d.provider || '') : 'not configured';
+    chip.title = d.configured ? (d.model || '') : '';
+    chip.className = 'status-chip ' + (d.configured ? 'sc-approved' : 'sc-rejected');
+  }catch(e){ /* the server may be starting */ }
+}
+
+/* the header picker lists every model of every provider ("label :: model") */
+function asstPickFill(d){
+  const sel = $('asstPick');
+  if (!sel) return;
+  const providers = (d && d.providers) || [];
+  const opts = [];
+  providers.forEach(p => (p.models || []).forEach(m =>
+    opts.push([p.label + '::' + m, p.label + ' · ' + m])));
+  sel.innerHTML = opts.length ? opts.map(([v, l]) =>
+      '<option value="' + asstEsc(v) + '"' + (v === (d.model_id || '') ? ' selected' : '') + '>'
+      + asstEsc(l) + '</option>').join('')
+    : '<option value="">no model</option>';
+  sel.hidden = opts.length === 0;
+}
+
+async function asstPick(id){
+  try{
+    const res = await fetch('/api/assistant/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: id }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    AsstState.cfg = d;
+    await asstCfgLoad();
+  }catch(e){ toast('Model switch failed — ' + e.message); }
+}
+
+/* ── settings pop-up · providers, their models, one active pick ── */
+const AsstEdit = { providers: [], active: '', effort: '' };
+
+function asstModalOpen(on){
+  $('asstModal').hidden = !on;
+  if (!on) return;
+  const d = AsstState.cfg || {};
+  AsstEdit.providers = JSON.parse(JSON.stringify(d.providers || []));
+  AsstEdit.active = d.model_id || '';
+  AsstEdit.effort = d.effort || '';
+  asstModalRender();
+}
+
+/* the picker lists provider + model; it is a change-triggered save, so the
+   current pick is shown even when the model is not in the list yet */
+/* set a select to a value that its options already carry */
+function asstModalSelect(root, sel, value){
+  const el = root.querySelector(sel);
+  if (!el) return;
+  el.value = value == null ? '' : String(value);
+  if (el.value !== String(value || '') && value) el.value = '';
+}
+
+function asstSourceOptions(providers, cur){
+  const opts = [];
+  providers.forEach(p => (p.models || []).forEach(m =>
+    opts.push([p.label + '::' + m, p.label + ' · ' + m])));
+  if (cur && !opts.some(([v]) => v === cur)) opts.unshift([cur, cur]);
+  /* the pick is applied by asstModalSelect after the markup is in place: an
+     escaped attribute would reach the parser as selected&quot; and be dropped */
+  return '<option value="">—</option>' + opts.map(([v, l]) =>
+    '<option value="' + asstEsc(v) + '">' + asstEsc(l) + '</option>').join('');
+}
+
+function asstModalRender(){
+  const body = $('asstModalBody');
+  const efforts = [['', 'provider default'], ['minimal', 'minimal'], ['low', 'low'],
+                   ['medium', 'medium'], ['high', 'high']];
+  const cards = AsstEdit.providers.map((p, i) =>
+    '<div class="asst-prov" data-prov="' + i + '">'
+    + '<div class="asst-prov-head"><b>' + asstEsc(p.label || '') + '</b>'
+    + '<span class="st-art ' + (p.api_key_set ? 'on' : 'off') + '">'
+    + (p.api_key_set ? 'key set' : 'no key') + '</span>'
+    + '<span class="asst-gap"></span>'
+    + '<button class="ghost-btn neutral sm" type="button" data-asst-fetch="' + i + '">list models</button>'
+    + '<button class="ghost-btn neutral sm" type="button" data-asst-del="' + i + '">remove</button></div>'
+    + '<label class="st-field"><span>base url</span>'
+    + '<input type="text" dir="ltr" data-ap-url="' + i + '" value="' + asstEsc(p.base_url || '') + '"></label>'
+    + '<label class="st-field"><span>api key</span>'
+    + '<input type="password" dir="ltr" autocomplete="new-password" data-ap-key="' + i + '" value=""'
+    + (p.api_key_set ? ' placeholder="' + asstEsc(p.api_key_masked || 'set') + '"' : '') + '></label>'
+    + '<label class="st-field"><span>models · one per line</span>'
+    + '<textarea dir="ltr" rows="1" data-autofit data-ap-models="' + i + '">'
+    + asstEsc((p.models || []).join('\n')) + '</textarea></label></div>').join('');
+  body.innerHTML =
+    '<div class="asst-set-grid">'
+    + '<div class="asst-set-col"><div class="asst-prov-list">' + cards + '</div>'
+    + '<button class="ghost-btn neutral sm" type="button" data-asst-add>add provider</button></div>'
+    + '<div class="asst-set-col">'
+    + '<label class="st-field"><span>active model</span><select data-asst-active>'
+    + asstSourceOptions(AsstEdit.providers, AsstEdit.active) + '</select></label>'
+    + '<label class="st-field"><span>thinking level</span><select data-asst-effort>'
+    + efforts.map(([v, l]) => '<option value="' + v + '">'
+        + asstEsc(l) + '</option>').join('') + '</select></label>'
+    + '<div class="asst-opt"><span class="st-art '
+    + (AsstEdit.providers.some(p => p.api_key_set) ? 'on' : 'off') + '">'
+    + (AsstEdit.providers.some(p => p.api_key_set) ? 'keys saved' : 'no key')
+    + '</span></div></div></div>';
+  asstModalSelect(body, '[data-asst-active]', AsstEdit.active);
+  asstModalSelect(body, '[data-asst-effort]', AsstEdit.effort);
+  if (typeof stAutofit === 'function') stAutofit(body);
+  body.querySelectorAll('textarea[data-autofit]').forEach(t => {
+    t.oninput = () => { t.style.height = 'auto'; t.style.height = (t.scrollHeight + 2) + 'px'; };
+  });
+  body.onclick = async e => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.hasAttribute('data-asst-add')){
+      const n = AsstEdit.providers.length + 1;
+      AsstEdit.providers.push({ label: 'provider' + n, base_url: '',
+        models: [], api_key_set: false });
+      asstModalRender();
+    } else if (b.hasAttribute('data-asst-del')){
+      AsstEdit.providers.splice(+b.dataset.asstDel, 1);
+      asstModalRender();
+    } else if (b.hasAttribute('data-asst-fetch')){
+      await asstFetchModels(+b.dataset.asstFetch, b);
+    }
+  };
+}
+
+function asstModalRead(){
+  const body = $('asstModalBody');
+  AsstEdit.providers = AsstEdit.providers.map((p, i) => {
+    const val = attr => {
+      const el = body.querySelector('[' + attr + '="' + i + '"]');
+      return el ? el.value : '';
+    };
+    return { label: p.label,
+             base_url: val('data-ap-url').trim(),
+             api_key: val('data-ap-key').trim() || '__KEEP__',
+             models: val('data-ap-models').split('\n').map(s => s.trim()).filter(Boolean),
+             api_key_set: p.api_key_set, api_key_masked: p.api_key_masked };
+  });
+  const active = body.querySelector('[data-asst-active]');
+  const effort = body.querySelector('[data-asst-effort]');
+  AsstEdit.active = active ? active.value : '';
+  AsstEdit.effort = effort ? effort.value : '';
+}
+
+async function asstFetchModels(i, btn){
+  asstModalRead();
+  const p = AsstEdit.providers[i];
+  if (!p) return;
+  btn.disabled = true;
+  const err = $('asstModalErr');
+  try{
+    // the saved provider answers first (the key is masked in this form);
+    // an unsaved row is listed straight from the server only after a save
+    const res = await fetch('/api/assistant/models', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: p.label }) });
+    const d = await res.json();
+    if (!d.ok && !(d.models || []).length){
+      throw new Error(d.detail || d.error || ('HTTP ' + res.status));
+    }
+    const merged = Array.from(new Set((p.models || []).concat(d.models || [])));
+    AsstEdit.providers[i].models = merged;
+    asstModalRender();
+  }catch(e){
+    if (err){ err.hidden = false; err.textContent = e.message; }
+  }finally{ btn.disabled = false; }
+}
+
+async function asstCfgSave(){
+  const err = $('asstModalErr');
+  if (err) err.hidden = true;
+  asstModalRead();
+  try{
+    const res = await fetch('/api/assistant/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ providers: AsstEdit.providers,
+                             active: AsstEdit.active, effort: AsstEdit.effort }) });
+    const d = await res.json();
+    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
+    AsstState.cfg = d;
+    await asstCfgLoad();
+    asstModalOpen(false);
+    toast('Assistant saved');
+  }catch(e){
+    if (err){ err.hidden = false; err.textContent = e.message; }
+    else toast('Assistant save failed — ' + e.message);
+  }
+}
+
+/* one message node; returns the live handles so the stream can paint it */
+function asstAppend(role, text){
+  const box = $('asstMsgs');
+  const el = document.createElement('article');
+  el.className = 'asst-msg ' + role;
+  const body = document.createElement('div');
+  body.className = 'asst-body';
+  const think = document.createElement('details');
+  think.className = 'asst-think';
+  think.hidden = true;
+  const sum = document.createElement('summary');
+  sum.innerHTML = '<i class="fa fa-brain" aria-hidden="true"></i><span>thinking</span>';
+  const thinkBody = document.createElement('div');
+  thinkBody.className = 'asst-think-body';
+  think.append(sum, thinkBody);
+  el.append(body);
+  if (role === 'assistant') el.insertBefore(think, body);
+  box.appendChild(el);
+  const node = { el: el, body: body, think: think, thinkBody: thinkBody,
+                 text: text || '', thinking: '', dirty: false, timer: null,
+                 started: performance.now(), usage: null };
+  node.paint = () => {
+    node.dirty = false;
+    node.body.innerHTML = asstMd(node.text);
+    node.el.classList.toggle('streaming', !!node.streaming);
+    if (node.thinking){
+      node.think.hidden = false;
+      node.thinkBody.textContent = node.thinking;
+    }
+    if (node.usage) asstUsageLine(node);
+    asstMermaid(node.body);
+    typesetMath(node.body);
+    asstScroll();
+  };
+  node.paint();
+  return node;
+}
+
+/* the per-reply stat line: thinking, tokens in/out, speed */
+function asstUsageLine(node){
+  const u = node.usage || {};
+  const secs = Math.max(0.001, (performance.now() - node.started) / 1000);
+  const tps = u.tokens_per_second != null ? u.tokens_per_second
+    : Math.round(((u.completion_tokens || 0) || (node.text.length / 4)) / secs * 10) / 10;
+  let line = node.el.querySelector('.asst-usage');
+  if (!line){
+    line = document.createElement('div');
+    line.className = 'asst-usage';
+    node.el.appendChild(line);
+  }
+  const bits = [];
+  if (node.thinking) bits.push('<i class="fa fa-brain" aria-hidden="true"></i> '
+    + (u.reasoning_tokens ? stNumLocal(u.reasoning_tokens) + ' reasoning' : 'thinking'));
+  if (u.prompt_tokens != null) bits.push(stNumLocal(u.prompt_tokens) + ' in');
+  if (u.completion_tokens != null) bits.push(stNumLocal(u.completion_tokens) + ' out');
+  bits.push(tps.toFixed(1) + ' tok/s');
+  bits.push(stNumLocal(Math.max(0, secs).toFixed(1)) + 's');
+  line.innerHTML = bits.join(' · ');
+}
+
+const stNumLocal = v => String(v == null ? '' : v);
+
+function asstTouch(node){
+  /* repaint at most every 90 ms — a token-by-token innerHTML would thrash */
+  if (node.timer) return;
+  node.timer = setTimeout(() => { node.timer = null; node.paint(); }, 90);
+}
+
+async function asstSend(){
+  const input = $('asstIn');
+  const text = (input.value || '').trim();
+  if (!text || AsstState.busy) return;
+  input.value = '';
+  asstPreviewPaint();
+  AsstState.messages.push({ role: 'user', content: text });
+  asstAppend('user', text);
+  const node = asstAppend('assistant', '');
+  node.streaming = true;
+  node.paint();
+  AsstState.busy = true;
+  $('asstSend').disabled = true;
+  const size = $('asstSize');
+  if (size) size.hidden = true;
+  try{
+    const res = await fetch('/api/assistant/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: AsstState.messages }) });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;){
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let cut;
+      while ((cut = buf.indexOf('\n\n')) >= 0){
+        const chunk = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        chunk.split('\n').forEach(line => {
+          if (!line.startsWith('data:')) return;
+          let ev = null;
+          try{ ev = JSON.parse(line.slice(5).trim()); }catch(e){ return; }
+          if (!ev) return;
+          if (ev.type === 'thinking'){ node.thinking += ev.text || ''; node.think.open = true; }
+          else if (ev.type === 'text'){ node.text += ev.text || ''; }
+          else if (ev.type === 'usage'){ node.usage = ev; }
+          else if (ev.type === 'error'){
+            node.text += (node.text ? '\n\n' : '') + '**' + (ev.message || 'Assistant error') + '**';
+          }
+          asstTouch(node);
+        });
+      }
+    }
+  }catch(e){
+    node.text += (node.text ? '\n\n' : '') + '**Assistant unreachable — ' + e.message + '**';
+  }
+  node.streaming = false;
+  node.paint();
+  if (node.text.trim()) AsstState.messages.push({ role: 'assistant', content: node.text });
+  AsstState.busy = false;
+  $('asstSend').disabled = false;
+  asstScroll();
+}
+
+/* ── the built-in Markdown preview: the message renders as you type ── */
+function asstPreviewPaint(){
+  const box = $('asstPreview');
+  const area = $('asstIn');
+  if (!box || !area) return;
+  const text = area.value || '';
+  box.classList.toggle('empty', !text.trim());
+  if (!text.trim()){ box.innerHTML = ''; return; }
+  box.innerHTML = asstMd(text);
+  asstMermaid(box);
+  typesetMath(box);
+}
+
+/* the composer grows with its text, up to a scroll-free cap */
+function asstGrow(){
+  const area = $('asstIn');
+  if (!area) return;
+  area.style.height = 'auto';
+  const h = Math.min(area.scrollHeight + 2, 180);
+  area.style.height = h + 'px';
+  area.style.overflowY = area.scrollHeight + 2 > 180 ? 'auto' : 'hidden';
+  asstPreviewPaint();
+}
+
+$('asstBubble').onclick = () => asstOpen(!AsstState.open);
+$('asstClose').onclick = () => asstOpen(false);
+$('asstGear').onclick = () => asstModalOpen($('asstModal').hidden);
+$('asstModalClose').onclick = () => asstModalOpen(false);
+$('asstModal').onclick = e => { if (e.target === $('asstModal')) asstModalOpen(false); };
+$('asstSave').onclick = () => asstCfgSave();
+$('asstPick').onchange = e => asstPick(e.target.value);
+$('asstForm').onsubmit = e => { e.preventDefault(); asstSend(); };
+$('asstIn').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); asstSend(); }
+});
+$('asstIn').addEventListener('input', () => asstGrow());

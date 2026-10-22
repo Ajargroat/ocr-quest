@@ -1,4 +1,4 @@
-"""Pipeline + Credentials coherence pins (restructure 2026-10-07).
+﻿"""Pipeline + Credentials coherence pins (restructure 2026-10-07).
 
 The user re-laid the pipeline view: period stats at the VERY TOP, then the
 stage strip, the toolbar (run + provider/proxy context on the right), a
@@ -118,6 +118,14 @@ class PipelineCoherenceTests(unittest.TestCase):
         # the profile buttons belong to Credentials, not the pipeline toolbar
         self.assertNotIn('id="pipeProxyNew"', bar)
         self.assertNotIn('id="pipeProxyDel"', bar)
+
+    def test_proxy_check_button_sits_in_the_pipeline_toolbar(self):
+        html = _read("index.html")
+        view = _view(html, "viewPipeline")
+        bar = view.split('class="toolbar"', 1)[1].split("</section>", 1)[0]
+        self.assertIn('id="pipeProxyCheck"', bar)
+        js = _read("app.js")
+        self.assertIn("'/api/proxy/check'", js)
 
     def test_upload_panel_is_full_width_with_dropdowns(self):
         html = _read("index.html")
@@ -533,7 +541,10 @@ class SidebarLayoutTests(unittest.TestCase):
         in a sidebar footer; the sidebar's top slot is the brand, not a
         collapse control (Q1/Q2 — the sidebar no longer collapses)."""
         html = _read("index.html")
-        self.assertNotIn("<header", html)
+        # the assistant chat panel has a <header> of its own; the rule is about
+        # the SIDEBAR's top header, so scope the pin to the pre-nav markup
+        self.assertNotIn("<header", html.split('<nav id="side"', 1)[0])
+        self.assertNotIn("side-head", html)
         side = html.split('id="side"', 1)[1].split("</nav>", 1)[0]
         self.assertNotIn('id="sideFooter"', side)
         self.assertNotIn('id="conn"', side)
@@ -694,3 +705,69 @@ class HintCopyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AssistantChatTests(unittest.TestCase):
+    """The floating assistant: own provider list, built-in Markdown preview,
+    a roomier panel with a per-reply token/speed line."""
+
+    def test_the_panel_is_bigger_and_its_body_is_smaller_type(self):
+        css = _read("styles.css")
+        panel = css[css.index(".asst-panel{"):css.index(".asst-head{")]
+        self.assertIn("min(560px", panel)
+        self.assertIn("780px", panel)
+        self.assertNotIn("420px", panel)
+        body = css[css.index(".asst-msg{"):css.index(".asst-msg.user{")]
+        self.assertIn("font-size:var(--fs-1)", body)
+
+    def test_the_markdown_preview_is_built_in(self):
+        """No preview toggle: the composer renders what is typed, beside it."""
+        html = _read("index.html")
+        js = _read("app.js")
+        self.assertNotIn('id="asstPreviewBtn"', html)
+        self.assertNotIn("AsstState.preview", js)
+        self.assertIn('id="asstPreview"', html)
+        self.assertIn("function asstPreviewPaint", js)
+        self.assertIn('addEventListener(\'input\', () => asstGrow())', js)
+        css = _read("styles.css")
+        self.assertIn(".asst-write{display:grid;grid-template-columns:1fr 1fr", css)
+
+    def test_a_reply_shows_thinking_tokens_and_speed(self):
+        js = _read("app.js")
+        for token in ("tokens_per_second", "reasoning_tokens", "prompt_tokens",
+                      "asst-usage", "tok/s"):
+            self.assertIn(token, js, token)
+
+    def test_settings_is_a_popup_with_providers_and_a_thinking_level(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        self.assertIn('id="asstModal"', html)
+        self.assertNotIn('id="asstConfig"', html)
+        self.assertNotIn('id="asstUrl"', html)
+        for token in ("asstModalOpen", "data-ap-models", "data-asst-effort",
+                      "asstFetchModels", "/api/assistant/models",
+                      "data-asst-active"):
+            self.assertIn(token, js, token)
+        # the header carries the active-model picker
+        self.assertIn('id="asstPick"', html)
+
+    def test_the_assistant_hatches_no_stray_border_box(self):
+        """The gear/close live in the panel header — the old config block that
+        sat under it (a second bordered strip) is gone."""
+        css = _read("styles.css")
+        self.assertNotIn(".asst-config{", css)
+        self.assertNotIn("#asstPreviewBtn", css)
+
+
+class PipelinePagesControlTests(unittest.TestCase):
+    """The pipeline toolbar's pages-per-call picker drives OCR_PAGES_PER_CALL"""
+
+    def test_pipeline_toolbar_exposes_pages_per_call(self):
+        html = _read("index.html")
+        js = _read("app.js")
+        self.assertIn('id="pipePagesPerCall"', html)
+        self.assertIn('for="pipePagesPerCall"', html)
+        self.assertIn("Pages / call", html)
+        for n in range(1, 9):
+            self.assertIn('<option value="%d">' % n, html)
+        self.assertIn("/api/pipeline/settings", js)
