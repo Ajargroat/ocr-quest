@@ -1,4 +1,4 @@
-"""Write-cache (deferrals) and circuit-breaker tests (no network, no database).
+﻿"""Write-cache (deferrals) and circuit-breaker tests (no network, no database).
 
 Run them either way:
     python tests/test_deferrals.py
@@ -61,11 +61,11 @@ class FakeRouter:
             "questions": [{"question_number": 1, "question_text": "hi"}]}
         self.fault = fault
 
-    def call(self, cfg, prompt, data_b64, mime, on_problem=None, on_route=None):
+    def call(self, cfg, prompt, data_b64, mime, on_problem=None, on_route=None,
+             **kwargs):
         if self.fault is not None:
             raise self.fault
         return self.parsed, {}, {}
-
 
 class CacheCase(unittest.TestCase):
     """Isolates the cache file + retry env for every test."""

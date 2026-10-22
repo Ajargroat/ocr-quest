@@ -20,9 +20,10 @@ import time
 
 from PIL import Image
 
-from pipeline import converter, gemini as gemini_mod
+from pipeline import converter, gemini as gemini_mod, prompts
 
-from pipeline.studio import bands, extract, llm, workspace
+from pipeline.studio import (bands, extract, faults as studio_faults, llm,
+                             workspace)
 
 # A box smaller than this (of 1000) is treated as a bad reply, not a crop.
 MIN_BOX = 8
@@ -176,8 +177,10 @@ def _vision_boxes(cfg, job_id, page_no, image_rel, blocks):
     path = os.path.join(workspace.job_dir(job_id), image_rel)
     questions = _questions(blocks)
     result = llm.call_stage(
-        cfg, "vision", GEOMETRY_PROMPT + json.dumps(questions,
-                                                    ensure_ascii=False),
+        cfg, "vision", llm.stage_prompt(
+            cfg, "vision",
+            prompts.get("studio.geometry", GEOMETRY_PROMPT)
+            + json.dumps(questions, ensure_ascii=False)),
         _read_b64(path), "image/jpeg")
     parsed = result.get("parsed")
     if not isinstance(parsed, dict):
@@ -211,7 +214,10 @@ def _locate_batch(cfg, job_id, page_nos, by_page, pages):
                         "questions": _questions(by_page[page_no])})
     if not payloads:
         return {}
-    prompt = LOCATE_PROMPT + json.dumps(request, ensure_ascii=False)
+    prompt = llm.stage_prompt(
+        cfg, "vision",
+        prompts.get("studio.locate", LOCATE_PROMPT)
+        + json.dumps(request, ensure_ascii=False))
     result = llm.call_stage(cfg, "vision", prompt, images=payloads,
                             labels=labels, json_mode=True, thinking=0)
     return _parse_locate(result, [entry["page"] for entry in request])
@@ -284,7 +290,10 @@ def _band_call(cfg, items):
     request = [{"key": item["band"].key,
                 "hint": (item["block"].get("text") or "")[:120]}
                for item in items]
-    prompt = BAND_PROMPT + json.dumps(request, ensure_ascii=False)
+    prompt = llm.stage_prompt(
+        cfg, "vision",
+        prompts.get("studio.band", BAND_PROMPT)
+        + json.dumps(request, ensure_ascii=False))
     return llm.call_stage(cfg, "vision", prompt,
                           images=[base64.b64encode(item["jpeg"]).decode("ascii")
                                    for item in items],
@@ -322,6 +331,26 @@ def _parse_bands(result, items):
     return {}, True
 
 
+# A question box taller than this share of the page can hold a figure under
+# its words; a tight text run cannot and is not sent to the model.
+FIGURE_HINT_MIN = 0.18
+
+
+def _may_hold_figure(block):
+    """True when a text-lane block's box is roomy enough to contain a figure.
+
+    The box is the union of the words' own boxes, so a question with a
+    diagram under it spans a tall box - the diagram is empty space in the
+    middle of it.  A block of straight text is a thin band.
+    """
+    box = block.get("bbox")
+    if not box or len(box) != 4:
+        return False
+    if (block.get("source") or {}).get("method") != "text":
+        return False
+    return (box[2] - box[0]) / 1000.0 >= FIGURE_HINT_MIN
+
+
 def _area(box):
     return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
 
@@ -346,9 +375,22 @@ def _store_figures(block, figures):
     clean = [box for box in (_clean_bbox(raw) for raw in figures or []) if box]
     block["figure_bboxes"] = clean
     block["figure_bbox"] = _pick_figure(clean) if clean else None
+    # The job summary and the rows read this flag; the box list alone left a
+    # pictured row counting as "0 figures" in the Jobs list.
+    block["has_figure"] = bool(clean)
 
 
-def _apply_band_reply(items, found, relative, stats):
+def _center(box):
+    return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
+
+
+def _distance(one, other):
+    """Center distance between two page-normalized boxes."""
+    a, b = _center(one), _center(other)
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def _apply_band_reply(items, found, relative, stats, emit=None):
     """Write the valid figures; return the bands that need one more cut."""
     retry = []
     for item in items:
@@ -358,7 +400,33 @@ def _apply_band_reply(items, found, relative, stats):
             continue                       # no answer: keep the locate figure
         figs = found[key]
         if not relative:
-            _store_figures(block, figs)
+            # This lane answered in page coordinates. The band QA is written
+            # for band-relative boxes, so map back before judging: a figure
+            # outside this question's band is another question's picture.
+            if not figs:
+                _store_figures(block, [])
+                stats["figure_missing"] += 1
+                continue
+            kept = []
+            region = item["band"].to_page([0, 0, 1000, 1000])
+            for fig in figs:
+                # A page-coordinate figure that mostly sits outside the band
+                # the model was shown belongs to another question. Reject it
+                # here instead of shipping a picture nobody asked for.
+                if region and _containment(fig, region) < 0.6:
+                    stats["qa_rejects"] = stats.get("qa_rejects", 0) + 1
+                    stats["figure_rejected"] = \
+                        stats.get("figure_rejected", 0) + 1
+                    if emit:
+                        emit("geometry", "info",
+                             "figure on %s rejected - outside its band" % key)
+                    continue
+                inner = item["band"].to_band(fig)
+                if inner and bands.qa(inner, item["band"])[0]:
+                    kept.append(fig)
+                else:
+                    stats["qa_rejects"] = stats.get("qa_rejects", 0) + 1
+            _store_figures(block, kept)
             continue
         if not figs:
             _store_figures(block, [])
@@ -409,7 +477,79 @@ def _retry_band(cfg, job_id, item, stats):
         stats["figure_missing"] += 1
 
 
-def _figure_pass(cfg, job_id, chunk, stats):
+def _containment(figure, box):
+    """Share of the figure's area that lies inside a question box."""
+    if not box:
+        return 0.0
+    y0 = max(figure[0], box[0])
+    x0 = max(figure[1], box[1])
+    y1 = min(figure[2], box[2])
+    x1 = min(figure[3], box[3])
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+    return (y1 - y0) * (x1 - x0) / float(max(1, _area(figure)))
+
+
+def _overlap(one, other):
+    """Intersection over the smaller box - 1.0 means the same picture."""
+    y0 = max(one[0], other[0])
+    x0 = max(one[1], other[1])
+    y1 = min(one[2], other[2])
+    x1 = min(one[3], other[3])
+    if y1 <= y0 or x1 <= x0:
+        return 0.0
+    return ((y1 - y0) * (x1 - x0)
+            / float(max(1, min(_area(one), _area(other)))))
+
+
+def _dedupe_figures(blocks, stats=None):
+    """One picture belongs to one question.
+
+    Neighbouring bands overlap by design, so two questions can both claim the
+    same diagram. The question whose own box center sits nearest the picture
+    keeps it (a tie falls back to the box that contains more of the picture);
+    the other claim is cleared. Returns how many claims were dropped, and
+    records the pair count as ``figure_conflicts``.
+    """
+    claims = []
+    for block in blocks:
+        for raw in block.get("figure_bboxes") or []:
+            box = _clean_bbox(raw)
+            if box:
+                claims.append((block, box, block.get("page")))
+    if len(claims) < 2:
+        return 0
+    dropped = set()
+    conflicts = 0
+    for left in range(len(claims)):
+        for right in range(left + 1, len(claims)):
+            one_block, one, one_page = claims[left]
+            other_block, other, other_page = claims[right]
+            if one_block is other_block or one_page != other_page:
+                continue                       # two pages, two pictures
+            if _overlap(one, other) <= 0.5:
+                continue
+            conflicts += 1
+            box_one = _clean_bbox(one_block.get("bbox"))
+            box_other = _clean_bbox(other_block.get("bbox"))
+            if box_one and box_other:
+                keep_left = _distance(one, box_one) <= _distance(other,
+                                                                box_other)
+            else:
+                keep_left = (_containment(one, box_one)
+                             >= _containment(other, box_other))
+            dropped.add(right if keep_left else left)
+    for index in dropped:
+        block, box, _page = claims[index]
+        rest = [raw for raw in block.get("figure_bboxes") or []
+                if _clean_bbox(raw) != box]
+        _store_figures(block, rest)
+    if stats is not None:
+        stats["figure_conflicts"] = stats.get("figure_conflicts", 0) + conflicts
+    return len(dropped)
+
+
+def _figure_pass(cfg, job_id, chunk, stats, emit=None):
     """One band batch; falls back to single bands when a lane refuses many."""
     items = _cut_bands(cfg, job_id, chunk)
     if not items:
@@ -435,7 +575,7 @@ def _figure_pass(cfg, job_id, chunk, stats):
                     relative = False
             except Exception:
                 pass
-    retry = _apply_band_reply(items, found, relative, stats)
+    retry = _apply_band_reply(items, found, relative, stats, emit)
     for item in retry:
         _retry_band(cfg, job_id, item, stats)
 
@@ -443,10 +583,14 @@ def _figure_pass(cfg, job_id, chunk, stats):
 # -- crops ------------------------------------------------------------------
 
 def _crop_spec(block, assets, figure=None):
-    """(crop_bbox, source) for one block: its picture, or nothing at all.
+    """(crop_bbox, provenance) for one block: its picture, or nothing at all.
 
     A question with no picture gets no crop. Cropping the whole question
     region would ship a picture the row never had (and an invented bbox).
+
+    Provenance is kept apart on purpose: ``asset`` is a figure the text
+    layer itself points at (an embedded image with an exact box), while
+    ``model`` is a band-pass guess. Only an asset may skip human review.
     """
     boxes = [assets[i]["bbox"] for i in block.get("images") or []
              if i in assets and assets[i].get("bbox")]
@@ -455,10 +599,10 @@ def _crop_spec(block, assets, figure=None):
         for box in boxes[1:]:
             union = [min(union[0], box[0]), min(union[1], box[1]),
                      max(union[2], box[2]), max(union[3], box[3])]
-        return union, "figure"
+        return union, "asset"
     figure = _clean_bbox(figure)
     if figure:
-        return figure, "figure"
+        return figure, "model"
     return None, None
 
 
@@ -553,7 +697,8 @@ def run(job_id, cfg, emit=None):
     stats = {"blocks": len(blocks), "boxes": 0, "vision_pages": 0,
              "missing": 0, "crops": 0, "calls": 0, "bands": 0,
              "band_calls": 0, "figure_missing": 0, "qa_rejects": 0,
-             "kept_previous": 0, "errors": []}
+             "figure_rejected": 0, "figure_conflicts": 0,
+             "figure_dropped": 0, "kept_previous": 0, "errors": []}
     previous = ((workspace.read_artifact(job_id, "geometry") or {}).get("boxes")
                 or {})
 
@@ -605,7 +750,9 @@ def run(job_id, cfg, emit=None):
                         stats["errors"].append({"page": page_no,
                                                 "error": str(inner)})
                         emit("geometry", "error",
-                             "page %s: %s" % (page_no, inner))
+                             "page %s: %s" % (page_no, inner),
+                             fault=studio_faults.payload(
+                                 studio_faults.classify(inner)))
                         continue
                     for key, hit in one.items():
                         found[(page_no, key)] = hit
@@ -634,17 +781,31 @@ def run(job_id, cfg, emit=None):
             block["bbox_source"] = old.get("source") or "vision"
             stats["kept_previous"] += 1
 
-    # Pictured questions: one band pass, several bands per request.
+    # Pictured questions: one band pass, several bands per request.  A text
+    # lane question qualifies too: this PDF draws most of its figures as
+    # vector paths, which ``probe.figure_bounds`` cannot see (it counts image
+    # objects only), so a question whose box is tall enough to hold a figure
+    # below its words is checked by the model instead of being assumed bare.
+    # Only a question (or a lesson) can own a picture. A prose header or a
+    # question fragment sits in a tall box, so a band cut over it answers
+    # "yes, a figure" for text that never had one - that was the source of the
+    # crops attached to the wrong rows. An organized page already had its
+    # picture ownership read at question level by the extract model; re-cutting
+    # a band over it can only move the crop to the wrong question.
     pictured = [block for block in blocks
-                if block.get("bbox_source") == "vision"
+                if block.get("kind") in ("question", "lesson")
                 and not block.get("images")
-                and block.get("figure_bbox")]
+                and not block.get("organized")
+                and (block.get("figure_bbox")
+                     or _may_hold_figure(block))]
     band_batch = max(1, _cfg_int(cfg, "studio_band_batch", 6))
     for start in range(0, len(pictured), band_batch):
         chunk = pictured[start:start + band_batch]
         emit("geometry", "info",
              "checking %d pictured question(s)" % len(chunk))
-        _figure_pass(cfg, job_id, chunk, stats)
+        _figure_pass(cfg, job_id, chunk, stats, emit)
+
+    stats["figure_dropped"] = _dedupe_figures(blocks, stats)
 
     entries = {}
     for block in blocks:
@@ -660,9 +821,11 @@ def run(job_id, cfg, emit=None):
             stats["boxes"] += 1
         if crop_bbox:
             stats["crops"] += 1
-        # Only the text lane's figure boxes are exact enough to skip review.
-        exact = (crop_source == "figure"
-                 and block.get("bbox_source") == "text_layer")
+        # Only an ASSET (an image the text layer itself placed) may skip
+        # review. A model-located band figure is a guess and always waits for
+        # the human gate - provenance is not the same as where the block came
+        # from.
+        exact = crop_source == "asset"
         entry = {"bbox": box, "source": block.get("bbox_source"),
                  "crop_bbox": crop_bbox, "crop_source": crop_source,
                  "figure_bboxes": figures,

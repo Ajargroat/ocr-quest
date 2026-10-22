@@ -17,6 +17,7 @@ import shutil
 from datetime import datetime, timezone
 
 import psycopg2
+from psycopg2.extras import Json
 
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backups")
 GRAVEYARD_FILE = os.path.join(BACKUP_ROOT, "row_graveyard.jsonl")
@@ -93,6 +94,11 @@ def _connect(cfg):
 
 
 def _jsonable(v):
+    """A value JSON can carry as-is.
+
+    jsonb/json columns come back as dict/list — they ARE the JSON, so they
+    pass through untouched (stringifying them would write Python's repr into
+    the snapshot and make the restore unreadable)."""
     from decimal import Decimal
     if isinstance(v, (datetime,)):
         return v.isoformat()
@@ -100,7 +106,27 @@ def _jsonable(v):
         return float(v)
     if isinstance(v, (bytes, bytearray)):
         return v.hex()
+    if isinstance(v, (dict, list, bool, int, float)) or v is None:
+        return v
     return str(v)
+
+
+def _sql_value(v):
+    """A value psycopg2 can adapt for the SQL dump.
+
+    A dict/list needs the JSON adapter: psycopg2 has no default adapter for
+    Python containers ("can't adapt type 'dict'"), and every jsonb column in
+    lesson_blocks/questions/media_assets is exactly that. Json() writes the
+    same literal the API would, so the dump replays into the column
+    unchanged."""
+    if isinstance(v, (dict, list)):
+        return Json(v)
+    return v
+
+
+def _drop_partial(out_dir):
+    """Remove a snapshot directory that never reached its manifest."""
+    shutil.rmtree(out_dir, ignore_errors=True)
 
 
 def _table_columns(cur, table):
@@ -129,7 +155,11 @@ def run_backup(cfg, trigger="weekly"):
         "total_bytes": 0,
     }
     missing = []
-    conn = _connect(cfg)
+    try:
+        conn = _connect(cfg)
+    except Exception:
+        _drop_partial(out_dir)
+        raise
     try:
         with conn.cursor() as cur:
             cur.execute("SHOW server_version")
@@ -161,7 +191,8 @@ def run_backup(cfg, trigger="weekly"):
                     fh.write("-- %s · %s · %d rows · trigger=%s\n" % (
                         name, table, len(rows), trigger))
                     for row in rows:
-                        fh.write(cur.mogrify(template, row).decode("utf-8") + "\n")
+                        params = tuple(_sql_value(v) for v in row)
+                        fh.write(cur.mogrify(template, params).decode("utf-8") + "\n")
 
                 manifest["tables"][table] = {
                     "rows": len(rows),
@@ -173,6 +204,11 @@ def run_backup(cfg, trigger="weekly"):
                     + manifest["tables"][table]["json_bytes"]
             if missing:
                 manifest["missing_tables"] = missing
+    except Exception:
+        # A set without a manifest is invisible to list_sets() and would never
+        # be rotated away — drop the half-written directory instead of leaking it.
+        _drop_partial(out_dir)
+        raise
     finally:
         conn.close()
 

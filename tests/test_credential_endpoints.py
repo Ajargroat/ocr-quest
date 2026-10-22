@@ -591,5 +591,32 @@ class CheckProviderEndpointTest(EndpointCase):
         self.assertNotIn("latency_ms", d)
 
 
+class ProxyCheckTest(EndpointCase):
+    """GET /api/proxy/check probes every ENABLED profile once."""
+
+    def test_it_probes_enabled_profiles_and_skips_disabled_ones(self):
+        seen = []
+
+        def fake_probe(profile):
+            seen.append(profile["name"])
+            return {"reachable": profile["name"] == "Good", "kind": "ok",
+                    "detail": "googleapis.com answered HTTP 200"}
+
+        main.gemini_mod.test_proxy = fake_probe
+        main.cfg.proxy_profiles = [
+            {"name": "Good", "host": "127.0.0.1", "port": "1", "enabled": True},
+            {"name": "Off", "host": "127.0.0.1", "port": "2", "enabled": False},
+            {"name": "Bad", "host": "127.0.0.1", "port": "3"},
+        ]
+        res = self.client().get("/api/proxy/check")
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual([r["name"] for r in body["results"]], ["Good", "Bad"])
+        self.assertTrue(body["results"][0]["ok"])
+        self.assertFalse(body["results"][1]["ok"])
+        self.assertEqual(seen, ["Good", "Bad"])
+
+
 if __name__ == "__main__":
     unittest.main()

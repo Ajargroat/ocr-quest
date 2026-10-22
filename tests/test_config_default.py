@@ -133,3 +133,18 @@ class LaneModelToggleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StudioOrganizeConfigTests(unittest.TestCase):
+    """STUDIO_ORGANIZE — on by default, opt-out via env."""
+
+    def test_default_is_on_and_can_be_disabled(self):
+        saved = os.environ.pop("STUDIO_ORGANIZE", None)
+        try:
+            self.assertEqual(config.load_config().studio_organize, 1)
+            os.environ["STUDIO_ORGANIZE"] = "0"
+            self.assertEqual(config.load_config().studio_organize, 0)
+        finally:
+            os.environ.pop("STUDIO_ORGANIZE", None)
+            if saved is not None:
+                os.environ["STUDIO_ORGANIZE"] = saved

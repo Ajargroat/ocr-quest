@@ -1,4 +1,4 @@
-"""Row building: merged view → DB-shaped questions + answers (pure).
+﻿"""Row building: merged view → DB-shaped questions + answers (pure).
 
 Kept free of I/O on purpose: the batch importer, the JSON export and the
 tests all build rows through here, so what the UI approved is exactly what a
@@ -187,6 +187,14 @@ def diagram_urls(view, blob=None):
             out[key] = "crops/%s.jpg" % key
     return out
 
+def job_source_id(view):
+    """The source id every row of a job carries - the sources.id it points at.
+
+    The questions/answers name their source by id and that column is a
+    foreign key onto sources(id), so the importer writes that row first.
+    """
+    return "studio-%s" % view.get("job_id")
+
 def build_rows(view, diagram_urls=None):
     """Rows for the importable part of a merged job.
 
@@ -194,7 +202,7 @@ def build_rows(view, diagram_urls=None):
     queued, so a failed upload can never import a question without its figure.
     """
     diagram_urls = diagram_urls or {}
-    source_id = "studio-%s" % view.get("job_id")
+    source_id = job_source_id(view)
     questions, answers, skipped, imported = [], [], [], []
     by_number = {}
     for block in view.get("blocks") or []:
@@ -288,7 +296,9 @@ def _question_row(source_id, block, image):
         "difficulty": block.get("difficulty"),
         "review_status": "pending",
         "raw_ocr_text": block.get("raw_ocr_text"),
-        "diagram_url": url if real else None,
+        # a picture with no page box is still a picture: diagram_url and
+        # diagram_bbox are independent columns (QBank renders the former)
+        "diagram_url": url or None,
         "diagram_bbox": json.dumps(real) if real else None,
         "media_images": json.dumps(pictures, ensure_ascii=False),
         "grade": block.get("grade"),

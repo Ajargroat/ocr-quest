@@ -1,4 +1,4 @@
-"""Offline tests for P5/P6/P7 behaviour: Pacific-midnight usage reset,
+﻿"""Offline tests for P5/P6/P7 behaviour: Pacific-midnight usage reset,
 quota-exhausted skip-till-reset, per-call JSON history + period filter,
 exponential backoff, and DB period counts.
 
@@ -187,6 +187,25 @@ class PerCallHistoryTests(unittest.TestCase):
         rep = r.usage_report("all")
         self.assertEqual([c["key_name"] for c in rep["calls"]], ["Key 1"])
         self.assertEqual(rep["totals"]["calls"], 1)
+
+
+    def test_studio_rows_are_kept_even_through_the_9router_lane(self):
+        """The studio's default lane IS 9router, so its rows are studio usage,
+        not routing noise — the Usage tab must show them (bug: they vanished)."""
+        r = GeminiRouter()
+        with open(self._calls_file(), "w", encoding="utf-8") as fh:
+            json.dump([
+                {"ts": time.time(), "model": "chain-model", "key_name": "9router",
+                 "source": "studio", "tokens_in": 10, "tokens_out": 4,
+                 "ok": True, "ms": 30.0},
+                {"ts": time.time(), "model": "chain-model", "key_name": "9router",
+                 "source": "pipeline", "ok": True, "ms": 20.0},
+            ], fh)
+        rep = r.usage_report("all")
+        self.assertEqual(len(rep["calls"]), 1)
+        self.assertEqual(rep["calls"][0]["source"], "studio")
+        self.assertEqual(rep["totals"]["by_source"]["studio"]["calls"], 1)
+        self.assertNotIn("pipeline", rep["totals"]["by_source"])
 
 
 class UsageChartTests(unittest.TestCase):

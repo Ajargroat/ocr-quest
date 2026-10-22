@@ -61,9 +61,11 @@ Main groups:
 | Server | `HOST` (default `0.0.0.0`), `PORT` (default `8080`) | set `HOST=127.0.0.1` on shared networks — the dashboard has no authentication |
 | Network retries | `NET_RETRIES`, `NET_RETRY_WAIT` | |
 | Revision | `REVISION_BATCH_LIMIT`, `REVISION_CHUNK_SIZE` | |
-| Studio | `STUDIO_CHUNK_CHARS`, `STUDIO_CHUNK_IMAGES`, `STUDIO_PAGES_PER_CALL`, `STUDIO_BAND_BATCH`, `STUDIO_VISION_MODEL`, `STUDIO_VISION_LONG_EDGE`, `STUDIO_VISION_QUALITY`, `STUDIO_SOURCE_ROOT`, `STUDIO_CROP_PREFIX` | stage-1 request windows (contiguous pages per extraction call, bounded by chars and page images); pages per vision call (extraction/locate/OCR) and bands per figure pass; vision pages are capped by long edge and JPEG quality, not bytes; sources live in the folder tree (`<INPUT_ROOT>/studio` by default) and the DB references a source by its folder id; only crops go to the bucket under `STUDIO_CROP_PREFIX` (re-crop replaces the same object id) |
+| Studio | `STUDIO_CHUNK_CHARS`, `STUDIO_CHUNK_IMAGES`, `STUDIO_PAGES_PER_CALL`, `STUDIO_BAND_BATCH`, `STUDIO_ORGANIZE`, `STUDIO_VISION_MODEL`, `STUDIO_VISION_LONG_EDGE`, `STUDIO_VISION_QUALITY`, `STUDIO_SOURCE_ROOT`, `STUDIO_CROP_PREFIX` | stage-1 request windows (contiguous pages per extraction call, bounded by chars and page images); pages per vision call (extraction/locate/OCR) and bands per figure pass; vision pages are capped by long edge and JPEG quality, not bytes; sources live in the folder tree (`<INPUT_ROOT>/studio` by default) and the DB references a source by its folder id; only crops go to the bucket under `STUDIO_CROP_PREFIX` (re-crop replaces the same object id) |
 | Converter | `CONVERTER_ENABLED`, `CONVERTER_DPI`, `CONVERTER_RASTER_QUALITY`, `CONVERTER_MIN_AGE_MINUTES`, `CONVERTER_SCAN_INTERVAL_SECONDS` | the watcher runs inside the app (no Docker); `CONVERTER_ENABLED=0` turns it off; every page JPEG is capped at 200 KB by re-encoding at a lower quality (DPI is never lowered) |
-| Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | |
+| Backups | `BACKUP_INTERVAL_DAYS`, `BACKUP_KEEP` | dumps the lessons model as JSON + replayable SQL; keeps the newest `BACKUP_KEEP` sets |
+| OCR pages | `OCR_PAGES_PER_CALL` (1..8) | `1` is one picture per call; `2..8` reads that many pages in one request and splits the reply back onto the pages. The pipeline toolbar's "Pages / call" writes it |
+| Assistant | `ASSISTANT_PROVIDERS`, `ASSISTANT_MODEL`, `ASSISTANT_EFFORT`, `ASSISTANT_URL`, `ASSISTANT_API_KEY` | the floating help chat's own OpenAI-compatible endpoints, never an OCR lane; `ASSISTANT_PROVIDERS` holds several providers (label, base URL, key, model list) and `ASSISTANT_MODEL` picks one as `label::model`; the key stays server-side and the reply is relayed as text + thinking + usage events |
 
 ¹ `INPUT_ROOT` is read from the environment but not listed in `.env.example`; the
 default (`./konkour-ocr`) is used when it is unset.
@@ -95,6 +97,36 @@ pipeline page queues files with a `konkour-ocr/{subject}/{grade}/{topic}/
 cancel or remove queued/failed entries.
 
 Keep `MIN_AGE_SECONDS` at its default (30 s) so scans don't race the converter.
+
+## OCR Studio
+
+Studio turns one PDF into reviewable rows: **Extract** (text layer or OCR, with
+a model re-read of a scrambled text page), **Enrich** (fields, tags, health),
+**Crop** (question boxes and figure crops), then **Inspect / Import**. The stage
+tabs are routed by `#studio/<tab>`; each stage's provider and model are picked
+in the Models tab, and only the Gemini-pool calls take the Studio proxy
+(9router stays loopback).
+
+The text lane is deterministic first: a page whose anchors, options or line
+flow are unsure is re-read by the extract model, one call per such page. The
+Extract tab's **organize** picker chooses that pass per run: `auto` (adaptive,
+the default), `off` (never) or `all pages` (force a full re-read). The env key
+`STUDIO_ORGANIZE` only defines what `auto` may do.
+
+Latency is dominated by the model lanes, not the code: on the reference physics
+booklet (3 dense pages, Gemini 3.5 flash-lite) an enrich call on 9router took
+26-89 s, while one Gemini-pool band batch through a proxy took 23-133 s.
+`STUDIO_PAGES_PER_CALL` and `STUDIO_BAND_BATCH` are the batching levers; the
+studio lanes obey the same `NET_RETRIES` / `NET_RETRY_WAIT` knobs as the
+pipeline. The pipeline tab's proxy check button probes every enabled profile
+before a run, so a dead tunnel is visible before any stage starts.
+
+Health is a triage signal: a row is `ready` when its demanded fields are filled
+and no issue is open. A metadata field the whole document cannot supply (no
+printed institute/year line) is reported once at the job level, not as one
+warning per row. The Inspect strip shows the job's own scorecard (questions,
+four-option sets, topic matches, crop approvals, organizer use) beside the row
+chips (status, topic, missing count, picture provenance).
 
 ## Tests
 

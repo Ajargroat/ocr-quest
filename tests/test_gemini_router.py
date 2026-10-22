@@ -372,6 +372,19 @@ class RouterTest(unittest.TestCase):
         self.assertEqual(full[0], "gemini-3.5-flash-lite")
         self.assertIn("gemini-3.8-flash", full)
 
+    def test_a_pin_reduces_the_plan_to_that_one_model(self):
+        """The Gemini-model dropdown sends ONE model ("All models" = none)."""
+        cfg = make_cfg()
+        cfg.gemini_pin = "gemini-3.8-flash"
+        plan = {i: ms for i, _k, ms, _lat, _pen
+                in GeminiRouter()._plan(cfg, 0)}
+        self.assertEqual(plan[0], ["gemini-3.8-flash"])
+        cfg.gemini_pin = ""
+        full = {i: ms for i, _k, ms, _lat, _pen
+                in GeminiRouter()._plan(cfg, 0)}[0]
+        self.assertIn("gemini-3.5-flash-lite", full)
+        self.assertGreater(len(full), 1)
+
     def test_missing_pool_raises_immediately(self):
         r = GeminiRouter()
         with self.assertRaises(faults.FaultError) as ctx:

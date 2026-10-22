@@ -64,6 +64,30 @@ class Band:
     def crop(self, page_image):
         return page_image.crop(self.rect)
 
+    def to_band(self, box):
+        """Page-relative 0-1000 box -> band-relative 0-1000 box.
+
+        The inverse of ``to_page``; used to run the band QA on a lane that
+        answered in page coordinates instead of band coordinates.
+        """
+        clean = clean_box(box)
+        if not clean:
+            return None
+        y0, x0, y1, x1 = clean
+        rx0, ry0, rx1, ry1 = self.rect
+        if ry1 <= ry0 or rx1 <= rx0:
+            return None
+
+        def by(value):
+            px = value / 1000.0 * self.page_h
+            return clamp(round((px - ry0) / float(ry1 - ry0) * 1000.0))
+
+        def bx(value):
+            px = value / 1000.0 * self.page_w
+            return clamp(round((px - rx0) / float(rx1 - rx0) * 1000.0))
+
+        return [by(y0), bx(x0), by(y1), bx(x1)]
+
     def to_page(self, box):
         """Band-relative 0-1000 box -> page-relative 0-1000 box."""
         clean = clean_box(box)

@@ -34,21 +34,93 @@ def _page_text(page):
         return ""
 
 
-def _count_figures(page):
-    """Rough figure count: pdfium image objects on the page.
+# --- figure geometry ------------------------------------------------------
+# An image is a genuine figure only when it is a real picture standing on
+# its own. Three shapes are page decoration and are skipped:
+#
+#   * page furniture - a repeated header/footer strip, a full-page scan, a
+#     watermark - swallows a large share of the page;
+#   * a decoration - a corner mark, a bullet - is a sliver of the page;
+#   * an image drawn on top of a page-filling picture (a title banner over
+#     a scanned cover) is part of that picture, not a figure of the page.
+#
+# Every share is measured against the page area, so the rule travels with
+# the page size instead of hard-coded coordinates.
+FIGURE_MAX_AREA_RATIO = 0.35     # at or above this share: page furniture
+FIGURE_MIN_AREA_RATIO = 0.005    # below this share: a tiny decoration
+FIGURE_FILL_AREA_RATIO = 0.9     # at or above this share: the page itself
+
+
+def _page_area(page):
+    """The page area in PDF points, or 0.0 when the size is unknown."""
+    try:
+        width, height = page.get_size()
+    except Exception:
+        return 0.0
+    if not width or not height:
+        return 0.0
+    return float(width) * float(height)
+
+
+def _area_share(bounds, area):
+    """The share of the page an image box covers."""
+    return ((bounds[2] - bounds[0]) * (bounds[3] - bounds[1])) / area
+
+
+def _inside(inner, outer, tol=1.0):
+    """True when ``inner`` lies within ``outer`` (a point of slack)."""
+    return (inner[0] >= outer[0] - tol and inner[1] >= outer[1] - tol
+            and inner[2] <= outer[2] + tol and inner[3] <= outer[3] + tol)
+
+
+def figure_bounds(page):
+    """(left, bottom, right, top) of every genuine figure image on a page.
 
     pdfium object types (pypdfium2.raw): 1 = text, 2 = path, 3 = image.
     Images are the reliable "this page has a picture" signal; vector paths
     flood-count rules and text on every page, so only 3 counts here.
+
+    Page furniture and tiny decorations are left out - this is the single
+    rule both the probe and the extractor follow, so the two can never
+    disagree about what a figure is. When the page size is unknown every
+    image is kept: an unmeasurable page must not lose a real figure.
     """
-    figures = 0
+    boxes = []
     try:
         for obj in page.get_objects():
-            if obj.type == 3:          # image object
-                figures += 1
+            if obj.type != 3:               # 3 = image
+                continue
+            try:
+                bounds = tuple(obj.get_bounds())
+            except Exception:
+                continue
+            if len(bounds) != 4 or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+                continue
+            boxes.append(bounds)
     except Exception:
-        return 0
-    return figures
+        return []
+    area = _page_area(page)
+    if not area:
+        return boxes
+    filling = [b for b in boxes if _area_share(b, area) >= FIGURE_FILL_AREA_RATIO]
+    out = []
+    for bounds in boxes:
+        share = _area_share(bounds, area)
+        if share >= FIGURE_MAX_AREA_RATIO or share < FIGURE_MIN_AREA_RATIO:
+            continue
+        if any(_inside(bounds, big) for big in filling):
+            continue
+        out.append(bounds)
+    return out
+
+
+def _count_figures(page):
+    """Rough figure count: genuine figure images on the page.
+
+    Page furniture and tiny decorations do not count - they are filtered
+    by ``figure_bounds``, the same rule the extractor uses.
+    """
+    return len(figure_bounds(page))
 
 
 def _looks_like_answer_key(text: str) -> bool:
@@ -185,7 +257,7 @@ def suggest_profile(probe_report: dict) -> dict:
         "source_kind": kind,
         "compilation": "unknown",       # an agent / the user fills this in
         "static": {"subject": None, "corp": None, "year": None, "grade": None},
-        "extract_per_question": ["corp", "year", "topic", "difficulty"],
+        "extract_per_question": ["corp", "year", "topic"],
         "answer_layout": answer_layout,
         "notes": ("text layer present on %d/%d pages" % (
             probe_report.get("text_pages", 0), total)),

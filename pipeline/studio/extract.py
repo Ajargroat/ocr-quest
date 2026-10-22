@@ -16,12 +16,15 @@ and left empty — the rest of the job still extracts.
 """
 import base64
 import hashlib
+import json
 import os
 import re
 import time
 
-from pipeline import converter
-from pipeline.studio import chunker, layout, llm, workspace
+from pipeline import converter, prompts
+from pipeline.utils import to_english_digits
+from pipeline.studio import (chunker, faults as studio_faults, layout, llm,
+                             persian, workspace)
 from pipeline.studio import probe as probe_mod
 
 # Render resolution for figures, page images and (later) crops.
@@ -54,6 +57,42 @@ Rules:
 8. Never cut a question: one question stays one entry. If the last question on this page continues onto the next page, end this page with one line exactly "SPLIT: tail".
 9. If the first question on this page continues a question that started on an earlier page, print one line exactly "SPLIT: head" right before that question's text. A question that both continues and continues onwards gets both marker lines.
 Output only the page text."""
+
+# The organize pass: a text page whose deterministic anchor pass is unsure is
+# re-read as ONE structure. The image is the source of truth; the text layer is
+# only a spelling reference because its reading order is sometimes scrambled.
+ORGANIZE_PAGE_PROMPT = """You re-read one exam page and return its questions.
+
+The page image is the source of truth. The text below is the PDF's own text
+layer; its reading order is sometimes scrambled and some question numbers are
+glued to a formula, so use it only as a spelling reference.
+
+Return ONE JSON object:
+{"questions": [{"number": 55, "stem": "...", "options": ["...", "..."],
+                "figure": [y0, x0, y1, x1] | null}]}
+
+Rules:
+- One entry per question whose printed number is visible on this page, in
+  printed order. Never invent a number and never renumber.
+- Read the page image in its printed visual order, not the text layer's
+  order. Re-join every piece the print splits across lines: a stem, an
+  option and a formula each read as one continuous unit again.
+- "stem": the full stem as ONE flowing paragraph - no newline character
+  anywhere inside. Verbatim, LaTeX kept, option texts excluded. A question
+  that continues from the previous page has no printed number here: leave
+  it out (the code joins the halves).
+- "options": the printed options in printed order, label stripped ("1)" and
+  "1(" are labels, not text). Each option is likewise one flowing string
+  with no newline inside. Keep the printed count; an unreadable option is
+  "" but still occupies its place.
+- "figure": the box of the picture that belongs to this question, normalized
+  [y0, x0, y1, x1] on a 0-1000 scale over the page, or null when the question
+  has no picture. A formula printed as text is not a figure.
+- Never merge two questions and never move an option to another question.
+- Never let the text layer's scrambled or duplicated lines create words
+  the printed page does not carry: trust the image, copy its words.
+- Output no commentary and no markdown fences.
+"""
 
 # The vision lane's per-page section marker (rule 7 of the prompt).
 PAGE_MARK_RE = re.compile(r"^\s*=+\s*PAGE\s+(\d+)\s*=+\s*$", re.IGNORECASE)
@@ -89,21 +128,13 @@ def _char_boxes(page):
 
 
 def _figure_bounds(page):
-    """(left, bottom, right, top) of every image object on the page."""
-    out = []
-    try:
-        for obj in page.get_objects():
-            if obj.type != 3:               # 3 = image (see probe._count_figures)
-                continue
-            try:
-                bounds = tuple(obj.get_bounds())
-            except Exception:
-                continue
-            if len(bounds) == 4 and bounds[2] > bounds[0] and bounds[3] > bounds[1]:
-                out.append(bounds)
-    except Exception:
-        return []
-    return out[:FIGURES_PER_PAGE]
+    """(left, bottom, right, top) of every genuine figure image on the page.
+
+    Page furniture (a repeated header/footer strip, a full-page scan) and
+    tiny decorations (a corner mark) are skipped by the same rule the
+    probe uses, so the two never disagree about what a figure is.
+    """
+    return probe_mod.figure_bounds(page)[:FIGURES_PER_PAGE]
 
 
 def _render_pil(page, dpi=None):
@@ -210,10 +241,15 @@ def _block(key, kind, page_no, order, number=None, label=None, text="",
            options=None, metadata_line=None, bbox=None, bbox_source=None,
            images=None, raw_ocr=None, source=None, split=None):
     metadata = layout.metadata_fields(metadata_line)
+    # The text layer of a scanned-but-textual PDF carries no half-spaces
+    # (see pipeline.studio.persian), so every block is repaired here - the one
+    # place every lane and every source shape passes through.
+    text = persian.restore(text or "")
+    options = _option_texts(options)
     return {
         "key": key, "kind": kind, "page": page_no, "order": order,
         "number": number, "label": label,
-        "text": text, "options": _option_texts(options),
+        "text": text, "options": [persian.restore(o) for o in options],
         "metadata_line": metadata_line,
         "corp": metadata["corp"], "year": metadata["year"],
         "topic": None, "difficulty": metadata["difficulty"],
@@ -236,20 +272,25 @@ def _key_entry_blocks(text, page_no, source):
     ]
 
 
-def _text_page(job_id, page, page_no, is_key_page, assets):
+def _text_page(job_id, page, page_no, is_key_page, assets, start=None):
     """Deterministic lane for one page with a real text layer."""
     text = _page_text(page)
+    boxes = _char_boxes(page)
     source = {"method": "text", "page": page_no}
     if is_key_page:
-        return ({"page": page_no, "method": "text", "text": text, "images": []},
+        return ({"page": page_no, "method": "text", "text": text,
+                 "images": [], "answer_key": True},
                 _key_entry_blocks(text, page_no, source))
 
     try:
         width, height = page.get_size()
     except Exception:
         width = height = 0
-    blocks = layout.split_text(text)
-    boxes = _char_boxes(page)
+    # The organizer cuts the page at its question anchors first; a page it
+    # cannot anchor falls back to the plain line splitter.
+    organized = layout.split_page(text, boxes=boxes,
+                                  page_size=(width, height), start=start)
+    blocks = organized["blocks"]
 
     figures = []
     if width and height:
@@ -309,7 +350,207 @@ def _text_page(job_id, page, page_no, is_key_page, assets):
 
     page_images = [f["id"] for f in figures if f["id"] not in claimed]
     return ({"page": page_no, "method": "text", "text": text,
-             "images": page_images}, records)
+             "images": page_images,
+             "layout": {"confidence": organized["confidence"],
+                        "anchors": organized["anchors"],
+                        "numbers": organized.get("numbers") or [],
+                        "questions": organized["questions"],
+                        "last": organized["last"]}}, records)
+
+
+def _as_number(raw):
+    """A question number from a model/JSON value, or None."""
+    try:
+        text = to_english_digits(str(raw)).strip()
+    except Exception:
+        return None
+    if not text.isdigit():
+        return None
+    value = int(text)
+    return value if 1 <= value <= 999 else None
+
+
+def _organize_figure(raw):
+    """A validated [y0, x0, y1, x1] figure box, or None."""
+    if not isinstance(raw, (list, tuple)) or len(raw) != 4:
+        return None
+    try:
+        box = [int(round(float(value))) for value in raw]
+    except (TypeError, ValueError):
+        return None
+    if min(box) < 0 or max(box) > 1000:
+        return None
+    if box[2] - box[0] < 15 or box[3] - box[1] < 15:
+        return None
+    return box
+
+
+def _organize_entries(parsed):
+    """Validated questions from one organize reply. Never raises."""
+    if not isinstance(parsed, dict):
+        return []
+    raw = parsed.get("questions")
+    if not isinstance(raw, list):
+        return []
+    entries, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        number = _as_number(item.get("number"))
+        if number is None or number in seen:
+            continue
+        stem = str(item.get("stem") or "").strip()
+        options = [str(option).strip() for option in item.get("options") or []
+                   if str(option or "").strip()][:4]
+        figure = _organize_figure(item.get("figure"))
+        if not stem and not options:
+            continue
+        seen.add(number)
+        entries.append({"number": number, "stem": stem, "options": options,
+                        "figure": figure})
+    return entries
+
+
+def _sanitize_entry(entry, stats):
+    """One flowing piece per stem/option; count what needed flattening."""
+    raw = (entry.get("stem") or "")
+    breaks = "\n" in raw or "\r" in raw
+    entry["stem"] = layout.one_line(raw)
+    options = []
+    for option in entry.get("options") or []:
+        breaks = breaks or "\n" in (option or "") \
+            or "\r" in (option or "")
+        options.append(layout.one_line(option))
+    entry["options"] = options
+    if breaks:
+        stats["organize_sanitized"] += 1
+
+
+def _organize_enabled(cfg, record, blocks=None, mode="auto"):
+    """Should this page be re-read by the extract model?
+
+    ``mode`` is this run's own choice: ``auto`` follows the env default and
+    the adaptive trigger, ``off`` never organizes, ``all`` re-reads every
+    text page. An explicit per-run choice wins over the env default; the env
+    only decides what ``auto`` means.
+    """
+    mode = (mode or "auto").strip().lower()
+    if mode not in ("auto", "off", "all"):
+        mode = "auto"
+    if not record or record.get("method") != "text":
+        return False
+    if record.get("answer_key"):
+        return False
+    if mode == "off":
+        return False
+    if mode == "all":
+        return True
+    if not getattr(cfg, "studio_organize", 0):
+        return False
+    try:
+        confidence = float((record.get("layout") or {}).get("confidence") or 0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 1.0:
+        return True
+    # A fully-anchored page can still be incoherent: a print that wraps
+    # sentences mid-line never passes. Those pages always get re-read.
+    for block in blocks or []:
+        if layout.mid_sentence_breaks(block.get("text") or ""):
+            return True
+    return False
+
+
+def _organize_page(cfg, job_id, page, page_no, record, emit, stats):
+    """One organize call over a low-confidence text page. [] on failure."""
+    text = record.get("text") or ""
+    try:
+        pil = _render_pil(page)
+        dest = _save_page(job_id, pil, page_no, cfg)
+        record["image"] = os.path.relpath(dest, workspace.job_dir(job_id))
+        with open(dest, "rb") as fh:
+            blob = base64.b64encode(fh.read()).decode("ascii")
+        prompt = (prompts.get("studio.organize", ORGANIZE_PAGE_PROMPT)
+                  + "\n\npage text:\n" + text)
+        stats["organize_calls"] += 1
+        result = llm.call_stage(cfg, "extract", prompt, blob, "image/jpeg",
+                                raw=False, json_mode=True, temperature=0.1,
+                                thinking=0)
+    except Exception as exc:
+        stats["organize_errors"].append({"page": page_no, "error": str(exc)})
+        emit("extract", "error", "organize page %s: %s" % (page_no, exc),
+             fault=studio_faults.payload(studio_faults.classify(exc)))
+        return []
+    parsed = (result or {}).get("parsed")
+    if not isinstance(parsed, dict):
+        try:
+            parsed = json.loads((result or {}).get("text") or "")
+        except (TypeError, ValueError):
+            parsed = None
+    entries = _organize_entries(parsed)
+    for entry in entries:
+        _sanitize_entry(entry, stats)
+    if not entries:
+        stats["organize_errors"].append({"page": page_no,
+                                         "error": "no usable questions"})
+        emit("extract", "warn",
+             "organize page %s returned no usable question" % page_no)
+    return entries
+
+
+def _apply_organize(blocks, entries, page_no, span=None):
+    """Overlay validated model questions on one page's deterministic blocks.
+
+    A deterministic block for the same number keeps its text-layer bbox (the
+    exact geometry), gets the model's clean stem/options, and is marked
+    ``organized``. A question the deterministic pass missed becomes a new
+    block; no deterministic-only block is ever dropped. ``span`` is the
+    page's anchored number range: a model number outside it is a question
+    that continues from another page (or a misread), and it is skipped
+    instead of becoming a bbox-less row.
+    """
+    replaced = added = skipped = 0
+    by_number = {}
+    for block in blocks:
+        if block.get("kind") == "question" and block.get("page") == page_no:
+            by_number.setdefault(block.get("number"), block)
+    for entry in entries:
+        number = entry["number"]
+        target = by_number.get(number)
+        if target is None and span and not span[0] <= number <= span[1]:
+            skipped += 1
+            continue
+        if target is not None:
+            if entry["stem"]:
+                target["text"] = persian.restore(entry["stem"])
+            if len(entry["options"]) >= len(target.get("options") or []):
+                target["options"] = [
+                    persian.restore("%d) %s" % (index, option))
+                    for index, option in enumerate(entry["options"], start=1)
+                    if option]
+            if entry["figure"]:
+                target["figure_bbox"] = entry["figure"]
+                target["figure_bboxes"] = [entry["figure"]]
+                target["figure_source"] = "organize"
+                target["has_figure"] = True
+            target["organized"] = True
+            replaced += 1
+            continue
+        options = ["%d) %s" % (index, option)
+                   for index, option in enumerate(entry["options"], start=1)
+                   if option]
+        block = _block("p%d-o%d" % (page_no, number), "question", page_no, 0,
+                       number=number, text=entry["stem"], options=options,
+                       source={"method": "organize", "page": page_no})
+        block["organized"] = True
+        if entry["figure"]:
+            block["figure_bbox"] = entry["figure"]
+            block["figure_bboxes"] = [entry["figure"]]
+            block["figure_source"] = "organize"
+            block["has_figure"] = True
+        blocks.append(block)
+        added += 1
+    return replaced, added, skipped
 
 
 def _vision_text(job_id, cfg, image_path, page_no):
@@ -335,7 +576,9 @@ def _vision_texts(cfg, image_paths, page_nos):
         batch = payloads[start:start + per_call]
         batch_pages = page_nos[start:start + per_call]
         blob = batch[0] if len(batch) == 1 else batch
-        result = llm.call_stage(cfg, "extract", OCR_PAGE_PROMPT, blob,
+        prompt = llm.stage_prompt(
+            cfg, "extract", prompts.get("studio.ocr", OCR_PAGE_PROMPT))
+        result = llm.call_stage(cfg, "extract", prompt, blob,
                                 "image/jpeg", raw=True)
         route = result.get("route") or route
         text = (result.get("text") or "").strip()
@@ -435,9 +678,16 @@ def _image_source_page(job_id, cfg, src):
 
 # ── the stage entry point ───────────────────────────────────────────────────
 
-def run(job_id, cfg, emit=None):
-    """Extract a job's source into layer1.json. Returns the job summary."""
+def run(job_id, cfg, emit=None, organize="auto"):
+    """Extract a job's source into layer1.json. Returns the job summary.
+
+    ``organize`` is the per-run choice for the text-lane model re-read:
+    ``auto`` (the default), ``off`` or ``all``.
+    """
     emit = emit or (lambda *args, **kwargs: None)
+    mode = (organize or "auto").strip().lower()
+    if mode not in ("auto", "off", "all"):
+        mode = "auto"
     src = workspace.source_path(job_id)
     if not src:
         raise ValueError("job has no source file")
@@ -447,7 +697,12 @@ def run(job_id, cfg, emit=None):
 
     assets, pages, blocks = [], [], []
     stats = {"text_pages": 0, "vision_pages": 0, "assets": 0, "calls": 0,
-             "blocks": 0, "joined": 0, "errors": []}
+             "blocks": 0, "joined": 0, "errors": [],
+             "organized_pages": 0, "organize_calls": 0,
+             "organized_blocks": 0, "organize_skipped": 0,
+             "organize_sanitized": 0, "organize_mode": mode,
+             "organize_errors": []}
+    layout_prev = None
 
     if os.path.splitext(src)[1].lower() == ".pdf":
         import pypdfium2 as pdfium
@@ -473,7 +728,11 @@ def run(job_id, cfg, emit=None):
                     page = doc[page_no - 1]
                     if counts[page_no - 1] >= probe_mod.TEXT_PAGE_MIN_CHARS:
                         results[page_no] = _text_page(
-                            job_id, page, page_no, page_no in key_pages, assets)
+                            job_id, page, page_no, page_no in key_pages, assets,
+                            start=layout_prev)
+                        record = results[page_no][0] or {}
+                        layout_prev = ((record.get("layout") or {}).get("last")
+                                       or layout_prev)
                         stats["text_pages"] += 1
                     else:
                         vision.append(page_no)
@@ -498,7 +757,9 @@ def run(job_id, cfg, emit=None):
                         emit("extract", "error",
                              "pages %d-%d: %s"
                              % (window["page_start"], window["page_end"],
-                                exc))
+                                exc),
+                             fault=studio_faults.payload(
+                                 studio_faults.classify(exc)))
                     stats["vision_pages"] += len(vision)
                     for page_no in vision:
                         text = texts.get(page_no) or ""
@@ -518,6 +779,26 @@ def run(job_id, cfg, emit=None):
                 for page_no in window["pages"]:
                     record, page_blocks = results[page_no]
                     _stamp_window(page_blocks, window)
+                    if _organize_enabled(cfg, record, page_blocks, mode):
+                        entries = _organize_page(
+                            cfg, job_id, doc[page_no - 1], page_no, record,
+                            emit, stats)
+                        layout_info = record.get("layout") or {}
+                        span = None
+                        if layout_info.get("anchors"):
+                            numbers = layout_info.get("numbers") or []
+                            if numbers:
+                                span = (min(numbers), max(numbers))
+                        replaced, added, skipped = _apply_organize(
+                            page_blocks, entries, page_no, span)
+                        stats["organize_skipped"] += skipped
+                        if entries:
+                            stats["organized_pages"] += 1
+                            stats["organized_blocks"] += replaced + added
+                            emit("extract", "info",
+                                 "organized page %s: %d question(s), "
+                                 "%d outside the page range"
+                                 % (page_no, len(entries), skipped))
                     pages.append(record)
                     blocks.extend(page_blocks)
         finally:
@@ -557,7 +838,7 @@ def run(job_id, cfg, emit=None):
     workspace.log_event(
         job_id, "extract", "success",
         "extracted %d block(s) - text pages %d, vision pages %d, "
-        "assets %d, joined %d"
+        "assets %d, joined %d, organized pages %d"
         % (len(blocks), stats["text_pages"], stats["vision_pages"],
-           stats["assets"], stats["joined"]))
+           stats["assets"], stats["joined"], stats["organized_pages"]))
     return {"job": workspace.summary(job_id), "stats": stats}

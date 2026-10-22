@@ -12,6 +12,14 @@ backups/
 # When each Gemini key was first saved (hashed ids only) — local, never committed
 .gemini-key-meta.json
 
+# User-edited LLM prompts (the Prompts view) — machine-local wording, the
+# built-in defaults stay in pipeline/prompts.py
+.prompt-overrides.json
+.prompt-overrides.json.tmp
+
+# The local-first studio review store — edits + crop verdicts before import.
+# (Lives inside workspace/<job>/review.json, which workspace/ already covers.)
+
 # Pipeline write-cache: extracted results that Postgres could not accept yet,
 # re-imported automatically at the end of the next run
 .pending-deferrals.json

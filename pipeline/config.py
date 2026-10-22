@@ -307,6 +307,9 @@ class Config:
     studio_chunk_images: int = 3
     studio_pages_per_call: int = 3
     studio_band_batch: int = 6
+    # Re-read a low-confidence text page with the extract model (image + the
+    # PDF's own text) instead of trusting the text layer's scrambled order.
+    studio_organize: int = 1
     # Vision pages are capped by pixels, not bytes: a sharp 3000 px page is
     # smaller than the old q20 4968 px one and gives every model more to see.
     studio_vision_long_edge: int = 3000
@@ -315,6 +318,22 @@ class Config:
     # bucket prefix standalone crops are uploaded under (Q8/Q11/Q3).
     studio_source_root: str = ""
     studio_crop_prefix: str = "crops"
+    # One pinned Gemini model per surface ("" -> walk the whole ladder). The
+    # picker offers "All" + the ladder models ENABLED in Credentials, so a
+    # single model can be exercised on its own instead of the round-robin.
+    gemini_pin: str = ""
+    studio_gemini_pin: str = ""
+    # How many consecutive page images of one paper the pipeline sends in a
+    # single OCR call (1 = the classic one picture per call).
+    ocr_pages_per_call: int = 1
+    # The floating AI assistant: its own OpenAI-compatible providers (one or
+    # many), each with a key and a model list, plus the one active model and
+    # its thinking level (never the OCR lanes). All empty -> "not configured".
+    assistant_url: str = ""
+    assistant_key: str = ""
+    assistant_model: str = ""        # "label::model" once a list is saved
+    assistant_providers: tuple = ()
+    assistant_effort: str = ""       # "" = the provider's own default
 
 
 def load_config() -> Config:
@@ -374,13 +393,34 @@ def load_config() -> Config:
         or os.path.join(input_root, "studio")
     crop_prefix = (os.getenv("STUDIO_CROP_PREFIX") or "crops").strip().strip("/")
     pages_per_call = max(1, min(8, int(os.getenv("STUDIO_PAGES_PER_CALL", "3"))))
+    # The pipeline's own pages-per-call: how many consecutive page images of
+    # one paper go into a single OCR call (1 keeps the classic behaviour).
+    ocr_pages_per_call = max(1, min(8, int(os.getenv("OCR_PAGES_PER_CALL", "1"))))
     band_batch = max(1, min(12, int(os.getenv("STUDIO_BAND_BATCH", "6"))))
+    organize = 1 if os.getenv("STUDIO_ORGANIZE", "1").strip() not in (
+        "0", "false", "False", "no", "off", "") else 0
     vision_edge = max(800, min(5000, int(os.getenv("STUDIO_VISION_LONG_EDGE",
                                                    "3000"))))
     vision_quality = max(50, min(95, int(os.getenv("STUDIO_VISION_QUALITY",
                                                     "88"))))
     chunk_images = max(1, min(12, int(os.getenv("STUDIO_CHUNK_IMAGES",
                                                 str(pages_per_call)))))
+    ladder = _model_ladder()
+    enabled_models = _enabled_models()
+
+    def _model_pin(name):
+        """A pinned ladder model, or "" (walk the ladder).
+
+        A pin that is no longer on the ladder — or was switched OFF in the
+        credential section — self-heals to "" instead of leaving a lane that
+        can never plan a call."""
+        want = (os.getenv(name) or "").strip()
+        if not want or want not in ladder:
+            return ""
+        if enabled_models is not None and want not in enabled_models:
+            return ""
+        return want
+
     return Config(
         input_root=input_root,
         min_age_seconds=int(os.getenv("MIN_AGE_SECONDS", "30")),
@@ -396,8 +436,10 @@ def load_config() -> Config:
         # Multi-key / multi-model Gemini routing (see pipeline.gemini_router).
         gemini_key_pool=_gemini_pool(),
         gemini_key_names=_csv(os.getenv("GEMINI_KEY_NAMES", "")),
-        gemini_model_ladder=_model_ladder(),
-        gemini_enabled_models=_enabled_models(),
+        gemini_model_ladder=ladder,
+        gemini_enabled_models=enabled_models,
+        gemini_pin=_model_pin("GEMINI_MODEL_PIN"),
+        studio_gemini_pin=_model_pin("STUDIO_GEMINI_MODEL_PIN"),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         # Resolved views: consumers (runner, vision, revision/audit) keep
@@ -425,7 +467,9 @@ def load_config() -> Config:
         studio_chunk_chars=int(os.getenv("STUDIO_CHUNK_CHARS", "24000")),
         studio_chunk_images=chunk_images,
         studio_pages_per_call=pages_per_call,
+        ocr_pages_per_call=ocr_pages_per_call,
         studio_band_batch=band_batch,
+        studio_organize=organize,
         studio_vision_long_edge=vision_edge,
         studio_vision_quality=vision_quality,
         studio_source_root=source_root,
@@ -442,4 +486,10 @@ def load_config() -> Config:
         revision_provider_enabled=_flag("REVISION_PROVIDER_ENABLED"),
         supabase_enabled=_flag("SUPABASE_ENABLED"),
         db_connections=_json_list("DB_CONNECTIONS"),
+        assistant_url=(os.getenv("ASSISTANT_URL") or "").strip(),
+        assistant_key=(os.getenv("ASSISTANT_API_KEY") or "").strip(),
+        assistant_model=(os.getenv("ASSISTANT_MODEL") or "").strip(),
+        assistant_providers=tuple(p for p in _json_list("ASSISTANT_PROVIDERS")
+                                  if isinstance(p, dict)),
+        assistant_effort=(os.getenv("ASSISTANT_EFFORT") or "").strip().lower(),
     )

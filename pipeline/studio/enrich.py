@@ -12,13 +12,16 @@ human must look at), ``missing`` (demanded fields still empty) and
 ready/warn rows and leaves the rest queued.
 """
 import json
+import re
 import time
 
 from pipeline import gemini as gemini_mod
+from pipeline import prompts
 from pipeline.revision.pairing import norm_scalar
 from pipeline.utils import to_english_digits
 
-from pipeline.studio import layout, llm, profile as profile_mod, tags, workspace
+from pipeline.studio import (faults as studio_faults, layout, llm,
+                             profile as profile_mod, tags, workspace)
 
 # Blocks per model call. Small enough that one bad reply loses little work.
 CHUNK = 10
@@ -48,6 +51,14 @@ Rules:
 - Persian stays Persian; keep ZWNJ half-spaces, punctuation and LaTeX as printed.
 - Never guess a value that is not visible in the block, and never copy one
   from a neighbouring question.
+- Never move stem or option content from one numbered question into another:
+  if a fragment clearly belongs to a different number, leave it out and set
+  that field missing.
+- An option belongs to the SAME numbered question as its stem. When the landed
+  options cannot be proven to belong to this question, output "" for every
+  option of this block instead of borrowing them from a neighbour.
+- Repair LaTeX/units only when the misreading is unambiguous (a split numeric
+  "138/6", a broken exponent). Never paraphrase, never translate.
 - Output no commentary, no markdown fences, nothing outside the JSON.
 """
 
@@ -73,7 +84,7 @@ def _payload(block):
 
 
 def _prompt(req, vocab, payload):
-    return (PROMPT_HEAD
+    return (prompts.get("studio.enrich", PROMPT_HEAD)
             + "\ndifficulties: " + json.dumps(list(layout._DIFFICULTY),
                                               ensure_ascii=False)
             + "\nrequested: " + json.dumps(req)
@@ -144,8 +155,10 @@ def _propose(block, field, value):
 # ── the model pass ──────────────────────────────────────────────────────────
 
 def _call_chunk(cfg, payload, req, vocab):
-    result = llm.call_stage(cfg, "enrich", _prompt(req, vocab, payload),
-                            raw=False)
+    result = llm.call_stage(
+        cfg, "enrich",
+        llm.stage_prompt(cfg, "enrich", _prompt(req, vocab, payload)),
+        raw=False)
     parsed = result.get("parsed")
     if not isinstance(parsed, dict):
         parsed = gemini_mod.extract_json(result.get("text") or "")
@@ -162,18 +175,41 @@ def _keep_text(old, new):
     return new, new.strip() != (old or "").strip()
 
 
+_OPTION_LABEL_RE = re.compile(r"^\s*\d{0,2}\s*[\)\.]\s*")
+_LETTER_LABEL_RE = re.compile(r"^[\u0621-\u064a]{1,3}\s*[\)\.]")
+
+
 def _fixes_options(block, patch):
     """Option texts: the model may repair one, never drop a landed one."""
     old = block.get("options") or []
     new = patch.get("options")
     if not isinstance(new, list) or not any(str(o).strip() for o in new):
         return
+    if len(new) > 4:
+        # An exam question has at most four options. A longer list means the
+        # patch swallowed a neighbour's options; keep the landed set.
+        if "options beyond 4" not in block["issues"]:
+            block["issues"].append("options beyond 4")
+        return
     cleaned = [_keep_text(old[i] if i < len(old) else None,
                           new[i] if i < len(new) else None)[0]
                for i in range(max(len(old), len(new)))]
     if [str(o).strip() for o in cleaned] != [str(o).strip() for o in old]:
         block["fixes"].append("options repaired")
-    block["options"] = [str(o).strip() for o in cleaned if str(o).strip()]
+    cleaned = [layout.one_line(o) for o in cleaned]
+    # Options carry their printed label canonically. The model's reply
+    # style (bare "6" or "1) 6") may differ run to run, so a numeric set
+    # is rebuilt from the landed order; a letter-labelled set (الف/ب/ج/د)
+    # carries its own order and answer linkage, so it is kept verbatim.
+    if any(_LETTER_LABEL_RE.match(str(o)) for o in cleaned):
+        block["options"] = [str(o).strip() for o in cleaned
+                           if str(o).strip()]
+        return
+    bare = [_OPTION_LABEL_RE.sub("", str(o).strip())
+            for o in cleaned]
+    block["options"] = ["%d) %s" % (index, text.strip())
+                       for index, text in enumerate(bare, start=1)
+                       if text.strip()]
 
 
 def _apply(block, patch, profile, tag_list, vocab):
@@ -184,6 +220,17 @@ def _apply(block, patch, profile, tag_list, vocab):
     if changed:
         block["fixes"].append("stem repaired")
     block["text"] = text
+
+    # A stem the print wrapped mid-sentence leaves enrich as one flow.
+    flowed = "\n".join(layout.reflow_lines(
+        (block["text"] or "").split("\n")))
+    if flowed != block["text"]:
+        block["fixes"].append("stem reflowed")
+        block["text"] = flowed
+    options = [layout.one_line(o) for o in block.get("options") or []]
+    if options != [str(o) for o in block.get("options") or []]:
+        block["fixes"].append("options reflowed")
+        block["options"] = options
 
     _fixes_options(block, patch)
 
@@ -222,9 +269,9 @@ def _apply(block, patch, profile, tag_list, vocab):
         else:
             _propose(block, "topic", wanted)
 
-    extra = {str(f).strip() for f in patch.get("missing") or []
-             if str(f).strip() in FIELDS}
-    block["missing"] = sorted(set(block["missing"]) | extra)
+    # ``missing`` is recomputed from the landed values in ``_health`` after
+    # the whole patch is applied. The model's own claims are NOT trusted: a
+    # value it just filled used to stay listed as missing forever.
 
 
 # ── the answer key ──────────────────────────────────────────────────────────
@@ -280,16 +327,43 @@ def _field_value(block, field):
     return block.get(field) if field in FIELDS else None
 
 
-def _health(block, req, profile):
-    """(status, issues) — the pre-import check every row goes through."""
+# A printed metadata line is the only place corp/year can come from. When the
+# whole job lacks one, no row can supply those fields, so their absence is a
+# job-level note (merge.merged carries it) and not one warning per row.
+SOFT_METADATA = ("corp", "year")
+
+
+def _job_soft(blocks):
+    """Metadata fields absent from EVERY question - unknowable for this job."""
+    absent = set(SOFT_METADATA)
+    for block in blocks or []:
+        if block.get("kind") != "question":
+            continue
+        for field in SOFT_METADATA:
+            if _field_value(block, field):
+                absent.discard(field)
+    return absent
+
+
+def _health(block, req, profile, soft=()):
+    """(status, issues) - the pre-import check every row goes through.
+
+    ``error`` is reserved for a row that is structurally broken - an empty
+    stem, no options.  A gap in a demanded field is a ``warn``: the review
+    queue must see it, but the row still imports.  A field in ``soft`` is one
+    the whole job cannot supply (no printed metadata line) - its absence is
+    shown in ``missing`` yet does not downgrade the row to ``warn``.
+    """
     issues = list(block["issues"])
     kind = block.get("kind")
     if kind == "question":
-        block["missing"] = sorted(
-            set(block["missing"]) | {f for f in req
-                                     if not _field_value(block, f)})
+        # Computed exactly once, from the values the row actually lands: the
+        # model's own "missing" claims and any stale stored list never decide
+        # this. A field a patch just filled must stop being listed.
+        block["missing"] = [f for f in req if not _field_value(block, f)]
     else:
         block["missing"] = []
+    hard = [f for f in block["missing"] if f not in soft]
 
     if kind == "question":
         if not (block.get("text") or "").strip():
@@ -305,15 +379,20 @@ def _health(block, req, profile):
         if not _label(block.get("label")):
             issues.append("no answer label")
 
+    if layout.mid_sentence_breaks(block.get("text") or ""):
+        issues.append("coherence")
+
     for entry in block["proposed"]:
         issues.append("%s not in the tag list" % entry.get("field"))
 
     if not block.get("number") and kind in ("question", "answer_key_entry"):
         issues.append("no question number")
 
-    if kind == "question" and ("empty stem" in issues or block["missing"]):
+    if kind == "question" and "empty stem" in issues:
         status = "error"
-    elif issues:
+    elif issues or hard:
+        # A metadata gap the job cannot supply is a note, not a wall; any
+        # other gap still keeps the row in the review queue.
         status = "warn"
     else:
         status = "ready"
@@ -355,7 +434,8 @@ def run(job_id, cfg, emit=None):
             patches = {}
             stats["errors"].append({"blocks": [b["key"] for b in chunk],
                                     "error": str(exc)})
-            emit("enrich", "error", "chunk at block %d: %s" % (start + 1, exc))
+            emit("enrich", "error", "chunk at block %d: %s" % (start + 1, exc),
+                 fault=studio_faults.payload(studio_faults.classify(exc)))
         for block in chunk:
             patch = patches.get(block["key"])
             if patch is None:
@@ -364,11 +444,13 @@ def run(job_id, cfg, emit=None):
                 _apply(block, patch, profile, tag_list, vocab)
 
     stats["answers_linked"] = _link_answers(blocks)
+    soft = _job_soft(blocks)
+    stats["metadata_missing"] = sorted(soft)
 
     for block in blocks:
         block["tags"] = [v for v in (block.get("subject"), block.get("topic"))
                          if v]
-        status, issues = _health(block, req, profile)
+        status, issues = _health(block, req, profile, soft)
         block["status"] = status
         block["issues"] = issues
         block["needs_human"] = status != "ready"

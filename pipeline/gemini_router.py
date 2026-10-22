@@ -1,4 +1,4 @@
-"""Key × model routing for Gemini, built to spend the fewest possible calls.
+﻿"""Key × model routing for Gemini, built to spend the fewest possible calls.
 
 The production problem
 ----------------------
@@ -392,7 +392,7 @@ class GeminiRouter:
             self._usage_save()
 
     def _count_send(self, key, model, tokens_in=0, tokens_out=0,
-                     ms=0.0, key_name="", ok=True):
+                     ms=0.0, key_name="", ok=True, source="pipeline"):
         """Append one COMPLETED (successful) send to the per-call history.
 
         The daily gauge is NOT bumped here: _count_attempt already counted
@@ -402,7 +402,7 @@ class GeminiRouter:
         not a row)."""
         self._calls_append(key, model, tokens_in=tokens_in,
                            tokens_out=tokens_out, ms=ms,
-                           key_name=key_name, ok=ok)
+                           key_name=key_name, ok=ok, source=source)
 
     def _calls_load(self):
         """Per-call history rows (newest last), tolerant of corruption."""
@@ -414,7 +414,7 @@ class GeminiRouter:
             return []
 
     def _calls_append(self, key, model, tokens_in=0, tokens_out=0,
-                      ms=0.0, key_name="", ok=True):
+                      ms=0.0, key_name="", ok=True, source="pipeline"):
         """Append one history row atomically; failures are swallowed
         (history is a gauge, never worth breaking a run).
 
@@ -435,6 +435,11 @@ class GeminiRouter:
                     "tokens_out": int(tokens_out or 0),
                     "ms": round(float(ms or 0.0), 1),
                     "ok": bool(ok),
+                    # Which surface made the call: "pipeline" (OCR runs),
+                    # "studio" (any studio stage), "9router" (custom lane).
+                    # The Usage tab shows it, so studio calls are readable
+                    # as studio calls instead of anonymous pool rows.
+                    "source": source or "pipeline",
                 })
                 del rows[:-CALLS_CAP]
                 path = _calls_path()
@@ -455,14 +460,29 @@ class GeminiRouter:
         if hours is not None:
             cutoff = time.time() - hours * 3600
             rows = [r for r in rows if r.get("ts", 0) >= cutoff]
-        # 9router is a routing helper, not a model-usage series — keep its rows
-        # out of BOTH the chart and the table (item 4.2).
-        rows = [r for r in rows if (r.get("key_name") or "") != "9router"]
+        # 9router is the PIPELINE's routing helper, not a model-usage series —
+        # keep those rows out of BOTH the chart and the table (item 4.2). A
+        # STUDIO call through its own 9router provider is real studio usage
+        # (that is the studio's default lane), so dropping by key_name alone is
+        # what made the Usage tab look empty after a studio run.
+        rows = [r for r in rows
+                if not ((r.get("key_name") or "") == "9router"
+                        and (r.get("source") or "pipeline") == "pipeline")]
         totals = {"calls": len(rows),
                   "errors": sum(1 for r in rows if not r.get("ok")),
                   "tokens_in": sum(r.get("tokens_in", 0) for r in rows),
                   "tokens_out": sum(r.get("tokens_out", 0) for r in rows),
-                  "ms": round(sum(r.get("ms", 0.0) for r in rows), 1)}
+                  "ms": round(sum(r.get("ms", 0.0) for r in rows), 1),
+                  # Per-surface split: the pipeline's own calls next to the
+                  # studio's, so "did the studio run show up?" is answerable
+                  # at a glance instead of by eye over the table.
+                  "by_source": {}}
+        for row in rows:
+            src = row.get("source") or "pipeline"
+            bucket = totals["by_source"].setdefault(src, {"calls": 0, "tokens": 0})
+            bucket["calls"] += 1
+            bucket["tokens"] += int(row.get("tokens_in") or 0) \
+                + int(row.get("tokens_out") or 0)
         return {"period": period, "calls": rows, "totals": totals}
 
     def _usage_of(self, key):
@@ -516,8 +536,13 @@ class GeminiRouter:
                 blocked = st.get("blocked", {})
                 last = st.get("ok_model", "")
                 enabled = getattr(cfg, "gemini_enabled_models", None)
+                # The surface's model picker: "" walks the whole ladder
+                # (round-robin), a name pins every call to that ONE model so
+                # its behaviour can be judged on its own.
+                pin = (getattr(cfg, "gemini_pin", "") or "").strip()
                 ladder = [m for m in cfg.gemini_model_ladder
                           if (enabled is None or m in enabled)
+                          and (not pin or m == pin)
                           and now >= blocked.get(m, 0.0)
                           and not self._spent_today(key, m)]
                 if not ladder:
@@ -591,7 +616,7 @@ class GeminiRouter:
                 st["penalty_until"] = now + PENALTY_WINDOW
 
     def _mark_ok(self, key, model, now=None, elapsed_ms=None,
-                 tokens_in=0, tokens_out=0, key_name=""):
+                 tokens_in=0, tokens_out=0, key_name="", source="pipeline"):
         now = now if now is not None else time.time()
         st = self._entry(key)
         with self._lock:
@@ -609,7 +634,7 @@ class GeminiRouter:
                                  + (1.0 - LATENCY_ALPHA) * old) \
                     if old else elapsed_ms
         self._count_send(key, model, tokens_in=tokens_in, tokens_out=tokens_out,
-                         ms=elapsed_ms or 0.0, key_name=key_name)
+                         ms=elapsed_ms or 0.0, key_name=key_name, source=source)
         # Criterion 10: the 0/20 bars update on EVERY call, not just
         # health-checks. main.py sets router.on_usage to a hub.emit
         # closure; the router itself stays UI-agnostic (no hub import,
@@ -625,7 +650,7 @@ class GeminiRouter:
     def call(self, cfg, prompt, data_b64, mime_type,
              temperature=0.1, max_tokens=16384, retries=None,
              on_problem=None, on_route=None, labels=None,
-             json_mode=False, thinking=None):
+             json_mode=False, thinking=None, source="pipeline"):
         """Run real work through the best key×model, rotating on failure.
 
         Returns (parsed_json, raw_text, route) where `route` is
@@ -663,7 +688,10 @@ class GeminiRouter:
                 flt,
                 "Every model version is unavailable or out of daily sends for "
                 "every key — check the Credentials bars; the cap resets with "
-                "Google's daily window, or add more keys.")
+                "Google's daily window, or add more keys."
+                + (" (the model picker is pinned to %s — set it back to All to "
+                   "use the whole ladder)" % cfg.gemini_pin
+                   if (getattr(cfg, "gemini_pin", "") or "").strip() else ""))
 
         last_flt = faults.fault("unknown")
         tried = 0
@@ -716,7 +744,7 @@ class GeminiRouter:
                 self._mark_ok(key, model, elapsed_ms=elapsed_ms,
                               tokens_in=(usage or {}).get("tokens_in", 0),
                               tokens_out=(usage or {}).get("tokens_out", 0),
-                              key_name=label)
+                              key_name=label, source=source)
                 # This key just succeeded: start the NEXT call from
                 # the following pool position, so healthy keys share
                 # the files instead of key #1 taking them all.
@@ -739,7 +767,7 @@ class GeminiRouter:
     def call_pinned(self, cfg, key, prompt, data_b64, mime_type,
                     temperature=0.1, max_tokens=16384, retries=None,
                     on_problem=None, on_route=None, labels=None,
-                    json_mode=False, thinking=None):
+                    json_mode=False, thinking=None, source="pipeline"):
         """Same contract as call(), but PINNED to one key: it walks only that
         key's own ladder (blocked models / spent day caps / sticky model all
         honoured) and never rotates to another key. Does NOT touch
@@ -759,7 +787,10 @@ class GeminiRouter:
             flt["exhausted"] = True
             raise faults.FaultError(
                 flt, f"Key {mask(key)} has no usable model left today — "
-                     "every model is blocked or capped.")
+                     "every model is blocked or capped."
+                     + (" (the model picker is pinned to %s)" % cfg.gemini_pin
+                        if (getattr(cfg, "gemini_pin", "") or "").strip()
+                        else ""))
         pool = list(cfg.gemini_key_pool)
         label = self._label(cfg, pool.index(key) if key in pool else 0, key)
         quality_retried = set()
@@ -806,7 +837,7 @@ class GeminiRouter:
                 self._mark_ok(key, model, elapsed_ms=elapsed_ms,
                               tokens_in=(usage or {}).get("tokens_in", 0),
                               tokens_out=(usage or {}).get("tokens_out", 0),
-                              key_name=label)
+                              key_name=label, source=source)
                 return parsed, text, {"key": mask(key), "label": label,
                                       "model": model, "attempts": tried}
         # The pinned key's whole ladder failed for this file. If the key still

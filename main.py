@@ -222,6 +222,213 @@ async def usage_report(period: str = "all", group: str = "model", y: str = "call
     report["chart"] = usage_chart(report.get("calls") or [], group=group, y=y)
     return JSONResponse(report)
 
+
+# ════════════════ PIPELINE · pages per call (one-by-one engine) ════════════════
+# How many consecutive page images of one paper go into a single OCR call.
+# 1 keeps the classic one-picture-at-a-time behaviour.
+
+class PipelineSettings(BaseModel):
+    pages_per_call: int | None = None
+
+
+@app.get("/api/pipeline/settings")
+async def pipeline_settings():
+    return JSONResponse({"ok": True,
+                         "pages_per_call": int(getattr(cfg, "ocr_pages_per_call", 1) or 1),
+                         "max_pages": 8})
+
+
+@app.post("/api/pipeline/settings")
+async def pipeline_settings_save(body: PipelineSettings):
+    global cfg
+    value = max(1, min(8, int(body.pages_per_call or 1)))
+    envfile.update_env_file(ENV_PATH, {"OCR_PAGES_PER_CALL": str(value)})
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    return JSONResponse({"ok": True, "pages_per_call": cfg.ocr_pages_per_call,
+                         "max_pages": 8})
+
+
+# ════════════════ PROMPTS · every LLM instruction, editable ════════════════
+# The defaults live in code (pipeline/prompts.py's catalog); an override is a
+# local JSON file beside the usage history, applied to the NEXT call.
+
+class PromptSave(BaseModel):
+    id: str
+    text: str = ""
+
+
+class PromptReset(BaseModel):
+    id: str | None = None
+
+
+@app.get("/api/prompts")
+async def prompts_get():
+    from pipeline import prompts as prompts_mod
+    return JSONResponse({"ok": True, "prompts": prompts_mod.view()})
+
+
+@app.post("/api/prompts")
+async def prompts_save(body: PromptSave):
+    from pipeline import prompts as prompts_mod
+    known = {p["id"]: p for p in prompts_mod.view()}
+    if body.id not in known:
+        return JSONResponse({"ok": False, "error": "Unknown prompt id."},
+                            status_code=404)
+    text = body.text or ""
+    # identical to the built-in default -> no override at all, so a later
+    # default edit in the code shows through
+    if text.strip() == (known[body.id].get("default") or "").strip():
+        text = ""
+    prompts_mod.save(body.id, text)
+    return JSONResponse({"ok": True, "prompts": prompts_mod.view()})
+
+
+@app.post("/api/prompts/reset")
+async def prompts_reset(body: PromptReset):
+    from pipeline import prompts as prompts_mod
+    if body.id:
+        prompts_mod.clear(body.id)
+    else:
+        prompts_mod.clear_all()
+    return JSONResponse({"ok": True, "prompts": prompts_mod.view()})
+
+
+# ════════════════ ASSISTANT · the floating help chat ════════════════
+# Its own endpoint/key/model in .env. The key never reaches the browser: this
+# route relays the upstream SSE stream as our own text/thinking events.
+
+class AssistantConfig(BaseModel):
+    url: str | None = None
+    key: str | None = None      # None/__KEEP__ keeps, "" clears, else the new key
+    model: str | None = None
+    # The provider list: [{label, base_url, api_key, models}]. api_key follows
+    # the same KEEP / "KEEP:<label>" / literal rule as the studio providers.
+    providers: list[dict] | None = None
+    effort: str | None = None   # "" | minimal | low | medium | high
+    active: str | None = None   # "label::model" — the picker's current pick
+
+
+class AssistantChat(BaseModel):
+    messages: list[dict] = []
+
+
+class AssistantProbe(BaseModel):
+    label: str = ""
+
+
+@app.get("/api/assistant/config")
+async def assistant_config_get():
+    from pipeline import assistant
+    return JSONResponse(assistant.config_view(cfg))
+
+
+def _merge_assistant_providers(stored, incoming):
+    """Fold the submitted assistant providers over the stored ones (KEEP rule)."""
+    from pipeline import assistant
+    by_label = {p.get("label"): p for p in stored or [] if isinstance(p, dict)}
+    out, seen = [], set()
+    for raw in incoming or []:
+        if not isinstance(raw, dict):
+            continue
+        label = str(raw.get("label") or "").strip()
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        prev = by_label.get(label) or {}
+        key = str(raw.get("api_key", KEEP) or KEEP)
+        if key == "__CLEAR__":
+            key = ""
+        elif key == KEEP:
+            key = prev.get("api_key", "")
+        elif key.startswith(KEEP + ":"):
+            key = (by_label.get(key.split(":", 1)[1]) or {}).get("api_key", "")
+        models = [assistant.clean_model_name(m) for m in raw.get("models") or []]
+        models = [m for m in models if m]
+        out.append({"label": label,
+                    "base_url": str(raw.get("base_url") or "").strip(),
+                    "api_key": key,
+                    "models": list(dict.fromkeys(models))})
+    return out
+
+
+@app.post("/api/assistant/config")
+async def assistant_config_save(body: AssistantConfig):
+    from pipeline import assistant
+    global cfg
+    updates = {}
+    stored = list(getattr(cfg, "assistant_providers", ()) or ())
+    if body.providers is not None:
+        providers = _merge_assistant_providers(stored, body.providers)
+        updates["ASSISTANT_PROVIDERS"] = json.dumps(providers,
+                                                    ensure_ascii=False)
+        labels = [p["label"] for p in providers]
+        want = (body.active or (getattr(cfg, "assistant_model", "") or "")).strip()
+        label, model = assistant.split_id(want)
+        if label not in labels or not model:
+            first = providers[0] if providers else None
+            pick = first["models"][0] if (first and first["models"]) else ""
+            updates["ASSISTANT_MODEL"] = (assistant.model_id(first["label"], pick)
+                                          if first else "")
+        else:
+            updates["ASSISTANT_MODEL"] = assistant.model_id(label, model)
+    else:
+        # legacy single-endpoint fields stay writable on their own
+        if body.url is not None:
+            updates["ASSISTANT_URL"] = body.url.strip()
+        if body.active:
+            updates["ASSISTANT_MODEL"] = body.active.strip()
+        elif body.model is not None and getattr(cfg, "assistant_url", "").strip():
+            # with a legacy endpoint and no saved list, a bare model is the id
+            updates["ASSISTANT_MODEL"] = body.model.strip()
+    if body.key is not None:
+        key = body.key.strip()
+        if key == "":
+            updates["ASSISTANT_API_KEY"] = ""
+        elif key != KEEP:
+            updates["ASSISTANT_API_KEY"] = key
+    if body.effort is not None:
+        effort = body.effort.strip().lower()
+        updates["ASSISTANT_EFFORT"] = effort if effort in assistant.EFFORTS else ""
+    if updates:
+        envfile.update_env_file(ENV_PATH, updates)
+        load_dotenv(ENV_PATH, override=True)
+        cfg = load_config()
+    return JSONResponse(assistant.config_view(cfg))
+
+
+@app.post("/api/assistant/models")
+async def assistant_models(body: AssistantProbe):
+    """The provider's own model list (masked config, one metadata GET)."""
+    from pipeline import assistant
+    provider = next((p for p in assistant._providers(cfg)
+                     if p["label"] == body.label.strip()), None)
+    if provider is None:
+        return JSONResponse({"ok": False, "error": "no such provider",
+                             "models": []}, status_code=404)
+    report = await asyncio.to_thread(assistant.fetch_models, provider)
+    models = report.get("models") or []
+    if isinstance(models, list):
+        models = [m.get("id") if isinstance(m, dict) else str(m) for m in models]
+    return JSONResponse({"ok": bool(report.get("ok")), "models": models,
+                         "status": report.get("status"),
+                         "detail": report.get("detail") or report.get("error") or ""})
+
+
+@app.post("/api/assistant/chat")
+async def assistant_chat(body: AssistantChat):
+    """Stream the assistant's reply (text + reasoning) to the floating chat."""
+    from pipeline import assistant
+    from fastapi.responses import StreamingResponse
+
+    def events():
+        for event in assistant.stream(cfg, body.messages):
+            yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+
 class StatusUpdate(BaseModel):
     table: str
     id: str
@@ -666,11 +873,19 @@ def _merge_providers(stored, incoming):
             else:
                 key = stored[j].get("api_key", "") if 0 <= j < len(stored) else ""
         men = raw.get("models_enabled")
+        models = [str(m).strip() for m in (raw.get("models") or [])] \
+            if isinstance(raw.get("models"), list) else []
+        models = [m for m in models if m]
         out.append({"label": label,
                     "base_url": str(raw.get("base_url", "")).strip().rstrip("/"),
                     "api_key": key,
                     "model": str(raw.get("model", "")).strip(),
-                    "models": list(raw.get("models") or []) if isinstance(raw.get("models"), list) else [],
+                    # a model typed only as the DEFAULT is part of the list
+                    # too — picking one must never make another disappear
+                    "models": models + ([str(raw.get("model", "")).strip()]
+                                        if str(raw.get("model", "")).strip()
+                                        and str(raw.get("model", "")).strip()
+                                        not in models else []),
                     "models_enabled": [str(m).strip() for m in men if str(m).strip()] if isinstance(men, list) else None})
     seen, dedup = set(), []
     for p in out:
@@ -685,13 +900,17 @@ def _merge_providers(stored, incoming):
     for p in dedup:
         url = p.get("base_url") or ""
         if ("127.0.0.1:20128" in url or "localhost:20128" in url
-                or p.get("label") == "9router"):
-            if not kept:
-                p["label"] = "9router"
-                p["base_url"] = "http://127.0.0.1:20128/v1"
-                kept = (p,)
+                or p.get("label") == "9router"
+                or url.startswith("https://openrouter.ai")):
+            if all(k.get("base_url") != p.get("base_url") for k in kept):
+                if "openrouter.ai" in (p.get("base_url") or ""):
+                    p["label"] = p.get("label") or "openrouter"
+                else:
+                    p["label"] = "9router"
+                    p["base_url"] = "http://127.0.0.1:20128/v1"
+                kept = tuple(kept) + (p,)
         else:
-            print(f"[credentials] dropping non-9router provider "
+            print(f"[credentials] dropping unsupported provider "
                   f"'{p.get('label', '')}' ({url}) - custom kind removed (Q2)")
     return kept
 
@@ -792,6 +1011,50 @@ def _credentials_view():
             row["added"] = (entry.get("added", "")
                             if isinstance(entry, dict) else entry) or ""
     return st
+
+
+def _gemini_model_choices():
+    """The Gemini models a picker may offer: the ladder ∩ the enabled toggles.
+
+    Same source the credential section's model toggles write, so the dropdown
+    can never offer a model the router would refuse to call."""
+    ladder = list(cfg.gemini_model_ladder)
+    enabled = getattr(cfg, "gemini_enabled_models", None)
+    if enabled is None:
+        return ladder
+    return [m for m in ladder if m in enabled]
+
+
+class ModelPinSave(BaseModel):
+    pin: str = ""            # "" -> All (the round-robin ladder)
+    surface: str = "pipeline"
+
+
+@app.get("/api/gemini/pin")
+async def gemini_pin_get():
+    """The pipeline's Gemini model picker: options + the saved pin."""
+    return JSONResponse({"ok": True, "pin": cfg.gemini_pin,
+                         "models": _gemini_model_choices(),
+                         "studio_pin": cfg.studio_gemini_pin})
+
+
+@app.post("/api/gemini/pin")
+async def gemini_pin_save(body: ModelPinSave):
+    """Pin the pipeline OCR lane (or the studio lane) to ONE Gemini model."""
+    global cfg
+    surface = (body.surface or "pipeline").strip().lower()
+    key = "STUDIO_GEMINI_MODEL_PIN" if surface == "studio" else "GEMINI_MODEL_PIN"
+    pin = (body.pin or "").strip()
+    if pin and pin not in _gemini_model_choices():
+        return JSONResponse(
+            {"ok": False, "error": f"'{pin}' is not an enabled Gemini model."},
+            status_code=400)
+    envfile.update_env_file(ENV_PATH, {key: pin})
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    return JSONResponse({"ok": True, "saved": True, "pin": cfg.gemini_pin,
+                         "studio_pin": cfg.studio_gemini_pin,
+                         "models": _gemini_model_choices()})
 
 
 @app.get("/api/credentials")
@@ -1181,6 +1444,30 @@ async def profiles_test(body: ProfileTest):
     return JSONResponse(report)
 
 
+@app.get("/api/proxy/check")
+async def proxy_check():
+    """Probe googleapis.com through EVERY enabled proxy profile.
+
+    One keyless gateway probe per profile - the same one the lanes use, so a
+    verdict here means a verdict there. No model, no key, no tokens.
+    """
+    results = []
+    for profile in cfg.proxy_profiles:
+        if not profile.get("enabled", True):
+            continue
+        try:
+            report = await asyncio.to_thread(gemini_mod.test_proxy, profile)
+        except Exception as exc:                 # pragma: no cover
+            report = {"reachable": False, "kind": "unknown",
+                      "detail": str(exc)}
+        results.append({"name": profile.get("name", ""),
+                        "ok": bool(report.get("reachable")),
+                        "kind": report.get("kind") or "",
+                        "detail": report.get("detail") or ""})
+    return JSONResponse({"ok": True, "active": cfg.proxy_active,
+                         "results": results})
+
+
 @app.post("/api/review/bbox")
 async def review_bbox(body: BboxUpdate):
     try:
@@ -1365,13 +1652,19 @@ async def _studio_call(func, *args):
     return JSONResponse({"ok": True, **result})
 
 
+class StudioExtractBody(BaseModel):
+    organize: str = "auto"          # auto | off | all, per run
+
+
 @app.post("/api/studio/jobs/{job_id}/extract")
-async def studio_extract(job_id: str):
+async def studio_extract(job_id: str,
+                         body: StudioExtractBody = StudioExtractBody()):
     """Stage 1 — source → layer1 (text lane deterministic, image lane OCR)."""
     from pipeline.studio import jobs as studio_jobs_mod
     if not _studio_exists(job_id):
         return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
-    return await _studio_call(studio_jobs_mod.run_extract, hub, job_id, cfg)
+    return await _studio_call(studio_jobs_mod.run_extract, hub, job_id,
+                              cfg, body.organize)
 
 
 @app.post("/api/studio/jobs/{job_id}/enrich")
@@ -1405,6 +1698,7 @@ async def studio_import(job_id: str, body: StudioImportBody):
 @app.get("/api/studio/jobs/{job_id}/bulk")
 async def studio_bulk(job_id: str):
     """The merged bulk view (layer2 + geometry + review) + import state."""
+    from pipeline.studio import drafts
     from pipeline.studio import importers as importers_mod
     from pipeline.studio import merge
     from pipeline.studio import workspace
@@ -1416,12 +1710,110 @@ async def studio_bulk(job_id: str):
             workspace.read_artifact, job_id, "imports") or {}
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    # the Import table rides along: the pane paints rows from the same answer
+    # it already fetched, so opening a job costs one request, not two
+    results = imports.get("results") or {}
+    runs = imports.get("runs") or []
+    target = (runs[-1].get("target") if runs else "") or "supabase"
+    rows = []
+    for b in view.get("blocks") or []:
+        row = _import_row(b, target, results.get(b.get("key")))
+        row["job"], row["job_name"] = job_id, workspace.source_name(job_id) or job_id
+        rows.append(row)
     return JSONResponse({"ok": True, "view": view,
+                         "scorecard": view.get("scorecard"),
                          "targets": importers_mod.targets(),
-                         "results": imports.get("results") or {},
-                         "runs": imports.get("runs") or [],
+                         "results": results,
+                         "runs": runs,
+                         "rows": rows,
+                         "row_totals": {"rows": len(rows),
+                                        "importable": sum(1 for r in rows if r["ok"]),
+                                        "blocked": sum(1 for r in rows if not r["ok"])},
+                         "drafts": drafts.staged(job_id),
                          "settings": _studio_batch_view()})
 
+def _import_row(b, target, mark):
+    """One Import-table row: exactly what a run would write, verdict included."""
+    from pipeline.studio import merge
+    crop = b.get("crop") or {}
+    ok, why = merge.importable(b)
+    answered = bool(b.get("answer") or b.get("answer_key"))
+    row = {"job": b.get("job") or "", "key": b.get("key") or "",
+           "kind": b.get("kind") or "", "number": b.get("number"),
+           "page": b.get("page"), "text": b.get("text") or "",
+           "options": list(b.get("options") or []),
+           "subject": b.get("subject"), "topic": b.get("topic"),
+           "corp": b.get("corp"), "year": b.get("year"),
+           "difficulty": b.get("difficulty"), "status": b.get("status") or "",
+           "has_picture": bool(crop.get("needed")),
+           "picture": ("approved" if crop.get("approved")
+                       else "external" if crop.get("external") else "pending")
+                      if crop.get("needed") else "none",
+           "answered": answered, "issues": list(b.get("issues") or []),
+           "ok": bool(ok), "why": why or "",
+           "result": (mark or {}).get("status") or "",
+           "target": target}
+    return row
+
+@app.get("/api/studio/import/rows")
+async def studio_import_rows(job: str = "", others: int = 0):
+    """The Import tab's table: the rows a run WILL write, not a count.
+
+    Scope is the open job plus (``others=1``) every other processed job, so
+    one table can show one file's rows or the whole studio's together —
+    each row names the file it came from.
+    """
+    from pipeline.studio import importers as importers_mod
+    from pipeline.studio import merge, workspace
+
+    def _rows():
+        ids = []
+        if job and _studio_exists(job):
+            ids.append(job)
+        if others:
+            ids.extend(j.get("id") for j in workspace.list_jobs()
+                       if j.get("id") != job)
+        out = []
+        for job_id in ids:
+            try:
+                view = merge.merged(job_id)
+                imports = workspace.read_artifact(job_id, "imports") or {}
+            except Exception:
+                continue
+            results = imports.get("results") or {}
+            runs = imports.get("runs") or []
+            target = (runs[-1].get("target") if runs else "") or "supabase"
+            name = workspace.source_name(job_id) or job_id
+            for b in view.get("blocks") or []:
+                row = _import_row(b, target, results.get(b.get("key")))
+                row["job"], row["job_name"] = job_id, name
+                out.append(row)
+        return out
+
+    rows = await asyncio.to_thread(_rows)
+    totals = {"rows": len(rows), "importable": sum(1 for r in rows if r["ok"]),
+              "blocked": sum(1 for r in rows if not r["ok"])}
+    return JSONResponse({"ok": True, "rows": rows,
+                         "targets": importers_mod.targets(), "totals": totals})
+
+
+@app.get("/api/studio/jobs/{job_id}/log")
+async def studio_log(job_id: str, limit: int = 300):
+    """The job's own log.jsonl - the studio log panel's history.
+
+    Every stage emit lands in this file (with its classified fault), so the
+    panel can rebuild a finished run after a reload; the live websocket
+    stream only carries what happens next.
+    """
+    from pipeline.studio import workspace
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        limit = max(1, min(int(limit or 300), 1000))
+        lines = await asyncio.to_thread(workspace.read_log, job_id, limit)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "job": job_id, "lines": lines})
 
 @app.get("/api/studio/jobs/{job_id}/crop/{key}")
 async def studio_crop(job_id: str, key: str):
@@ -1440,6 +1832,28 @@ async def studio_crop(job_id: str, key: str):
     return FileResponse(path, media_type="image/jpeg",
                         headers={"Cache-Control": "no-store"})
 
+
+@app.get("/api/studio/jobs/{job_id}/preview/{page}")
+async def studio_page_preview(job_id: str, page: int):
+    """One page as a small JPEG — the Inspect editor's crop overlay.
+
+    The crop itself is a finished picture, so the box editor needs the page it
+    was cut from; a capped copy keeps the pop-up light and is cached per job
+    until the job's lane/prompt is saved again (lane.save drops it).
+    """
+    from pipeline.studio import lane
+    if not _studio_exists(job_id) or page < 1:
+        return JSONResponse({"ok": False, "error": "no such page"},
+                            status_code=404)
+    try:
+        path = await asyncio.to_thread(lane.render_preview, job_id, page)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    if not os.path.isfile(path):
+        return JSONResponse({"ok": False, "error": "preview not available"},
+                            status_code=404)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
 
 @app.post("/api/studio/jobs/{job_id}/crop/{key}")
 async def studio_crop_upload(job_id: str, key: str, body: StudioCropBody):
@@ -1476,6 +1890,119 @@ async def studio_crop_upload(job_id: str, key: str, body: StudioCropBody):
 
     try:
         result = await asyncio.to_thread(_run)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, **result})
+
+
+class StudioCommitBody(BaseModel):
+    """Body of POST /api/studio/jobs/{job}/commit - the Inspect approval."""
+    edits: dict[str, dict] = {}
+    crops: dict[str, dict] = {}
+    target: str = "supabase"
+    dry_run: bool = False
+
+
+def _draft_url(job_id: str, key: str, stamp=None) -> str:
+    """The staged picture's preview URL (unique per save, so a replace shows)."""
+    base = "/api/studio/jobs/%s/draft/crop/%s" % (job_id, key)
+    return base + ("?v=%s" % stamp if stamp is not None else "")
+
+
+class StudioDraftCutBody(BaseModel):
+    """Body of POST /api/studio/jobs/{job}/draft/cut/{key} - the crop square."""
+    bbox: list[float] = []
+
+
+@app.post("/api/studio/jobs/{job_id}/draft/cut/{key}")
+async def studio_draft_cut(job_id: str, key: str, body: StudioDraftCutBody):
+    """Cut the editor's page square into a staged picture (local-first).
+
+    The Inspect square speaks the page's own 0-1000 box; this is where those
+    values become the picture shown under it. Nothing is uploaded: the bytes
+    land in the job's drafts folder and approval publishes them.
+    """
+    from pipeline.studio import drafts
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"},
+                            status_code=404)
+    try:
+        info = await asyncio.to_thread(drafts.cut, job_id, key, body.bbox)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "url": _draft_url(job_id, key, info["at"]),
+                         **info})
+
+
+@app.post("/api/studio/jobs/{job_id}/draft/crop/{key}")
+async def studio_draft_crop_save(job_id: str, key: str,
+                                 file: UploadFile = File(...)):
+    """Stage a FINISHED picture locally - local first, bucket only on approval."""
+    from pipeline.studio import drafts
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    data = await file.read()
+    try:
+        info = await asyncio.to_thread(drafts.save, job_id, key, data)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "url": _draft_url(job_id, key, info["at"]),
+                         **info})
+
+
+@app.get("/api/studio/jobs/{job_id}/draft/crop/{key}")
+async def studio_draft_crop(job_id: str, key: str):
+    """Serve a staged picture for the editor preview (never cached)."""
+    from pipeline.studio import drafts
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    try:
+        path = drafts.draft_path(job_id, key)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    if not os.path.exists(path):
+        return JSONResponse({"ok": False, "error": "no staged picture"},
+                            status_code=404)
+    return FileResponse(path, media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/studio/jobs/{job_id}/draft/crop/{key}")
+async def studio_draft_crop_drop(job_id: str, key: str):
+    """Forget one staged picture (the card's reset)."""
+    from pipeline.studio import drafts
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+    removed = await asyncio.to_thread(drafts.drop, job_id, key)
+    return JSONResponse({"ok": True, "removed": bool(removed)})
+
+
+@app.post("/api/studio/jobs/{job_id}/commit")
+async def studio_commit(job_id: str, body: StudioCommitBody):
+    """Approve the Inspect batch: review + staged pictures + ONE import.
+
+    Local first, import second: until this call nothing was in the bucket or
+    the database. Every staged picture uploads AS CROPPED (no re-cut from a
+    page box) and every ready row lands in one batch.
+    """
+    from pipeline.studio import commit as commit_mod
+    from pipeline.studio import jobs as studio_jobs_mod
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"}, status_code=404)
+
+    def emit(step, level, text, **extra):
+        studio_jobs_mod._emit(hub, job_id, step, level, text, **extra)
+
+    try:
+        result = await asyncio.to_thread(
+            commit_mod.apply, cfg, job_id, body.edits, body.crops,
+            body.target, body.dry_run, emit)
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     except Exception as exc:
@@ -1580,7 +2107,115 @@ def _studio_models_view():
             "proxy_profiles": [p.get("name", "") for p in cfg.proxy_profiles
                                  if p.get("name", "")],
             "proxy": cfg.studio_proxy,
+            # the Gemini pool's own model picker ("") -> All, the round-robin
+            "gemini_pin": cfg.studio_gemini_pin,
+            "gemini_models": _gemini_model_choices(),
             **_studio_batch_view()}
+
+def _studio_job_view(job_id: str):
+    """One job as the per-file pop-up reads it: its lane, its counts.
+
+    ``stages`` repeats what each stage would run on today (a stored or
+    default provider label, '' meaning the Gemini pool), ``models`` is the
+    provider's model list for the pop-up's picker.
+    """
+    from pipeline.studio import lane, merge, workspace
+    over = lane.read(job_id)
+    stages = {}
+    for stage in ("extract", "enrich", "vision"):
+        label = lane.used(cfg, job_id, stage)
+        provider = next((p for p in cfg.studio_providers
+                         if p.get("label") == label), {}) if label else {}
+        stages[stage] = {"provider": label,
+                         "label": label or "Gemini pool",
+                         "model": (provider.get("model") or "") if provider
+                                  else (cfg.studio_gemini_pin or ""),
+                         "models": list(provider.get("models") or [])}
+    blocks = []
+    try:
+        view = merge.merged(job_id)
+    except Exception:
+        view = {"blocks": [], "stats": {}}
+    for b in view.get("blocks") or []:
+        ok, why = merge.importable(b)
+        crop = b.get("crop") or {}
+        blocks.append({"key": b.get("key"), "kind": b.get("kind"),
+                       "number": b.get("number"), "page": b.get("page"),
+                       "status": b.get("status"),
+                       "issues": list(b.get("issues") or []),
+                       "importable": bool(ok), "why": why or "",
+                       "picture": bool(crop.get("needed")),
+                       "picture_ok": bool(crop.get("approved"))})
+    sources = [{"key": p.get("label") or "Gemini pool",
+                "label": p.get("label") or "Gemini pool",
+                "models": list(p.get("models") or [])}
+               for p in cfg.studio_providers]
+    return {"job": workspace.summary(job_id),
+            "lane": {"provider": over["provider"],
+                     "provider_label": over["provider"] or "stage default",
+                     "prompt": over["prompt"]},
+            "stages": stages,
+            "sources": sources,
+            "gemini_models": _gemini_model_choices(),
+            "blocks": blocks,
+            "stats": view.get("stats") or {}}
+
+@app.get("/api/studio/jobs/{job_id}/lane")
+async def studio_lane_get(job_id: str):
+    """One file's own model/prompt (the pop-up that opens from the row)."""
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"},
+                            status_code=404)
+    return JSONResponse({"ok": True, **_studio_job_view(job_id)})
+
+class StudioLaneSave(BaseModel):
+    provider: str | None = None   # "" -> follow the Models tab default
+    prompt: str | None = None     # "" -> no extra instruction
+
+@app.post("/api/studio/jobs/{job_id}/lane")
+async def studio_lane_save(job_id: str, body: StudioLaneSave):
+    """Save this file's own lane (provider + model, optional prompt)."""
+    from pipeline.studio import lane
+    if not _studio_exists(job_id):
+        return JSONResponse({"ok": False, "error": "no such job"},
+                            status_code=404)
+    patch = {}
+    if body.provider is not None:
+        label = body.provider.strip()
+        if label and label not in {p.get("label") for p in cfg.studio_providers}:
+            return JSONResponse(
+                {"ok": False, "error": "Provider '%s' is not in the saved list."
+                                       % label}, status_code=400)
+        patch["provider"] = label
+    if body.prompt is not None:
+        patch["prompt"] = body.prompt
+    await asyncio.to_thread(lane.save, job_id, patch)
+    return JSONResponse({"ok": True, **_studio_job_view(job_id)})
+
+class StudioModelPick(BaseModel):
+    label: str = ""
+    model: str = ""
+
+@app.post("/api/studio/models/pick")
+async def studio_model_pick(body: StudioModelPick):
+    """Pick which model one provider runs (the list's default rung)."""
+    global cfg
+    label, model = body.label.strip(), body.model.strip()
+    providers = [dict(p) for p in cfg.studio_providers]
+    hit = next((p for p in providers if p.get("label") == label), None)
+    if hit is None:
+        return JSONResponse({"ok": False,
+                             "error": "Provider '%s' does not exist." % label},
+                            status_code=400)
+    hit["model"] = model
+    envfile.update_env_file(ENV_PATH, {
+        "STUDIO_PROVIDERS": json.dumps(providers, ensure_ascii=False)})
+    load_dotenv(ENV_PATH, override=True)
+    cfg = load_config()
+    view = _studio_models_view()
+    view["ok"] = True
+    view["saved"] = True
+    return JSONResponse(view)
 
 @app.get("/api/studio/models")
 async def studio_models_get():
@@ -1592,6 +2227,7 @@ class StudioModelsSave(BaseModel):
     enrich_active: str = KEEP
     vision_active: str = KEEP
     proxy: str | None = None     # None → keep; "" → direct (no proxy)
+    gemini_pin: str | None = None   # None → keep; "" → All (whole ladder)
 
 @app.post("/api/studio/models")
 async def studio_models_save(body: StudioModelsSave):
@@ -1600,6 +2236,17 @@ async def studio_models_save(body: StudioModelsSave):
     providers = (list(cfg.studio_providers)
                  if body.providers is None
                  else _merge_providers(list(cfg.studio_providers), body.providers))
+    # A pick is a default MODEL, not a mode: choosing one of several models
+    # must not make the rest of the provider's list disappear.
+    if body.providers is not None:
+        for i, raw in enumerate(body.providers):
+            if i < len(providers) and str(raw.get("model", "")).strip():
+                providers[i]["model"] = str(raw["model"]).strip()
+    for p in providers:
+        want = p.get("model", "")
+        p["models"] = [m for m in (p.get("models") or []) if m]
+        if want and want not in p["models"]:
+            p["models"].append(want)
     labels = {p["label"] for p in providers}
     extract_active = (cfg.studio_extract_active if body.extract_active == KEEP
                       else body.extract_active.strip())
@@ -1628,12 +2275,19 @@ async def studio_models_save(body: StudioModelsSave):
         return JSONResponse(
             {"ok": False, "error": f"Proxy profile '{proxy}' does not exist."},
             status_code=400)
+    pin = (cfg.studio_gemini_pin if body.gemini_pin is None
+           else body.gemini_pin.strip())
+    if pin and pin not in _gemini_model_choices():
+        return JSONResponse(
+            {"ok": False, "error": f"'{pin}' is not an enabled Gemini model."},
+            status_code=400)
     envfile.update_env_file(ENV_PATH, {
         "STUDIO_PROVIDERS": json.dumps(list(providers), ensure_ascii=False),
         "STUDIO_EXTRACT_ACTIVE": extract_active,
         "STUDIO_ENRICH_ACTIVE": enrich_active,
         "STUDIO_VISION_ACTIVE": vision_active,
         "STUDIO_PROXY": proxy,
+        "STUDIO_GEMINI_MODEL_PIN": pin,
     })
     load_dotenv(ENV_PATH, override=True)
     cfg = load_config()

@@ -2,6 +2,7 @@
 'Prepare Answer Rows' and 'Finalize Answer Rows'."""
 import json
 
+from . import prompts
 from .questions import is_real_bbox
 from .scanner import SourceItem
 from .utils import norm_text, parse_number, sha1_hex
@@ -46,6 +47,54 @@ OUTPUT FORMAT (strict JSON, no markdown fences):
 }"""
 
 
+
+# ── several pages per call (the pipeline's pages-per-call setting) ──
+# Same contract as ANSWER_TEMPLATE, wrapped per page so each page's blocks can
+# be attributed to that page's own source row. __CANDIDATES__ is replaced at
+# runtime, exactly like the single-page template. Editable in the Prompts view.
+ANSWER_PAGES_TEMPLATE = """You are a precise OCR and answer-extraction system for Iranian Konkour and textbook answer keys.
+You will receive several page images of ONE answer key, in reading order. Each image is preceded by a label such as "PAGE 2:".
+
+Your task:
+1. Extract every answer block of EVERY page, and keep each block under the page it was printed on. A block starts at its printed question number (e.g. "۴") and continues until the next question number or end of page.
+2. Preserve Persian text exactly, including half-spaces (ZWNJ) and punctuation.
+3. For each block output "question_number" (integer, Western digits), "answer_explanation" (full explanation in reading order, do not summarize), and "raw_ocr_text" (verbatim OCR of the block).
+4. ASSETS: for EVERY visible table, figure, chemical structure or graph inside the block, output one entry in "assets" in reading order, with:
+   - "asset_type": "table" | "diagram" | "chemical_structure" | "graph"
+   - "bbox": [ymin, xmin, ymax, xmax] normalized to 0-1000, tightly enclosing the asset
+   - "caption": the exact sentence introducing/referring to the asset (usually containing «جدول»، «شکل»، «نمودار»، «ساختار»); null if none
+   - "order": 1-based reading-order index inside the block
+5. CORRECT OPTION: CANDIDATE QUESTIONS from the database are given below. Using ONLY the explanation content, identify which candidate option the explanation supports. If certain, set "correct_option_label" exactly as in the candidates. If the page explicitly states the correct option, use that. DO NOT put this field empty or null.
+6. Metadata line near the bottom (e.g. "(ماز ۱۴۰۳-۱۴۰۴ - متوسط)") maps to "corp", "year", "difficulty".
+7. If a page holds no answer block, keep it with an empty answers array.
+
+CANDIDATE QUESTIONS (JSON):
+__CANDIDATES__
+
+OUTPUT FORMAT (strict JSON, no markdown fences):
+{
+  "pages": [
+    {
+      "page": 1,
+      "answers": [
+        {
+          "question_number": 4,
+          "answer_explanation": "string",
+          "correct_option_label": "string",
+          "correct_option_text": "string or null",
+          "corp": "string or null",
+          "year": "string or null",
+          "difficulty": "string or null",
+          "raw_ocr_text": "string",
+          "assets": [
+            { "asset_type": "table", "order": 1, "bbox": null, "caption": "string or null" }
+          ]
+        }
+      ]
+    }
+  ]
+}"""
+
 # The candidate bank can hold EVERY question of a topic, and the answer
 # branch re-sends it on each answer call. A count cap alone still let a
 # 60-question bank reach ~15k input tokens (the whole topic bank embedded),
@@ -64,7 +113,7 @@ def _clip(value, limit):
     return text if len(text) <= limit else text[:limit] + "…"
 
 
-def build_answer_prompt(candidates) -> str:
+def build_answer_prompt(candidates, pages=0) -> str:
     slim = []
     used = 0
     for q in candidates[:MAX_PROMPT_CANDIDATES]:
@@ -92,8 +141,15 @@ def build_answer_prompt(candidates) -> str:
         if slim and used > MAX_BANK_CHARS:      # always embed at least one
             break
         slim.append(entry)
-    return ANSWER_TEMPLATE.replace(
-        "__CANDIDATES__", json.dumps(slim, ensure_ascii=False))
+    if int(pages or 0) > 1:
+        template = prompts.get("pipeline.answers_pages", ANSWER_PAGES_TEMPLATE)
+    else:
+        template = prompts.get("pipeline.answers", ANSWER_TEMPLATE)
+    bank = json.dumps(slim, ensure_ascii=False)
+    if "__CANDIDATES__" in template:
+        return template.replace("__CANDIDATES__", bank)
+    # an edited prompt that dropped the placeholder still gets the bank
+    return template.rstrip() + "\n\nCANDIDATE QUESTIONS (JSON):\n" + bank
 
 
 def prepare_answer_rows(gemini_result: dict):

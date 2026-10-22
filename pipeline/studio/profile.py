@@ -38,7 +38,10 @@ def blank(source_kind: str = "unknown") -> dict:
         "source_kind": source_kind if source_kind in SOURCE_KINDS else "unknown",
         "compilation": "unknown",
         "static": {f: None for f in FIELDS},
-        "extract_per_question": ["corp", "year", "topic", "difficulty"],
+        # difficulty is never printed in these banks, so demanding it made
+        # every row warn for a field nobody can supply. It stays available
+        # per job from the Profile tab.
+        "extract_per_question": ["corp", "year", "topic"],
         "answer_layout": "unknown",
         "tag_list_ref": None,          # None => the shipped seed tag list
         "notes": "",

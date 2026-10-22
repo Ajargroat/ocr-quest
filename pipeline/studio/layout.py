@@ -28,8 +28,10 @@ from pipeline.utils import to_english_digits
 
 # A numeric marker: 1-3 digits (years are 4, so never a marker), a separator
 # character, then real content (not another digit — that is a decimal).
+# The booklet writes an option as "1) text" and as "1( text" - on that row
+# the open paren is the label's own closing mark.
 _MARK_RE = re.compile(
-    r"^[\(\[\{]?\s*(\d{1,3})\s*[\)\.\-\u2013\u2014\u0640:]\s*(?!\d)(.*)$")
+    r"^[\(\[\{]?\s*(\d{1,3})\s*[\(\)\.\-\u2013\u2014\u0640:]\s*(?!\d)(.*)$")
 # Latin / Persian option letters (الف، ب، ج، د plus latin forms).
 _LETTER_RE = re.compile(
     r"^[\(\[\{]?\s*([A-Da-d]|الف|[أإآ]|[بجده])\s*[\)\.\-\u2013\u2014\u0640:]\s*(.*)$")
@@ -73,34 +75,140 @@ def _classify(line):
     return None
 
 
+def _looks_like_sentence(text):
+    """True for a line that reads as prose rather than an option fragment.
+
+    An option value is a short token ("200 , NaNO3") or a formula; five or
+    more words is running text, whatever the line happens to end with - the
+    OCR also closes such a line with a stray ")2".
+    """
+    body = (text or "").strip()
+    if not body:
+        return False
+    return len(body.split()) >= 5
+
+
 def _option_marker(line):
-    """The line read as an option start (label 1-4 / الف..د), or None."""
+    """The line read as an option start (label 1-4 / الف..د), or None.
+
+    Two shapes are accepted: the usual "1) text", and the booklet's reversed
+    "200 , NaNO3 )1", where the label is drawn after the value it belongs to.
+    A sentence that merely ends in ")2" is not an option: ``_tail_label``
+    refuses anything ending in its own punctuation.
+    """
     kind = _classify(line)
-    if kind is None:
-        return None
-    if kind[0] == "num" and kind[1] <= 4:
+    if kind is not None and kind[0] == "num" and kind[1] <= 4:
         match = _MARK_RE.match(line)
         return {"label": match.group(1), "text": match.group(2).strip()}
-    if kind[0] == "letter":
+    if kind is not None and kind[0] == "letter":
         match = _LETTER_RE.match(line)
         return {"label": match.group(1), "text": match.group(2).strip()}
+    tail = _tail_label(line)
+    if tail:
+        return {"label": tail[1], "text": tail[0]}
     return None
 
 
+# Combining marks the producer draws as their own glyph.  A line that
+# starts with one (127 lines of the 32-page exam) no longer matches a
+# question marker, so 22 questions lost their number and merged into prose.
+_LEAD_MARKS = "\u0654\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\u0670"
+
+
+# A value followed by an option label: "200 , NaNO3 )1". The label comes last
+# in the stream because the producer draws the number after the value it
+# belongs to, so the pair is read back to front.
+_TAIL_LABEL_RE = re.compile(
+    r"^(?P<value>.*?\S)\s*\)\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])\s*$")
+
+# A row of four value/label pairs on one line, drawn right to left:
+# "120 )4 100 )3 90 )2 80 )1". The labels are the anchors.
+_PAIR_RE = re.compile(
+    r"(?P<value>.*?)\s*\)\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])(?=\s|$)")
+# A lone dash opens a numberless question (the booklet prints no number).
+_DASH_STEM_RE = re.compile(r"^[\-–—ـ]")
+
+
+# Anything that marks a line as a value rather than a phrase: a digit, a
+# fraction or decimal separator, a unit, or a formula glyph.
+_VALUE_RE = re.compile(r"[0-9\u06F0-\u06F9\u0660-\u0669/.,=%\u00D7\u00B7^_()]"
+                      r"|\w{1,3}O\d|mol|kJ|J/g")
+
+
+def _tail_label(text):
+    """("200 , NaNO3", "1") when the line is a value with a trailing label."""
+    match = _TAIL_LABEL_RE.match(text or "")
+    if not match:
+        return None
+    value = match.group("value").strip()
+    if not value or not re.search(r"[0-9\u06F0-\u06F9]|\w", value):
+        return None
+    # An option row carries a value: a number, a symbol or a formula part
+    # ("200 , NaNO3", "9 - 157/5").  Prose that merely happens to end in
+    # ")2" ("a sentence )2") has none of those and is not an option.
+    if value[-1:] in "?!." or not _VALUE_RE.search(value):
+        return None
+    return value, _english_digit(match.group("label"))
+
+
+def _english_digit(ch):
+    code = ord(ch)
+    if 0x06F0 <= code <= 0x06F9:
+        return str(code - 0x06F0)
+    if 0x0660 <= code <= 0x0669:
+        return str(code - 0x0660)
+    return ch
+
+
+def _pair_row(text):
+    """[(label, value)] for "120 )4 100 )3 90 )2 80 )1", or None.
+
+    Only a complete run of exactly the four options is accepted, each with a
+    non-empty value, so a stray ")2" inside a sentence is never an option.
+    """
+    found = [(m.group("value").strip(), _english_digit(m.group("label")))
+             for m in _PAIR_RE.finditer(text or "")]
+    if len(found) != 4:
+        return None
+    pairs = {}
+    for value, label in found:
+        if not value or label in pairs:
+            return None
+        pairs[label] = value
+    if set(pairs) != {"1", "2", "3", "4"}:
+        return None
+    return [(label, pairs[label]) for label in ("1", "2", "3", "4")]
+
+
 def _lines_with_offsets(text):
-    """[(line, start, end)] — end is exclusive of the newline."""
+    """[(line, start, end)] — end is exclusive of the line break.
+
+    A leading run of combining marks and spaces is absorbed into the
+    line's own start, so a mark the producer drew as its own glyph never
+    sits in front of a question number: "\u0654 55- \u0628\u06cc\u0646" reads as
+    "55- \u0628\u06cc\u0646".  Nothing is dropped - the mark still belongs to
+    the text after it - and every offset still names its own character.
+    """
     out, pos = [], 0
-    for raw in text.split("\n"):
-        out.append((raw, pos, pos + len(raw)))
-        pos += len(raw) + 1
+    for chunk in text.split("\n"):
+        # the split consumed the "\n"; a CRLF stream leaves its "\r" here
+        width = len(chunk)
+        line = chunk[:-1] if chunk.endswith("\r") else chunk
+        lead = 0
+        while lead < len(line) and (line[lead] in _LEAD_MARKS
+                                  or line[lead] in " \t"):
+            lead += 1
+        out.append((line[lead:], pos + lead, pos + len(line)))
+        pos += width + 1
     return out
 
 
 # A second option marker inside an already-open option line. OCR happily
 # renders "۱) ۱۰۰۰  ۲) ۲۰۰۰  ۳) ۱۵۰" as one line, so the marker has to be
 # found mid-line, never only at the start.
+# An option label inside a line: "2) text" and the booklet's "2( text".
 _INLINE_MARK = re.compile(
-    r"(?<=\s)[\(\[]?\s*([1-4\u06F1-\u06F4\u0661-\u0664])\s*[\)]\s*(?=\S)")
+    r"(?<=\s)[\(\[]?\s*([1-4\u06F1-\u06F4\u0661-\u0664])\s*[\(\)]\s*(?=\S)")
 
 
 def _split_inline_rows(rows):
@@ -176,6 +284,63 @@ def _same_marker_family(left, right):
     return str(left or "").strip().isdigit() == str(right or "").strip().isdigit()
 
 
+# ---- text coherence: a print's line breaks must not break sentences ----
+#
+# The pdfium text stream of these booklets is not guaranteed visual order
+# and often splits a sentence across lines for no reason; a block composed
+# with hard "\n" joins reads broken. The reflow below joins two adjacent
+# stem/lead pieces when the first does not end a sentence and the second is
+# not a new structure. Geometry is untouched: these helpers run on composed
+# text only, never on the char-span ranges.
+
+# A line ending with one of these reads finished: the Persian sentence
+# marks plus the closing brackets a formula line usually ends with.
+_SENTENCE_END = "؟!.,؛،:)]"
+
+# A following piece that starts a new structure must not be swallowed:
+# an option-style marker row, a page/section marker, a header pipe.
+_NEW_PIECE_RE = re.compile(r"^(?:\d{1,3}\s*[\)\(]|\||===|SPLIT)")
+
+
+def _joins(left, right):
+    """Should `left` flow into `right` inside one block's text?"""
+    left, right = (left or "").rstrip(), (right or "").lstrip()
+    if not left or not right:
+        return False
+    if left[-1] in _SENTENCE_END or "|" in left:
+        return False
+    if _NEW_PIECE_RE.match(right):
+        return False
+    return True
+
+
+def reflow_lines(lines):
+    """Join the pieces a print wrapped mid-sentence; keep structure lines."""
+    out = []
+    for line in lines:
+        line = (line or "").strip()
+        if not line:
+            continue
+        if out and _joins(out[-1], line):
+            out[-1] = out[-1] + " " + line
+        else:
+            out.append(line)
+    return out
+
+
+def mid_sentence_breaks(text):
+    """True when reflow_lines would repair a hard wrap in this block text."""
+    lines = [(line or "").strip() for line in (text or "").split("\n")]
+    return any(_joins(lines[i], lines[i + 1])
+               for i in range(len(lines) - 1))
+
+
+def one_line(value):
+    """A string that must never wrap: line breaks become single spaces."""
+    text = str(value or "").replace("\r\n", " ").replace("\r", " ")
+    return re.sub(r"[ \t]{2,}", " ", text.replace("\n", " ")).strip()
+
+
 def split_text(text):
     """Split one page's text into blocks (see module docstring).
 
@@ -193,8 +358,50 @@ def split_text(text):
         stripped = _stripped(line)
         kind = _classify(stripped)
 
+        if kind is None and _DASH_STEM_RE.match(stripped):
+            # A lone dash opens a numberless question.  Inside an option run
+            # that is already collecting options the same dash is content, so
+            # only a line that starts a block (or follows one) opens a stem.
+            # A dashed stem opens a block when nothing is open yet, or when
+            # what is open is still pure prose (the page header).  A real
+            # numbered question keeps its dashes as content.
+            opens = (current is None
+                     or (current.get("number") is None and run_count == 0))
+            if opens:
+                if current is not None:
+                    current["run_start"] = run_start
+                    raw_blocks.append(current)
+                # A numberless stem keeps its own first line as the
+                # head: there is no marker to strip from it.
+                current = {"number": None, "lines": [(line, start, end)],
+                           "head": _DASH_STEM_RE.sub("", stripped).strip(),
+                           "run_start": None, "dash_stem": True}
+                run_count, run_start = 0, None
+                numeric_seen = False
+                expected_option = 1
+                letter_next = 0
+                continue
+
+        pair_row = _pair_row(stripped) if current is not None else None
+        if pair_row:
+            # "120 )4 100 )3 90 )2 80 )1" is this question's four options,
+            # drawn right to left with each label after its own value.
+            current["pair_options"] = pair_row
+            current["lines"].append((line, start, end))
+            run_count, expected_option = 4, None
+            numeric_seen = True
+            continue
+
         if kind is not None and kind[0] == "num":
             value = kind[1]
+            head_match = _MARK_RE.match(stripped)
+            if (current is None and value <= 4 and head_match
+                    and "(" in head_match.group(0)[:head_match.start(2)]):
+                # "1( only an option label" at the very start of a page is
+                # not a question: an open paren is the option form, and an
+                # option with nothing above it belongs to no question.
+                lead.append((line, start, end))
+                continue
             if current is not None and expected_option == value:
                 if value == 1:
                     run_count = 0
@@ -233,7 +440,9 @@ def split_text(text):
             # A numbered question keeps its text: "(الف) (ب)" under a caption
             # is a figure label, not option 1 of a letter run.
             lettered = not numeric_seen or (letter_next or 0) > 0
-            if (current is not None and idx >= 0 and letter_next is not None
+            # _letter_index returns None for a letter it does not rank.
+            if (current is not None and idx is not None and idx >= 0
+                    and letter_next is not None
                     and idx == letter_next and lettered):
                 if idx == 0:
 
@@ -255,7 +464,8 @@ def split_text(text):
 
     out = []
     if lead:
-        body = "\n".join(t for t in (_stripped(l) for l, _, _ in lead) if t)
+        body = "\n".join(reflow_lines(
+            _stripped(l) for l, _, _ in lead))
         if body:
             out.append({"kind": "prose", "number": None, "text": body,
                         "options": [], "metadata_line": None,
@@ -294,8 +504,15 @@ def split_text(text):
                 opts.append(marker)
                 continue
             if in_options and opts:
-                # Splitter only places non-markers here while the option run
-                # is open — a wrapped option tail.
+                # A wrapped option tail continues the option above it, but
+                # a finished sentence does not: a value that closes with
+                # its own punctuation ends whatever was open.
+                if _looks_like_sentence(stripped):
+                    # Once the options have closed, running text is not
+                    # part of the stem either - it is a stray page line,
+                    # and the stem keeps only what preceded the options.
+                    in_options = False
+                    continue
                 opts[-1]["text"] = (opts[-1]["text"] + " " + stripped).strip()
                 continue
             stem.append(stripped)
@@ -308,15 +525,187 @@ def split_text(text):
                     if not stem[i]:
                         stem.pop(i)
                     break
+        if raw.get("pair_options"):
+            # A four-pair row is the question's whole option set; it wins
+            # over whatever the per-line scan collected.
+            opts = [{"label": label, "text": value}
+                    for label, value in raw["pair_options"]]
         out.append({
-            "kind": "question" if raw["number"] is not None else "prose",
+            # A numberless dashed stem with its own option run is still a
+            # question - the booklet simply printed no number for it.
+            "kind": ("question" if raw["number"] is not None
+                     or (raw.get("dash_stem") and len(opts) >= 2)
+                     else "prose"),
             "number": raw["number"],
-            "text": "\n".join(stem),
+            "text": "\n".join(reflow_lines(stem)),
             "options": opts,
             "metadata_line": meta,
             "ranges": [(s, e) for _, s, e in raw["lines"]],
         })
     return _absorb_option_orphans(out)
+
+
+# ── page organizer: question anchors ───────────────────────────────────────
+#
+# ``split_text`` is line-local: it opens a question only when a marker sits at
+# the start of a LINE. The producer of a real exam PDF draws some numbers glued
+# to a formula ("1657-", "2064-"), so the marker lands mid-line and the whole
+# question merges into its neighbour. The organizer below reads the page, finds
+# the question anchors by their printed sequence, and runs ``split_text`` on
+# each anchored slice. It is deterministic: no model, no network, and the old
+# splitter stays the fallback for a page with no anchors.
+
+# A dash after a number, with spaces allowed but never a line break: an option
+# row like "-9/6" belongs to the previous line and is not an anchor.
+_ANCHOR_RE = re.compile(r"(\d{1,4})[ \t]*[-\u2013\u2014]")
+
+
+def _anchor_candidates(text):
+    """[(start, digits, strong)] for every "number-dash" run on the page.
+
+    ``strong`` means the number opens its line (only bidi controls and the
+    producer's own combining marks may precede it) - the one candidate that
+    may seed a page without a known previous number.
+    """
+    out = []
+    for match in _ANCHOR_RE.finditer(text or ""):
+        digits = to_english_digits(match.group(1))
+        if not digits.isdigit():
+            continue
+        line_start = (text or "").rfind("\n", 0, match.start()) + 1
+        lead = (text or "")[line_start:match.start()].strip(
+            " \t" + _BIDI + _LEAD_MARKS)
+        out.append((match.start(), digits, lead == ""))
+    return out
+
+
+def question_anchors(text, start=None):
+    """[(start_offset, number)] - where the questions start on one page.
+
+    The accepted set follows the printed sequence: the next number, the tail
+    of a glued digit run ("1657-" -> 57), a one-digit tail of the next number
+    ("6-" after 65 -> 66), or the next-but-one number when the text layer lost
+    one question entirely. Every anchor is a cut point; anything that cannot
+    be placed in that sequence stays with the block before it.
+    """
+    candidates = _anchor_candidates(text)
+    if start is not None:
+        # The previous page ended with ``start``: every candidate on this page
+        # is judged against that number, so a question glued to a formula at
+        # the very top of the page ("−68-(") is still found.
+        previous = int(start)
+        out = []
+        rest = candidates
+    else:
+        seed = next((i for i, (_, digits, strong) in enumerate(candidates)
+                     if strong and len(digits) <= 3), None)
+        if seed is None:
+            return []
+        at, digits, _ = candidates[seed]
+        number = int(digits)
+        if number <= 0 or number > 999:
+            return []
+        out = [(at, number)]
+        previous = number
+        rest = candidates[seed + 1:]
+    for start, digits, _strong in rest:
+        number = int(digits)
+        if number <= 0:
+            continue
+        expected = previous + 1
+        if number == expected:
+            out.append((start, expected))
+            previous = expected
+        elif len(digits) >= 3 and int(digits[-2:]) in (expected,
+                                                       expected + 1):
+            # "1657-" / "2064-": the question number is the tail, the head
+            # belongs to the formula that ended the previous line. The tail
+            # may also close a one-question gap (55 then 1657 -> 57).
+            tail = int(digits[-2:])
+            out.append((start + len(digits) - 2, tail))
+            previous = tail
+        elif len(digits) == 1 and expected >= 10 and expected % 10 == number:
+            out.append((start, expected))
+            previous = expected
+        elif number == expected + 1:
+            # A text layer can lose one question; the next printed anchor is
+            # still a question boundary and must not merge into the previous.
+            out.append((start, number))
+            previous = number
+    return out
+
+
+def _anchor_chunk(chunk):
+    """Make a dash-glued anchor readable by ``split_text``'s marker rule.
+
+    ``split_text`` refuses "70- 1" (the dash must not be followed by a
+    digit), but an anchored slice already knows where the question starts.
+    Rewriting that one separator to the option-style paren keeps the text
+    and every offset intact and lets the stem begin with the number.
+    """
+    match = re.match(r"^(\d{1,4})[ \t]*[-\u2013\u2014](?=[ \t]*\d)",
+                     chunk or "")
+    if not match:
+        return chunk
+    dash = match.start() + len(match.group(1)) + 1
+    return chunk[:dash] + ")" + chunk[dash + 1:]
+
+
+def split_page(text, boxes=None, page_size=None, start=None):
+    """One page's text -> blocks + a layout confidence.
+
+    ``boxes``/``page_size`` are accepted for callers that already hold pdfium
+    character geometry (the text lane); the anchor rule works on the text and
+    the offsets, so a caller without geometry behaves identically. Returns
+    {"blocks", "confidence", "anchors", "questions"}.
+    """
+    text = text or ""
+    anchors = question_anchors(text, start=start)
+    if not anchors:
+        blocks = split_text(text)
+        return {"blocks": blocks, "confidence": 0.0, "anchors": 0,
+                "questions": sum(1 for b in blocks
+                                 if b.get("kind") == "question"),
+                "last": start}
+
+    cuts = [start for start, _ in anchors]
+    slices = []
+    if cuts[0] > 0:
+        slices.append((0, text[:cuts[0]], None))
+    for index, start in enumerate(cuts):
+        end = cuts[index + 1] if index + 1 < len(cuts) else len(text)
+        slices.append((start, text[start:end], anchors[index][1]))
+
+    blocks = []
+    for offset, chunk, number in slices:
+        chunk = _anchor_chunk(chunk)
+        opened = 0
+        for block in split_text(chunk):
+            block["ranges"] = [(s + offset, e + offset)
+                               for s, e in block.get("ranges") or []]
+            if (number is not None and opened == 0
+                    and block.get("kind") == "question"):
+                # "6-" after 65 is really question 66 (the producer dropped a
+                # digit). The sequence is the authority on the number; the
+                # block keeps the text it landed.
+                block["number"] = number
+                opened += 1
+            blocks.append(block)
+
+    by_number = {block.get("number"): block for block in blocks
+                 if block.get("kind") == "question"}
+    good = 0
+    for _start, number in anchors:
+        block = by_number.get(number)
+        if (block and (block.get("text") or "").strip()
+                and len(block.get("options") or []) == 4):
+            good += 1
+    confidence = good / float(len(anchors))
+    return {"blocks": blocks, "confidence": confidence,
+            "anchors": len(anchors),
+            "numbers": [number for _start, number in anchors],
+            "questions": sum(1 for b in blocks if b.get("kind") == "question"),
+            "last": anchors[-1][1]}
 
 
 def _absorb_option_orphans(blocks):

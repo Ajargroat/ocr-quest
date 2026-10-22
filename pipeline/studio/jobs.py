@@ -8,15 +8,20 @@ State is process-local (like ``revision/runner.py``): the authoritative job
 record is the workspace directory on disk, and this module only mirrors the
 *currently running* operation so the dashboard can show live progress.
 """
+import os
+import shutil
 import threading
+import time
 
 from . import enrich as enrich_mod
 from . import extract as extract_mod
 from . import geometry as geometry_mod
 from . import importers
+from . import lane
 from . import probe as probe_mod
 from . import profile as profile_mod
 from . import workspace
+from . import faults as studio_faults
 
 _lock = threading.Lock()
 _state = {"running": False, "job": None, "stage": None, "message": "",
@@ -34,14 +39,30 @@ def get_state() -> dict:
 
 
 def _emit(hub, job_id, stage, level, message, **extra):
-    """Log to the job file and (if a hub is attached) the live dashboard."""
+    """Log to the job file and (if a hub is attached) the live dashboard.
+
+    An error line always carries a classified fault -- the studio kinds first
+    (no source, wrong stage, broken PDF), then the pipeline kinds (tunnel
+    down, quota, bad key). The dashboard chips it exactly like the pipeline
+    log does, and the file keeps the verdict next to the message.
+    """
+    if level == "error" and not extra.get("fault"):
+        extra["fault"] = studio_faults.payload(
+            studio_faults.classify_text(message))
     workspace.log_event(job_id, stage, level, message, **extra)
     if hub is not None:
         try:
             hub.emit({"type": "studio", "job": job_id, "stage": stage,
-                      "level": level, "message": message, **extra})
+                      "level": level, "message": message,
+                      "ts": time.strftime("%H:%M:%S"), **extra})
         except Exception:
             pass
+
+def _fail(hub, job_id, stage, exc, prefix=""):
+    """Emit one error line, classified from the exception itself."""
+    message = (prefix + str(exc)).strip()
+    _emit(hub, job_id, stage, "error", message,
+          fault=studio_faults.payload(studio_faults.classify(exc)))
 
 
 # ── job lifecycle ───────────────────────────────────────────────────────────
@@ -62,7 +83,7 @@ def create_job(hub, fileobj, filename: str, original_name: str = None) -> dict:
         return run_probe(hub, job_id)
     except Exception as exc:
         _set(error=str(exc), running=False)
-        _emit(hub, job_id, "intake", "error", str(exc))
+        _fail(hub, job_id, "intake", exc)
         raise
     finally:
         _set(running=False, stage=None)
@@ -101,7 +122,7 @@ def run_probe(hub, job_id: str) -> dict:
         return result
     except Exception as exc:
         _set(error=str(exc))
-        _emit(hub, job_id, "probe", "error", str(exc))
+        _fail(hub, job_id, "probe", exc)
         raise
     finally:
         _set(running=False, stage=None)
@@ -131,27 +152,31 @@ def _run_stage(hub, job_id: str, stage: str, func, message: str) -> dict:
         return result
     except Exception as exc:
         _set(error=str(exc))
-        _emit(hub, job_id, stage, "error", str(exc))
+        _fail(hub, job_id, stage, exc)
         raise
     finally:
         _set(running=False, stage=None)
 
-def run_extract(hub, job_id: str, cfg) -> dict:
+def run_extract(hub, job_id: str, cfg, organize: str = "auto") -> dict:
     """Stage 1 — source → layer1 (text lane deterministic, image lane OCR)."""
     return _run_stage(hub, job_id, "extract",
-                      lambda jid, emit: extract_mod.run(jid, cfg, emit),
+                      lambda jid, emit: extract_mod.run(
+                          jid, lane.lane_cfg(cfg, jid, "extract"), emit,
+                          organize=organize),
                       "extracting")
 
 def run_enrich(hub, job_id: str, cfg) -> dict:
     """Stage 2 — layer1 → layer2 (fields, flags, tags, answer links)."""
     return _run_stage(hub, job_id, "enrich",
-                      lambda jid, emit: enrich_mod.run(jid, cfg, emit),
+                      lambda jid, emit: enrich_mod.run(
+                          jid, lane.lane_cfg(cfg, jid, "enrich"), emit),
                       "sorting")
 
 def run_geometry(hub, job_id: str, cfg) -> dict:
     """Stage 3 — locate every block, plan + cache its crop."""
     return _run_stage(hub, job_id, "geometry",
-                      lambda jid, emit: geometry_mod.run(jid, cfg, emit),
+                      lambda jid, emit: geometry_mod.run(
+                          jid, lane.lane_cfg(cfg, jid, "vision"), emit),
                       "locating")
 
 def run_import(hub, job_id: str, cfg, target: str = "supabase",
@@ -164,8 +189,12 @@ def run_import(hub, job_id: str, cfg, target: str = "supabase",
         "importing")
 
 def delete_job(job_id: str) -> bool:
-    """Remove a job directory (and all its artifacts). Returns True if gone."""
-    import shutil
+    """Remove a job directory, its artifacts AND its stored source.
+
+    The workspace and the source tree are two directories: clearing only the
+    workspace left the uploaded PDF on disk for good, invisible to the job
+    list. Returns True when the job is gone.
+    """
     try:
         path = workspace.job_dir(job_id)
     except ValueError:
@@ -173,4 +202,7 @@ def delete_job(job_id: str) -> bool:
     if not workspace.exists(job_id):
         return False
     shutil.rmtree(path, ignore_errors=True)
+    source_dir = workspace.source_dir(job_id)
+    if source_dir and os.path.isdir(source_dir):
+        shutil.rmtree(source_dir, ignore_errors=True)
     return not workspace.exists(job_id)

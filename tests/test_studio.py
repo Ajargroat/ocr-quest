@@ -60,6 +60,46 @@ def _tiny_pdf(path):
     return path
 
 
+class _FakeImage:
+    """A pdfium image object (type 3) with fixed bounds."""
+
+    def __init__(self, bounds):
+        self.type = 3
+        self._bounds = bounds
+
+    def get_bounds(self):
+        return self._bounds
+
+
+class _FakePage:
+    """A pdfium page stub: a size in PDF points plus image boxes.
+
+    The studio tests fake the page this way so the figure rule can be
+    exercised without a real PDF.
+    """
+
+    def __init__(self, width, height, boxes=()):
+        self._size = (width, height)
+        self._images = [_FakeImage(box) for box in boxes]
+
+    def get_size(self):
+        return self._size
+
+    def get_objects(self):
+        return self._images
+
+
+# The real exam page and the image boxes measured on it: a repeated
+# header/footer strip (56% of the page), a full-page scan (100%), a small
+# corner mark (0.2%) and the genuine figures (2%-8%).
+_PAGE_W, _PAGE_H = 609.45, 870.24
+_STRIP = (0, 0, 1200, 248)
+_SCAN = (-1, 4, 611, 872)
+_CORNER = (522, 787, 564, 816)
+_FIGURE = (63, 633, 226, 754)
+_TITLE = (164, 561, 460, 760)     # the cover banner, inside the scan
+
+
 class WorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="studio-ws-")
@@ -231,6 +271,49 @@ class ProbeTests(unittest.TestCase):
         # The hint word alone still wins, sentence lines or not.
         self.assertTrue(probe_mod._looks_like_answer_key(
             "پاسخ کلیدی آزمون\n" + grid))
+
+
+    def test_a_header_strip_is_not_a_figure(self):
+        # The repeated header/footer strip covers 56% of the page.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_STRIP])
+        self.assertEqual(probe_mod._count_figures(page), 0)
+        self.assertEqual(probe_mod.figure_bounds(page), [])
+
+    def test_a_full_page_scan_is_not_a_figure(self):
+        # A scan covering the whole page is the page, not a picture on it.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_SCAN])
+        self.assertEqual(probe_mod._count_figures(page), 0)
+        self.assertEqual(probe_mod.figure_bounds(page), [])
+
+    def test_a_tiny_corner_mark_is_not_a_figure(self):
+        # The corner mark covers 0.2% of the page.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_CORNER])
+        self.assertEqual(probe_mod._count_figures(page), 0)
+        self.assertEqual(probe_mod.figure_bounds(page), [])
+
+    def test_a_real_figure_is_counted(self):
+        # A genuine figure covers ~4% of the page.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_FIGURE])
+        self.assertEqual(probe_mod._count_figures(page), 1)
+        self.assertEqual(probe_mod.figure_bounds(page), [_FIGURE])
+
+    def test_decoration_and_a_figure_on_one_page(self):
+        # Only the figure counts; the strip and the mark are dropped.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_STRIP, _CORNER, _FIGURE])
+        self.assertEqual(probe_mod._count_figures(page), 1)
+        self.assertEqual(probe_mod.figure_bounds(page), [_FIGURE])
+
+    def test_a_page_of_unknown_size_keeps_its_figures(self):
+        # An unmeasurable page must not lose a real figure.
+        page = _FakePage(0, 0, [_FIGURE])
+        self.assertEqual(probe_mod._count_figures(page), 1)
+
+    def test_an_image_inside_a_scan_is_not_a_figure(self):
+        # The cover banner (11% of the page) sits inside the full-page
+        # scan: it belongs to the scan, it is not a figure of its own.
+        page = _FakePage(_PAGE_W, _PAGE_H, [_SCAN, _TITLE])
+        self.assertEqual(probe_mod._count_figures(page), 0)
+        self.assertEqual(probe_mod.figure_bounds(page), [])
 
 
 class ProfileTests(unittest.TestCase):
@@ -950,6 +1033,87 @@ class StudioLayoutTests(_StudioStageCase):
         self.assertEqual(blocks[0]["split"], "tail")
         self.assertFalse(blocks[0].get("split_joined"))
 
+    # -- the book's other marker conventions (measured on a real PDF) -----
+
+    def test_an_open_paren_label_is_an_option_never_a_question(self):
+        from pipeline.studio import layout
+        text = "\n".join([
+            "- stem of a numberless question?",
+            "1( first",
+            "2( second",
+            "3( third",
+            "4( fourth",
+        ])
+        blocks = layout.split_text(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "question")
+        self.assertIsNone(blocks[0]["number"])
+        self.assertEqual([o["label"] for o in blocks[0]["options"]],
+                         ["1", "2", "3", "4"])
+        self.assertEqual(blocks[0]["text"], "stem of a numberless question?")
+
+    def test_an_open_paren_label_alone_does_not_invent_a_question(self):
+        from pipeline.studio import layout
+        blocks = layout.split_text("1( only an option label")
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["kind"], "prose")
+        self.assertIsNone(blocks[0]["number"])
+        self.assertIn("1( only an option label", blocks[0]["text"])
+
+    def test_a_trailing_label_after_its_text_is_an_option(self):
+        from pipeline.studio import layout
+        text = "\n".join(["09- which salt?", "200 , NaNO3 )1",
+                          "384 , NaNO3 )2", "87 , KNO3 )3",
+                          "100 , KNO3 )4"])
+        blocks = layout.split_text(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["number"], 9)
+        self.assertEqual([(o["label"], o["text"]) for o in blocks[0]["options"]],
+                         [("1", "200 , NaNO3"), ("2", "384 , NaNO3"),
+                          ("3", "87 , KNO3"), ("4", "100 , KNO3")])
+
+    def test_a_sentence_ending_line_is_never_read_as_a_tail_label(self):
+        from pipeline.studio import layout
+        text = "\n".join(["11- stem?", "الف) a", "ب) b", "ج) c",
+                          "so this is a sentence )2"])
+        blocks = layout.split_text(text)
+        self.assertEqual(len(blocks), 1)
+        labels = [o["label"] for o in blocks[0]["options"]]
+        self.assertEqual(labels, ["\u0627\u0644\u0641", "\u0628", "\u062c"])
+        self.assertIsNone(layout._option_marker("a sentence )2"))
+
+    def test_a_value_label_pair_row_becomes_four_options(self):
+        from pipeline.studio import layout
+        self.assertEqual(layout._pair_row("120 )4 100 )3 90 )2 80 )1"),
+                         [("1", "80"), ("2", "90"), ("3", "100"),
+                          ("4", "120")])
+        self.assertEqual(layout._pair_row("3/6 )4 1/2 )3 4/8 )2 2/4 )1"),
+                         [("1", "2/4"), ("2", "4/8"), ("3", "1/2"),
+                          ("4", "3/6")])
+        self.assertIsNone(layout._pair_row(")4 )3 )2 )1"))
+        self.assertIsNone(layout._pair_row("120 )4 100 )3"))
+
+    def test_a_pair_row_inside_a_question_becomes_its_options(self):
+        from pipeline.studio import layout
+        text = "\n".join(["48- how fast?", "120 )4 100 )3 90 )2 80 )1"])
+        blocks = layout.split_text(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["number"], 48)
+        self.assertEqual([(o["label"], o["text"]) for o in blocks[0]["options"]],
+                         [("1", "80"), ("2", "90"), ("3", "100"),
+                          ("4", "120")])
+
+    def test_a_dash_in_an_open_option_run_stays_option_content(self):
+        from pipeline.studio import layout
+        text = "\n".join(["07- stem?", "- first option", "- second option",
+                          "- third option"])
+        blocks = layout.split_text(text)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0]["number"], 7)
+        self.assertIn("- first option", blocks[0]["text"])
+
+
+
 
 class StudioExtractTests(_StudioStageCase):
     def test_text_lane_is_deterministic_and_stores_the_figure_once(self):
@@ -1049,6 +1213,22 @@ class StudioExtractTests(_StudioStageCase):
             self.assertEqual((block["page_start"], block["page_end"]), (1, 2))
 
 
+    def test_decorative_images_are_not_cropped_as_figures(self):
+        from pipeline.studio import extract
+        page = _FakePage(_PAGE_W, _PAGE_H, [_STRIP, _CORNER, _FIGURE])
+        self.assertEqual(extract._figure_bounds(page), [_FIGURE])
+
+    def test_the_probe_and_the_extractor_agree_on_figures(self):
+        from pipeline.studio import extract
+        page = _FakePage(_PAGE_W, _PAGE_H, [_STRIP, _CORNER, _FIGURE])
+        self.assertEqual(probe_mod._count_figures(page),
+                         len(extract._figure_bounds(page)))
+
+    def test_a_cover_scan_and_its_banner_are_not_cropped(self):
+        from pipeline.studio import extract
+        page = _FakePage(_PAGE_W, _PAGE_H, [_SCAN, _TITLE, _STRIP])
+        self.assertEqual(extract._figure_bounds(page), [])
+
 def _blk(key, kind, **kw):
     base = {"key": key, "kind": kind, "page": kw.pop("page", 1),
             "order": kw.pop("order", 1), "number": None, "label": None,
@@ -1067,8 +1247,7 @@ def _seed_layer1(jid, blocks, assets=None, pages=None):
                "compilation": "multi_institute_multi_year",
                "static": {"subject": None, "corp": None, "year": None,
                           "grade": "دوازدهم", "topic": None, "difficulty": None},
-               "extract_per_question": ["subject", "corp", "year", "topic",
-                                        "difficulty"],
+               "extract_per_question": ["subject", "corp", "year", "topic"],
                "answer_layout": "key_pages_at_end", "tag_list_ref": None,
                "notes": "", "updated_at": "2026-10-17T00:00:00"}
     workspace.write_artifact(jid, "profile", profile)
@@ -1113,6 +1292,35 @@ class StudioMergeTests(_StudioStageCase):
         legacy = workspace.new_id()
         workspace.job_dir(legacy, create=True)
         self.assertIsNone(merge.merged(legacy)["folder_id"])
+
+
+class StudioProvenanceTests(_StudioStageCase):
+    """The merged view surfaces crop/figure provenance (plan 9.6)."""
+
+    def test_merged_surfaces_crop_and_figure_provenance(self):
+        from pipeline.studio import merge
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        block = _blk("p1-b1", "question", order=1, number=57,
+                     text="...", organized=True, figure_source="organize")
+        workspace.write_artifact(jid, "layer2", {
+            "version": 1, "job_id": jid, "profile": {},
+            "blocks": [block], "pages": [], "assets": [], "stats": {}})
+        workspace.write_artifact(jid, "geometry", {
+            "version": 1, "job_id": jid,
+            "boxes": {"p1-b1": {"bbox": [10, 10, 50, 90],
+                                "source": "text_layer",
+                                "crop_bbox": [10, 10, 50, 90],
+                                "crop_source": "model", "crop_page": 1,
+                                "crop_method": "model",
+                                "crop_approved": None,
+                                "figure_source": "organize"}},
+            "stats": {}})
+        view = merge.merged(jid)
+        first = view["blocks"][0]
+        self.assertEqual(first["crop"]["source"], "model")
+        self.assertEqual(first["crop"]["figure"], "organize")
+        self.assertTrue(first["organized"])
 
 
 class StudioRowsTests(unittest.TestCase):
@@ -1306,7 +1514,10 @@ class StudioEnrichTests(_StudioStageCase):
         self.assertEqual(first["subject"], "زیست‌شناسی")
         self.assertIn("stem repaired", first["fixes"])
         second = by_key["p1-b2"]
-        self.assertEqual(second["status"], "error")
+        # A gap in the source metadata warns: the document may simply not
+        # state it, and blocking the row would make a metadata-free paper
+        # entirely unimportable.
+        self.assertEqual(second["status"], "warn")
         self.assertIn("topic", second["missing"])
         self.assertEqual(second["proposed"],
                          [{"field": "topic", "value": "بردارها"}])
@@ -1329,6 +1540,50 @@ class StudioEnrichTests(_StudioStageCase):
         self.assertIn("sorting call returned nothing",
                       layer["blocks"][0]["issues"])
         self.assertTrue(out["stats"]["errors"])
+    def test_a_paper_with_no_metadata_line_still_imports(self):
+        """Missing source metadata warns; it never blocks the row."""
+        from pipeline.studio import enrich
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        # nothing on this page states corp/year/topic/difficulty
+        blocks = [
+            _blk("p1-b1", "question", order=1, number=1, text="text one",
+                 options=["a", "b", "c", "d"]),
+        ]
+        _seed_layer1(jid, blocks)
+        self.llm.CALL_OVERRIDE = lambda **kw: {"text": "", "parsed": {
+            "blocks": [{"key": "p1-b1", "kind": "question",
+                        "text": "text one",
+                        "options": ["a", "b", "c", "d"],
+                        "missing": []}]}, "route": {}, "lane": "stub"}
+        out = enrich.run(jid, {}, emit=lambda *a, **k: None)
+        self.assertEqual(out["stats"]["error"], 0)
+        block = workspace.read_artifact(jid, "layer2")["blocks"][0]
+        self.assertEqual(block["status"], "warn")
+        self.assertIn("corp", block["missing"])
+        self.assertNotIn("difficulty", block["missing"])
+        self.assertTrue(block["needs_human"])
+
+    def test_an_empty_stem_is_still_an_error(self):
+        """Structural breakage stays fatal - only metadata gaps soften."""
+        from pipeline.studio import enrich
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        blocks = [
+            _blk("p1-b1", "question", order=1, number=1, text="",
+                 options=["a", "b"]),
+        ]
+        _seed_layer1(jid, blocks)
+        self.llm.CALL_OVERRIDE = lambda **kw: {"text": "", "parsed": {
+            "blocks": [{"key": "p1-b1", "kind": "question", "text": "",
+                        "options": ["a", "b"], "missing": []}]},
+            "route": {}, "lane": "stub"}
+        out = enrich.run(jid, {}, emit=lambda *a, **k: None)
+        self.assertEqual(out["stats"]["error"], 1)
+        block = workspace.read_artifact(jid, "layer2")["blocks"][0]
+        self.assertEqual(block["status"], "error")
+        self.assertIn("empty stem", block["issues"])
+
 
 
 class StudioGeometryTests(_StudioStageCase):
@@ -1347,7 +1602,7 @@ class StudioGeometryTests(_StudioStageCase):
         out = geometry.run(jid, {}, emit=lambda *a, **k: None)
         self.assertEqual(out["stats"]["crops"], 1)
         entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-b1"]
-        self.assertEqual(entry["crop_source"], "figure")
+        self.assertEqual(entry["crop_source"], "asset")
         self.assertTrue(entry["crop_approved"])
         rendered = geometry.render_crop(jid, "p1-b1")
         path = workspace.crop_path(jid, "p1-b1")
@@ -1612,8 +1867,6 @@ class StudioGeometryTests(_StudioStageCase):
         self.assertIsNone(entry["crop_approved"])
         self.assertEqual(out["stats"]["figure_missing"], 1)
         self.assertEqual(out["stats"]["crops"], 0)
-
-
 def _echo_stub(**kw):
     """Enrich lane stub: echo every block back unchanged (offline)."""
     payload = json.loads(kw["prompt"].split("\nblocks: ", 1)[1])
@@ -1671,7 +1924,7 @@ class StudioImportTests(_StudioStageCase):
         jid = self._seed()
         view = merge.merged(jid)
         built = rows_mod.build_rows(view, {"p1-b1": "crops/p1-b1.jpg"})
-        self.assertEqual(len(built["questions"]), 1)
+        self.assertEqual(len(built["questions"]), 2)
         question = built["questions"][0]
         self.assertTrue(question["id"].startswith("studio-" + jid))
         self.assertTrue(question["id"].endswith("-p1-b1"))
@@ -1683,8 +1936,10 @@ class StudioImportTests(_StudioStageCase):
         self.assertEqual(answer["correct_option_text"], "دو")
         self.assertEqual(answer["question_id"], question["id"])
         self.assertEqual(answer["review_status"], "pending")
-        reasons = {s["key"]: s["reason"] for s in built["skipped"]}
-        self.assertEqual(reasons["p1-b2"], "flagged: topic")
+        # p1-b2 lacks topic: that is a warning, so it still builds a row.
+        self.assertEqual(len(built["questions"]), 2)
+        self.assertTrue(any(q["id"].endswith("-p1-b2")
+                            for q in built["questions"]))
         strict = rows_mod.build_rows(view, {})
         self.assertIn("crop not uploaded",
                       {s["key"]: s["reason"]
@@ -1699,16 +1954,16 @@ class StudioImportTests(_StudioStageCase):
             os.path.join(workspace.job_dir(jid), "export.json")))
         self.assertFalse(workspace.read_artifact(jid, "imports")["results"])
         out = importers.run({}, jid, target="file", dry_run=False)
-        self.assertEqual(out["report"]["questions"], 1)
+        self.assertEqual(out["report"]["questions"], 2)
         with io.open(os.path.join(workspace.job_dir(jid), "export.json"),
                      encoding="utf-8") as fh:
             payload = json.load(fh)
-        self.assertEqual(len(payload["questions"]), 1)
+        self.assertEqual(len(payload["questions"]), 2)
         self.assertEqual(len(payload["answers"]), 1)
         imports = workspace.read_artifact(jid, "imports")
         self.assertEqual(imports["results"]["p1-b1"]["status"], "ok")
-        self.assertEqual(imports["results"]["p1-b2"]["status"], "skipped")
-        self.assertEqual(workspace.summary(jid)["imported"], 2)
+        self.assertEqual(imports["results"]["p1-b2"]["status"], "ok")
+        self.assertEqual(workspace.summary(jid)["imported"], 3)
 
     def test_review_edit_recomputes_health_and_unlocks_import(self):
         from pipeline.studio import merge
@@ -1869,6 +2124,601 @@ class StudioLlmTests(unittest.TestCase):
         self.assertEqual(seen["ladder"], ("gemini-3.5-flash",))
         self.assertEqual(cfg.gemini_model_ladder,
                          ("gemini-3.5-flash-lite", "gemini-3.5-flash"))
+
+
+class StudioPersianTests(unittest.TestCase):
+    """Half-spaces (ZWNJ) put back into text that arrived without them.
+
+    The exam PDF's text layer carries no ZWNJ at all in body text, so the
+    repair has to be rule-based and narrow. Every string here is written with
+    \\u escapes so the assertions do not depend on how a terminal renders
+    Persian.
+    """
+
+    def test_a_verb_prefix_gets_its_half_space(self):
+        from pipeline.studio import persian
+        # "mishavad" / "nemikonad"
+        self.assertEqual(persian.restore("\u0645\u06cc\u0634\u0648\u062f"),
+                         "\u0645\u06cc\u200c\u0634\u0648\u062f")
+        self.assertEqual(persian.restore("\u0646\u0645\u06cc\u06a9\u0646\u062f"),
+                         "\u0646\u0645\u06cc\u200c\u06a9\u0646\u062f")
+
+    def test_a_word_that_merely_starts_with_the_prefix_is_untouched(self):
+        from pipeline.studio import persian
+        for word in ("\u0645\u06cc\u0627\u0646",      # mian (middle)
+                     "\u0645\u06cc\u062f\u0627\u0646",  # meydan (field)
+                     "\u062a\u0646\u0647\u0627"):        # tanha (only)
+            self.assertEqual(persian.restore(word), word)
+
+    def test_a_plural_suffix_gets_its_half_space(self):
+        from pipeline.studio import persian
+        # "ketab-ha-ye" -> "ketab\u200c-ha-ye"
+        self.assertEqual(persian.restore("\u06a9\u062a\u0627\u0628\u0647\u0627\u06cc"),
+                         "\u06a9\u062a\u0627\u0628\u200c\u0647\u0627\u06cc")
+
+    def test_a_word_that_already_has_its_half_space_is_not_touched(self):
+        from pipeline.studio import persian
+        word = "\u0645\u06cc\u200c\u0634\u0648\u062f"
+        self.assertEqual(persian.restore(word), word)
+
+    def test_the_comparative_is_not_split(self):
+        from pipeline.studio import persian
+        # "bishtar" (more) is one printed word: splitting it invents a word.
+        self.assertEqual(persian.restore("\u0628\u06cc\u0634\u062a\u0631"),
+                         "\u0628\u06cc\u0634\u062a\u0631")
+
+    def test_text_without_persian_is_returned_unchanged(self):
+        from pipeline.studio import persian
+        for text in ("", "N8 = 20 g", "x(m) 16"):
+            self.assertEqual(persian.restore(text), text)
+
+    def test_latin_runs_inside_persian_are_left_alone(self):
+        from pipeline.studio import persian
+        # "mi-shavad 20 g" - the digits and the unit never gain a half-space.
+        out = persian.restore("\u0645\u06cc\u0634\u0648\u062f 20 g")
+        self.assertIn("20 g", out)
+        self.assertTrue(out.startswith("\u0645\u06cc\u200c\u0634\u0648\u062f"))
+
+    def test_an_extracted_block_carries_the_repaired_text(self):
+        from pipeline.studio import extract
+        block = extract._block("p1-b1", "question", 1, 1,
+                               text="\u0645\u06cc\u0634\u0648\u062f",
+                               options=["\u0646\u0645\u06cc\u06a9\u0646\u062f"])
+        self.assertEqual(block["text"], "\u0645\u06cc\u200c\u0634\u0648\u062f")
+        self.assertEqual(block["options"][0],
+                         "\u0646\u0645\u06cc\u200c\u06a9\u0646\u062f")
+
+class StudioFigureHintTests(unittest.TestCase):
+    """Which text-lane blocks are sent to the model to look for a figure.
+
+    This PDF draws most of its diagrams as vector paths, which
+    ``probe.figure_bounds`` cannot see, so a text block with room below (or
+    between) its words has to be checked by the model.  A tight text run must
+    not be, or every question costs a call.
+    """
+
+    @staticmethod
+    def _block(box, method="text"):
+        return {"key": "p1-b1", "bbox": box, "source": {"method": method},
+                "images": []}
+
+    def test_a_tall_text_block_may_hold_a_figure(self):
+        from pipeline.studio import geometry
+        # 0.20 of the page tall: this is the shape of a stem with a diagram
+        # drawn under it (page 23 question 100).
+        self.assertTrue(geometry._may_hold_figure(
+            self._block([651, 121, 851, 918])))
+
+    def test_a_tight_text_run_may_not(self):
+        from pipeline.studio import geometry
+        # a two-line stem: 0.09 of the page
+        self.assertFalse(geometry._may_hold_figure(
+            self._block([700, 100, 790, 900])))
+
+    def test_a_vision_block_is_never_checked_twice(self):
+        from pipeline.studio import geometry
+        self.assertFalse(geometry._may_hold_figure(
+            self._block([600, 100, 900, 900], method="vision")))
+
+    def test_a_block_without_a_box_is_not_a_candidate(self):
+        from pipeline.studio import geometry
+        self.assertFalse(geometry._may_hold_figure(self._block(None)))
+
+    def test_a_block_that_already_has_an_image_is_skipped(self):
+        from pipeline.studio import geometry
+        block = self._block([600, 100, 900, 900])
+        block["images"] = ["img-1"]
+        source = io.open(geometry.__file__, encoding="utf-8").read()
+        # the pictured list excludes a block that already owns its image
+        self.assertIn('and not block.get("images")', source)
+        # ... and a block that is not a question at all (a prose header)
+        self.assertIn('if block.get("kind") in ("question", "lesson")', source)
+
+class StudioLeadingMarkTests(unittest.TestCase):
+    """A combining mark drawn before a question number must not hide it.
+
+    The exam PDF draws the hamza mark U+0654 as its own glyph, so 127 lines
+    arrive as "\u0654 55- ...".  The splitter's marker pattern needs the digit
+    first, so those questions lost their number and merged into the prose.
+    """
+
+    def test_a_line_keeps_its_offsets_after_the_mark_is_absorbed(self):
+        from pipeline.studio import layout
+        text = "\u0654 55- \u0628\u06cc\u0646\r\n\u062e\u0637"
+        rows = layout._lines_with_offsets(text)
+        self.assertEqual(rows[0][0].startswith("55-"), True)
+        # every offset must still name the characters it points at
+        for line, start, end in rows:
+            self.assertEqual(text[start:end], line)
+
+    def test_the_mark_does_not_hide_a_question_number(self):
+        from pipeline.studio import layout
+        text = ("\u0654 55- \u0628\u06cc\u0646 \u062f\u0648 \u0646\u0642\u0637\u0647 \u062f\u0631\u0635\u062f\r\n"
+                "\u0654 56- \u0627\u0645\u0648\u0627\u062c \u0645\u06a9\u0627\u0646\u06cc\u06a9\u06cc")
+        blocks = layout.split_text(text)
+        numbers = [b["number"] for b in blocks if b["kind"] == "question"]
+        self.assertEqual(numbers, [55, 56])
+
+    def test_an_ordinary_line_is_untouched(self):
+        from pipeline.studio import layout
+        line = "55- \u0628\u06cc\u0646"
+        rows = layout._lines_with_offsets(line)
+        self.assertEqual(rows[0], (line, 0, len(line)))
+
+
+class StudioOrganizerTests(unittest.TestCase):
+    """The anchor organizer: a number glued to a formula still splits."""
+
+    def test_a_glued_number_starts_its_question(self):
+        from pipeline.studio import layout
+        text = ("55- first?\n1) one\n2) two\n3) three\n4) four\n"
+                "0 1657- second?\n1) one\n2) two\n3) three\n4) four\n"
+                "58- third?\n1) one\n2) two\n3) three\n4) four\n")
+        out = layout.split_page(text)
+        numbers = [b["number"] for b in out["blocks"]
+                   if b["kind"] == "question"]
+        self.assertEqual(numbers, [55, 57, 58])
+        self.assertEqual(out["confidence"], 1.0)
+        self.assertEqual(out["last"], 58)
+
+    def test_a_page_carries_the_previous_sequence(self):
+        from pipeline.studio import layout
+        text = ("\u2212 68- fourth?\n1) one\n2) two\n3) three\n4) four")
+        out = layout.split_page(text, start=67)
+        self.assertEqual([b["number"] for b in out["blocks"]
+                          if b["kind"] == "question"], [68])
+
+    def test_a_one_digit_tail_is_renumbered_from_the_sequence(self):
+        from pipeline.studio import layout
+        text = ("65- fifth?\n1) one\n2) two\n3) three\n4) four\n"
+                "J 6- sixth?\n1) one\n2) two\n3) three\n4) four\n"
+                "67- seventh?\n1) one\n2) two\n3) three\n4) four")
+        out = layout.split_page(text)
+        numbers = [b["number"] for b in out["blocks"]
+                   if b["kind"] == "question"]
+        self.assertEqual(numbers, [65, 66, 67])
+
+    def test_an_unanchored_page_falls_back_to_the_line_splitter(self):
+        from pipeline.studio import layout
+        out = layout.split_page("no numbered question here")
+        self.assertEqual(out["confidence"], 0.0)
+        self.assertEqual(out["anchors"], 0)
+
+
+def _two_question_pdf(path):
+    """One text page: Q1 with four options, Q2 with none (confidence 0.5)."""
+    content = (
+        "BT /F1 12 Tf 40 800 Td (1- first question?\\)) Tj ET\n"
+        "BT /F1 12 Tf 40 770 Td (A\\) one) Tj ET\n"
+        "BT /F1 12 Tf 40 750 Td (B\\) two) Tj ET\n"
+        "BT /F1 12 Tf 40 730 Td (C\\) three) Tj ET\n"
+        "BT /F1 12 Tf 40 710 Td (D\\) four) Tj ET\n"
+        "BT /F1 12 Tf 40 650 Td (2- second question?\\)) Tj ET"
+    ).encode("latin-1")
+    return _write_pdf(path, [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length " + str(len(content)).encode() + b" >>\nstream\n"
+        + content + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"])
+
+
+class StudioOrganizePassTests(_StudioStageCase):
+    """The model organize pass over a low-confidence text page (step 1.2)."""
+
+    def _cfg(self):
+        return type("Cfg", (), {"studio_organize": 1})()
+
+    def _run(self, jid, stub):
+        from pipeline.studio import extract
+        self.llm.CALL_OVERRIDE = stub
+        return extract.run(jid, self._cfg(), emit=lambda *a, **k: None)
+
+    def test_a_low_confidence_page_is_reorganized_and_merged(self):
+        pdf = _two_question_pdf(os.path.join(self.src, "two.pdf"))
+        jid = self._job(pdf)
+
+        def stub(**kw):
+            if kw.get("stage") == "extract":
+                return {"text": "", "parsed": {"questions": [
+                    {"number": 1, "stem": "First question?",
+                     "options": ["one", "two", "three", "four"],
+                     "figure": None},
+                    {"number": 2, "stem": "Second question?",
+                     "options": ["w", "x", "y", "z"],
+                     "figure": [100, 100, 300, 300]},
+                    {"number": 3, "stem": "Extra question?",
+                     "options": ["p", "q"], "figure": None}]},
+                    "route": {}, "lane": "stub"}
+            return {"text": "", "parsed": {}, "route": {}, "lane": "stub"}
+
+        out = self._run(jid, stub)
+        self.assertEqual(out["stats"]["organize_calls"], 1)
+        self.assertEqual(out["stats"]["organized_pages"], 1)
+        layer = workspace.read_artifact(jid, "layer1")
+        by_number = {b["number"]: b for b in layer["blocks"]
+                     if b["kind"] == "question"}
+        self.assertEqual(sorted(by_number), [1, 2])
+        first = by_number[1]
+        self.assertEqual(first["text"], "First question?")
+        self.assertEqual(len(first["options"]), 4)
+        self.assertTrue(first["bbox"])                 # text-layer geometry kept
+        self.assertTrue(first["organized"])
+        second = by_number[2]
+        self.assertEqual(len(second["options"]), 4)
+        self.assertEqual(second["figure_bbox"], [100, 100, 300, 300])
+        self.assertTrue(second["has_figure"])
+        self.assertFalse(first["has_figure"])
+        # Q3 is outside the page's anchored range [1, 2]: a question that
+        # continues from another page, not a new one.
+        self.assertNotIn(3, by_number)
+        self.assertEqual(out["stats"]["organized_blocks"], 2)
+        self.assertEqual(out["stats"]["organize_skipped"], 1)
+
+    def test_a_model_question_inside_the_page_range_is_added(self):
+        from pipeline.studio import extract
+        entries = [{"number": 3, "stem": "Third?", "options": ["p", "q"],
+                    "figure": None}]
+        replaced, added, skipped = extract._apply_organize(
+            [], entries, 1, span=(1, 5))
+        self.assertEqual((replaced, added, skipped), (0, 1, 0))
+
+    def test_a_failed_organize_keeps_the_deterministic_blocks(self):
+        pdf = _two_question_pdf(os.path.join(self.src, "two.pdf"))
+        jid = self._job(pdf)
+
+        def boom(**kw):
+            raise RuntimeError("no lane")
+
+        out = self._run(jid, boom)
+        self.assertTrue(out["stats"]["organize_errors"])
+        layer = workspace.read_artifact(jid, "layer1")
+        numbers = [b["number"] for b in layer["blocks"]
+                   if b["kind"] == "question"]
+        self.assertEqual(numbers, [1, 2])
+        self.assertEqual(out["stats"]["organized_pages"], 0)
+
+
+class StudioFigureOwnerTests(_StudioStageCase):
+    """A picture belongs to exactly one question (step 3.1)."""
+
+    def test_the_band_box_round_trips_through_page_coordinates(self):
+        from pipeline.studio import bands
+        band = bands.Band("p1-b1", 1, (100, 200, 500, 800), 595, 842)
+        page = [300, 200, 400, 500]
+        inner = band.to_band(page)
+        back = band.to_page(inner)
+        for got, want in zip(back, page):
+            self.assertLessEqual(abs(got - want), 2)
+
+    def test_an_absolute_figure_outside_the_band_is_rejected(self):
+        from pipeline.studio import bands, geometry
+        band = bands.Band("p1-b1", 1, (0, 35, 595, 800), 595, 842)
+        block = {"key": "p1-b1", "bbox": [80, 60, 620, 940],
+                 "figure_bbox": None, "figure_bboxes": []}
+        stats = {"qa_rejects": 0, "figure_missing": 0}
+        geometry._apply_band_reply(
+            [{"band": band, "block": block}], {"p1-b1": [[0, 0, 50, 50]]},
+            False, stats)
+        self.assertEqual(stats["qa_rejects"], 1)
+        self.assertEqual(stats["figure_rejected"], 1)
+        self.assertIsNone(block["figure_bbox"])
+        self.assertEqual(block["figure_bboxes"], [])
+
+    def test_two_questions_never_share_one_figure(self):
+        from pipeline.studio import geometry
+        pdf = _figure_pdf(os.path.join(self.src, "owner.pdf"))
+        jid = self._job(pdf)
+        figure = [300, 60, 380, 940]
+        blocks = []
+        for key, bbox in (("p1-b1", [100, 50, 400, 950]),
+                          ("p1-b2", [400, 50, 700, 950])):
+            blocks.append(_blk(key, "question", number=len(blocks) + 1,
+                               text="question", bbox=bbox,
+                               bbox_source="text_layer",
+                               figure_bbox=figure,
+                               figure_bboxes=[figure]))
+        workspace.write_artifact(jid, "layer2", {
+            "version": 1, "job_id": jid, "profile": {},
+            "blocks": blocks, "pages": [], "assets": [], "stats": {}})
+        self.llm.CALL_OVERRIDE = lambda **kw: (_ for _ in ()).throw(
+            RuntimeError("no lane"))
+        out = geometry.run(jid, {}, emit=lambda *a, **k: None)
+        self.assertEqual(out["stats"]["figure_dropped"], 1)
+        self.assertEqual(out["stats"]["figure_conflicts"], 1)
+        boxes = workspace.read_artifact(jid, "geometry")["boxes"]
+        self.assertEqual(boxes["p1-b1"]["crop_bbox"], figure)
+        self.assertIsNone(boxes["p1-b2"]["crop_bbox"])
+
+class StudioCoherenceTests(unittest.TestCase):
+    """A print's line breaks must not break sentences (plan 9.1-9.5)."""
+
+    def test_reflow_joins_a_mid_sentence_wrap(self):
+        from pipeline.studio import layout
+        lines = ["اگر در فاصله", "یک شنونده فاصله",
+                 "کاهش یافته است؟ (3 / 0 = log 2)"]
+        out = layout.reflow_lines(lines)
+        self.assertEqual(len(out), 1)
+        self.assertIn("یک شنونده فاصله", out[0])
+        self.assertTrue(out[0].endswith("(3 / 0 = log 2)"))
+        # A line that ends a sentence never swallows the next piece.
+        raw = "\u0631\u0627 6 \u0628\u0631\u0627\u0628\u0650\u06a9\u0646\u062f."
+        two = layout.reflow_lines([
+            raw, "تراز شدت صوت چند دسیب کاهش یافته است؟"])
+        self.assertEqual(len(two), 2)
+
+    def test_reflow_never_swallows_a_structure_line(self):
+        from pipeline.studio import layout
+        lines = ["تراز شدت صوت چند دسیب", "| فیزیک | رشته تجربی | صفحه 13"]
+        self.assertEqual(layout.reflow_lines(lines), lines)
+
+    def test_mid_sentence_breaks_and_one_line(self):
+        from pipeline.studio import layout
+        self.assertTrue(layout.mid_sentence_breaks(
+            "اگر در فاصله\nیک شنونده فاصله"))
+        self.assertFalse(layout.mid_sentence_breaks(
+            "را 6 برابر می\u200cکند.\nاگر در فاصله"))
+        self.assertEqual(layout.one_line("الف\n\rب  ج"), "الف ب ج")
+
+    def test_split_text_composes_a_flowing_stem(self):
+        from pipeline.studio import layout
+        text = ("1- اولین پرسش این است\n"
+                "که پاسخ حقوقی کدام است؟\n"
+                "1) الف\n2) ب\n3) ج\n4) د\n")
+        blocks = layout.split_text(text)
+        self.assertEqual(blocks[0]["text"],
+                         "اولین پرسش این است که پاسخ حقوقی کدام است؟")
+        self.assertEqual([o["text"] for o in blocks[0]["options"]],
+                         ["الف", "ب", "ج", "د"])
+
+    def test_organize_gate_reads_coherence_not_just_confidence(self):
+        from pipeline.studio import extract
+        cfg = type("Cfg", (), {"studio_organize": 1})()
+        record = {"method": "text", "layout": {"confidence": 1.0}}
+        self.assertTrue(extract._organize_enabled(
+            cfg, record, [{"text": "اگر در فاصله\nیک شنونده"}]))
+        self.assertFalse(extract._organize_enabled(
+            cfg, record, [{"text": "را 6 برابر می\u200cکند.\nاگر در فاصله"}]))
+
+    def test_sanitize_entry_flattens_model_prose(self):
+        from pipeline.studio import extract
+        stats = {"organize_sanitized": 0}
+        entry = {"number": 55, "stem": "اگر در فاصله\nیک شنونده",
+                 "options": ["الف\nب", "ج"], "figure": None}
+        extract._sanitize_entry(entry, stats)
+        self.assertEqual(entry["stem"], "اگر در فاصله یک شنونده")
+        self.assertEqual(entry["options"], ["الف ب", "ج"])
+        self.assertEqual(stats["organize_sanitized"], 1)
+        clean = {"number": 56, "stem": "ساده", "options": ["الف"],
+                 "figure": None}
+        extract._sanitize_entry(clean, stats)
+        self.assertEqual(stats["organize_sanitized"], 1)
+
+    def test_enrich_rebuilds_numeric_option_labels(self):
+        from pipeline.studio import enrich
+        block = {"key": "p1-b1", "kind": "question", "number": 55,
+                 "text": "", "options": ["6", "16", "12", "26"],
+                 "fixes": [], "issues": [], "proposed": []}
+        enrich._apply(block, {"options": ["16", "6", "12", "26"]}, {}, [], [])
+        self.assertEqual(block["options"],
+                         ["1) 16", "2) 6", "3) 12", "4) 26"])
+        self.assertIn("options repaired", block["fixes"])
+
+    def test_enrich_keeps_letter_labels_verbatim(self):
+        from pipeline.studio import enrich
+        opts = ["\u0627\u0644\u0641) \u06cc\u06a9",
+                "\u0628) \u062f\u0648"]
+        block = {"key": "p1-b1", "kind": "question", "number": 2,
+                 "text": "", "options": list(opts),
+                 "fixes": [], "issues": [], "proposed": []}
+        enrich._apply(block, {"options": list(opts)}, {}, [], [])
+        self.assertEqual(block["options"], opts)
+
+    def test_enrich_flattens_wrapped_patch_options(self):
+        from pipeline.studio import enrich
+        block = {"key": "p1-b1", "kind": "question", "number": 56,
+                 "text": "", "options": [], "fixes": [], "issues": [],
+                 "proposed": []}
+        enrich._apply(block, {"options": ["\u0627\u0645\u0648\u0627\u062c\n\u0645\u06a9\u0627\u0646\u06cc\u06a9\u06cc"]},
+                      {}, [], [])
+        self.assertEqual(block["options"], ["1) امواج مکانیکی"])
+
+
+    def test_the_organize_prompt_demands_flowing_prose(self):
+        from pipeline.studio.extract import ORGANIZE_PAGE_PROMPT
+        self.assertIn("ONE flowing paragraph", ORGANIZE_PAGE_PROMPT)
+        self.assertIn("no newline character", ORGANIZE_PAGE_PROMPT)
+        self.assertIn("printed visual order", ORGANIZE_PAGE_PROMPT)
+
+    def test_enrich_leaves_a_flowing_stem_and_flat_options(self):
+        from pipeline.studio import enrich
+        block = {"key": "p1-b1", "kind": "question", "number": 55,
+                 "text": "اگر در فاصله\nیک شنونده فاصله",
+                 "options": ["1) الف\nب", "2) ج"], "fixes": [],
+                 "issues": [], "proposed": []}
+        enrich._apply(block, {"options": None}, {}, [], [])
+        self.assertEqual(block["text"], "اگر در فاصله یک شنونده فاصله")
+        self.assertIn("stem reflowed", block["fixes"])
+        self.assertEqual(block["options"], ["1) الف ب", "2) ج"])
+        self.assertIn("options reflowed", block["fixes"])
+
+    def test_health_flags_a_surviving_coherence_break(self):
+        from pipeline.studio import enrich
+        block = {"key": "p1-b1", "kind": "question", "number": 55,
+                 "text": "اگر در فاصله\nیک شنونده فاصله", "options": [],
+                 "issues": [], "proposed": [], "fixes": []}
+        status, issues = enrich._health(block, [], {})
+        self.assertEqual(status, "warn")
+        self.assertIn("coherence", issues)
+
+    def test_health_is_clean_for_flowing_text(self):
+        from pipeline.studio import enrich
+        block = {"key": "p1-b1", "kind": "question", "number": 55,
+                 "text": "اگر در فاصله یک شنونده فاصله", "options": [],
+                 "issues": [], "proposed": [], "fixes": []}
+        status, issues = enrich._health(block, [], {})
+        self.assertNotIn("coherence", issues)
+
+
+class StudioMetadataPolicyTests(_StudioStageCase):
+    """A paper with no metadata line must not warn once per row."""
+
+    def _run(self, blocks):
+        from pipeline.studio import enrich
+        jid = _seed_layer1(workspace.new_id(), blocks)
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        self.llm.CALL_OVERRIDE = _echo_stub
+        out = enrich.run(jid, {}, emit=lambda *a, **k: None)
+        layer = workspace.read_artifact(jid, "layer2")
+        return out, {b["key"]: b for b in layer["blocks"]}
+
+    @staticmethod
+    def _question(key, **kw):
+        base = dict(number=kw.pop("number", 1), text="stem " + key,
+                    subject="subject", topic="topic",
+                    options=["1) a", "2) b", "3) c", "4) d"])
+        base.update(kw)
+        return _blk(key, "question", **base)
+
+    def test_a_job_with_no_metadata_line_stays_ready(self):
+        out, blocks = self._run([
+            self._question("p1-b1", number=1),
+            self._question("p1-b2", number=2),
+        ])
+        first = blocks["p1-b1"]
+        self.assertEqual(first["status"], "ready")
+        self.assertEqual(first["missing"], ["corp", "year"])
+        self.assertEqual(out["stats"]["metadata_missing"], ["corp", "year"])
+        self.assertEqual(out["stats"]["ready"], 2)
+        self.assertEqual(out["stats"]["warn"], 0)
+
+    def test_a_field_one_row_can_supply_still_warns_the_others(self):
+        out, blocks = self._run([
+            self._question("p1-b1", number=1, corp="institute"),
+            self._question("p1-b2", number=2),
+        ])
+        self.assertEqual(blocks["p1-b1"]["status"], "ready")
+        self.assertEqual(blocks["p1-b1"]["missing"], ["year"])
+        self.assertEqual(blocks["p1-b2"]["status"], "warn")
+        self.assertEqual(blocks["p1-b2"]["missing"], ["corp", "year"])
+        self.assertEqual(out["stats"]["metadata_missing"], ["year"])
+
+
+class StudioScorecardTests(_StudioStageCase):
+    """The job card counts only what the rows already hold."""
+
+    def test_the_scorecard_counts_rows_topics_options_and_crops(self):
+        from pipeline.studio import merge
+        known = tags_mod.known_topics()[0]
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        blocks = [
+            _blk("p1-b1", "question", number=1, text="one",
+                 options=["1) a", "2) b", "3) c", "4) d"]),
+            _blk("p1-b2", "question", number=2, text="two",
+                 options=["1) a", "2) b"]),
+            _blk("p1-p1", "prose", order=3, text="header"),
+        ]
+        blocks = [
+            dict(blocks[0], status="ready", topic=known, corp="c", year="1402",
+                 has_figure=True, organized=True),
+            dict(blocks[1], status="warn", topic="zzz-unknown", corp="c",
+                 year="1402"),
+            dict(blocks[2], status="warn"),
+        ]
+        workspace.write_artifact(jid, "layer2", {
+            "version": 1, "job_id": jid, "profile": {"static": {}},
+            "blocks": blocks, "pages": [{"page": 1, "method": "text",
+                                         "layout": {"confidence": 0.5}}],
+            "assets": [], "stats": {}})
+        workspace.write_artifact(jid, "geometry", {
+            "version": 1, "job_id": jid, "stats": {}, "boxes": {
+                "p1-b1": {"bbox": [10, 10, 40, 90], "crop_bbox": [12, 12, 30, 80],
+                          "crop_approved": True, "crop_page": 1,
+                          "crop_source": "asset"},
+                "p1-b2": {"bbox": [50, 10, 70, 90],
+                          "crop_bbox": [52, 12, 60, 80],
+                          "crop_approved": None, "crop_page": 1,
+                          "crop_source": "model"},
+            }})
+        view = merge.merged(jid)
+        card = view["scorecard"]
+        self.assertEqual(card["blocks"], 3)
+        self.assertEqual(card["questions"], 2)
+        self.assertEqual(card["prose"], 1)
+        self.assertEqual(card["ready"], 1)
+        self.assertEqual(card["warn"], 2)
+        self.assertEqual(card["four_options"], 1)
+        self.assertEqual(card["fewer_options"], 1)
+        self.assertEqual(card["topics"], 2)
+        self.assertEqual(card["topics_known"], 1)
+        self.assertEqual(card["topics_unknown"], 1)
+        self.assertEqual(card["crops"], 2)
+        self.assertEqual(card["crops_approved"], 1)
+        self.assertEqual(card["crops_awaiting"], 1)
+        self.assertEqual(card["layout_confidence"], 0.5)
+        self.assertEqual(card["organized"], 1)
+        self.assertEqual(card["figures"], 1)
+        self.assertEqual(card["metadata_missing"], [])
+
+
+class StudioFigureOwnershipTests(_StudioStageCase):
+    """Nearest question keeps a shared picture; a far one is rejected."""
+
+    def test_the_nearest_question_keeps_a_shared_figure(self):
+        from pipeline.studio import geometry
+        figure = [400, 400, 500, 500]
+        near = _blk("p1-b2", "question", number=2, bbox=[430, 430, 470, 470],
+                    figure_bboxes=[figure])
+        far = _blk("p1-b1", "question", number=1, bbox=[0, 0, 1000, 550],
+                   figure_bboxes=[figure])
+        stats = {}
+        dropped = geometry._dedupe_figures([far, near], stats)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(stats["figure_conflicts"], 1)
+        self.assertEqual(near["figure_bboxes"], [figure])
+        self.assertEqual(far["figure_bboxes"], [])
+
+
+class StudioOrganizeModeTests(unittest.TestCase):
+    """The per-run organize choice (auto / off / all)."""
+
+    def test_modes_and_the_env_gate(self):
+        import types
+        from pipeline.studio import extract
+        text = {"method": "text"}
+        on = types.SimpleNamespace(studio_organize=1)
+        off = types.SimpleNamespace(studio_organize=0)
+        self.assertTrue(extract._organize_enabled(on, text, [], "auto"))
+        self.assertFalse(extract._organize_enabled(off, text, [], "auto"))
+        self.assertTrue(extract._organize_enabled(off, text, [], "all"))
+        self.assertFalse(extract._organize_enabled(on, text, [], "off"))
+        self.assertFalse(extract._organize_enabled(
+            on, {"method": "text", "answer_key": True}, [], "all"))
+        self.assertFalse(extract._organize_enabled(on, {"method": "vision"},
+                                                   [], "all"))
 
 
 if __name__ == "__main__":

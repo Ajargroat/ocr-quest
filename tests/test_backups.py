@@ -104,6 +104,44 @@ class SourceSnapshotTests(unittest.TestCase):
                     os.environ["BACKUP_KEEP"] = old_keep
 
 
+class BackupJsonAdapterTests(unittest.TestCase):
+    """The SQL dump must adapt jsonb containers (the dict crash).
+
+    lesson_blocks/questions/media_assets carry jsonb columns, and psycopg2
+    has no default adapter for a dict: without Json() the whole backup dies
+    with "can't adapt type 'dict'" and writes no set at all.
+    """
+
+    def test_a_container_becomes_the_json_adapter(self):
+        from psycopg2.extras import Json
+        from pipeline.backups import _sql_value
+        value = _sql_value({"a": 1})
+        self.assertIsInstance(value, Json)
+        self.assertEqual(value.adapted, {"a": 1})
+        self.assertIsInstance(_sql_value([1, 2]), Json)
+
+    def test_a_plain_value_is_passed_through(self):
+        from pipeline.backups import _sql_value
+        self.assertEqual(_sql_value("x"), "x")
+        self.assertEqual(_sql_value(7), 7)
+        self.assertIsNone(_sql_value(None))
+
+    def test_the_raw_dict_is_exactly_what_psycopg2_refused(self):
+        import psycopg2
+        with self.assertRaises(psycopg2.ProgrammingError) as ctx:
+            psycopg2.extensions.adapt({"a": 1})
+        self.assertIn("can't adapt type 'dict'", str(ctx.exception))
+        # the adapter the dumper actually uses is accepted
+        psycopg2.extensions.adapt(__import__("psycopg2.extras",
+                                             fromlist=["Json"]).Json({"a": 1}))
+
+    def test_jsonable_passes_containers_through(self):
+        from pipeline.backups import _jsonable
+        self.assertEqual(_jsonable({"a": 1}), {"a": 1})
+        self.assertEqual(_jsonable([1, 2]), [1, 2])
+        self.assertIs(_jsonable(True), True)
+
+
 class TableListTests(unittest.TestCase):
     """C1d: one allowlist drives the backup job, the console and its guard."""
 

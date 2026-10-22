@@ -3,6 +3,7 @@ Runs in a background thread and pushes live events to the dashboard."""
 import asyncio
 import base64
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -16,14 +17,15 @@ from .config import Config
 from .db import Database
 from .gemini import set_proxy
 from .gemini_router import router, mask
-from .questions import QUESTION_PROMPT, build_question_rows
+from .questions import (build_question_rows, pages_prompt, question_prompt,
+                        split_pages)
 from .scanner import scan
 from .storage import upload_file
 from .vision import call_ocr_openai
 
 
 def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None,
-              key_pin=None):
+              key_pin=None, labels=None):
     """Dispatch one OCR request to the configured engine.
 
     Lives in the runner (not vision.py) on purpose: the Gemini lane is the
@@ -42,7 +44,8 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None,
         # record its own (criterion 6 covers both sections).
         started = time.monotonic()
         parsed = call_ocr_openai(cfg, prompt, data_b64, mime_type,
-                                 on_problem=on_problem, on_route=on_route)
+                                 on_problem=on_problem, on_route=on_route,
+                                 labels=labels)
         try:
             router._calls_append(
                 getattr(cfg, "ocr_api_key", "") or "",
@@ -56,13 +59,124 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None,
         # Parallel lane: one PINNED key, its own ladder, no key rotation.
         parsed, _raw, _route = router.call_pinned(
             cfg, key_pin, prompt, data_b64, mime_type,
-            on_problem=on_problem, on_route=on_route)
+            on_problem=on_problem, on_route=on_route, labels=labels)
         return parsed
     parsed, _raw, _route = router.call(
         cfg, prompt, data_b64, mime_type,
-        on_problem=on_problem, on_route=on_route)
+        on_problem=on_problem, on_route=on_route, labels=labels)
     return parsed
 
+
+# ── pages per call: several page images of one paper in a single OCR call ──
+# The converter splits a paper into <base>-1.jpg, <base>-2.jpg, ... . Those
+# files sort as -1, -10, -2 (lexicographic), so a run is collected by base
+# name and only then put back in reading order. A run never crosses a folder,
+# a type or a paper. This is a pure optimisation: the pages-per-call setting
+# decides how many travel together, and every page still gets its own source
+# row, its own DB rows and its own archive step.
+_PAGE_SUFFIX = re.compile(r"^(?P<base>.+)-(?P<page>\d+)$")
+
+
+def _page_of(item):
+    """(paper base name, page number) from a file name, or (None, None)."""
+    stem = os.path.splitext(item.file_name or "")[0]
+    match = _PAGE_SUFFIX.match(stem)
+    if not match:
+        return None, None
+    return match.group("base"), int(match.group("page"))
+
+
+def _page_key(item):
+    """The run a page belongs to — None for anything that is not a page image."""
+    base, _page = _page_of(item)
+    if base is None or not (item.mime_type or "").lower().startswith("image/"):
+        return None
+    return (os.path.dirname(item.file_path or "").lower(), item.type, base)
+
+
+def page_runs(items, per_call):
+    """Split the queue into runs of consecutive page images of one paper."""
+    if per_call <= 1:
+        return [[item] for item in items]
+    runs, current, key = [], [], None
+    for item in items:
+        item_key = _page_key(item)
+        if item_key is None:
+            if current:
+                runs.append(current)
+            current, key = [], None
+            runs.append([item])
+            continue
+        if current and (item_key != key or len(current) >= per_call):
+            runs.append(current)
+            current = []
+        if not current:
+            key = item_key
+        current.append(item)
+    if current:
+        runs.append(current)
+    return [sorted(run, key=lambda it: _page_of(it)[1]) for run in runs]
+
+
+def _page_ocr_prepass(hub, cfg, db, items, per_call, log):
+    """OCR each run of page images in one call -> {source_id: parsed}.
+
+    Errors are swallowed on purpose: a batch that fails only costs one wasted
+    call, and the files then take their normal one-picture path with the
+    usual fault reporting, blocking and retry behaviour.
+    """
+    runs = [run for run in page_runs(items, per_call) if len(run) > 1]
+    if not runs:
+        return {}
+    covered = sum(len(run) for run in runs)
+    log("info", f"Pages per call: {per_call} — {len(runs)} batch(es) for "
+                f"{covered} of {len(items)} file(s)")
+    prefetched = {}
+    for run in runs:
+        if hub.stop_flag.is_set():
+            break
+        pages = [_page_of(item)[1] for item in run]
+        blobs, labels = [], []
+        for item, page in zip(run, pages):
+            try:
+                with open(item.file_path, "rb") as fh:
+                    blobs.append(base64.b64encode(fh.read()).decode())
+            except OSError:
+                blobs = []
+                break
+            labels.append("PAGE %d:" % page)
+        if not blobs:
+            log("warn", f"  ↳ page batch {pages} skipped — a page file could "
+                        "not be read")
+            continue
+        is_question = run[0].type == "سوال"
+        try:
+            if is_question:
+                parsed = _call_ocr(cfg, pages_prompt(), blobs, run[0].mime_type,
+                                   labels=labels)
+                split = split_pages(parsed, pages)
+                field = "questions"
+            else:
+                candidates = db.fetch_context_questions(
+                    run[0].subject, run[0].topic, run[0].grade)
+                parsed = _call_ocr(
+                    cfg, build_answer_prompt(candidates, pages=len(run)),
+                    blobs, run[0].mime_type, labels=labels)
+                split = split_pages(parsed, pages, key="answers")
+                field = "answers"
+        except Exception as exc:               # noqa: BLE001 - never fatal
+            flt = getattr(exc, "fault", None) or faults.classify(exc)
+            log("warn", f"  ↳ page batch {pages} failed ({flt['label']}) — each "
+                        "page takes its own call instead", flt.get("kind"))
+            continue
+        found = 0
+        for item, page in zip(run, pages):
+            entry = split.get(page) or {field: []}
+            prefetched[item.source_id] = {"parsed": entry, "ocr_ready": True}
+            found += len(entry.get(field) or [])
+        log("info", f"  ↳ pages {pages[0]}-{pages[-1]} read in one call "
+                    f"({found} {field})")
+    return prefetched
 
 def missing_credentials(cfg):
     """Pre-flight gate — the env names a run's active providers need.
@@ -328,13 +442,19 @@ def _run_serial(hub: Hub, cfg: Config, db: Database, items, log):
     limit = deferrals.max_consecutive_failures()
     stopped = False
     blocked = 0
+    # Pages per call: OCR the page images of one paper together before the
+    # per-file loop, then hand each file its own slice of that one reply.
+    per_call = max(1, int(getattr(cfg, "ocr_pages_per_call", 1) or 1))
+    prefetched = _page_ocr_prepass(hub, cfg, db, items, per_call, log) \
+        if per_call > 1 else {}
     for index, item in enumerate(items, 1):
         if hub.stop_flag.is_set():
             stopped = True
             log("warn", f"Stop requested — halting after file {index - 1} of "
                         f"{len(items)}; the remaining files stay for the next run.")
             break
-        outcome = _process_item(hub, cfg, db, item, index, len(items))
+        outcome = _process_item(hub, cfg, db, item, index, len(items),
+                                pre=prefetched.get(item.source_id))
         if outcome == "clean":
             hub.db_fail_streak = 0
         elif outcome == "blocked":
@@ -418,7 +538,7 @@ def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
             bundle["raw"] = raw
             bundle["data_b64"] = base64.b64encode(raw).decode()
             if item.type == "سوال":
-                bundle["prompt"] = QUESTION_PROMPT
+                bundle["prompt"] = question_prompt()
                 bundle["candidates"] = None
             else:
                 candidates = db.fetch_context_questions(
@@ -718,11 +838,21 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
         log("info", f"[{index}/{total}] {branch}: {item.rel_path}")
 
         if pre is not None:
-            # Parallel lane already read the file + uploaded it + OCR'd it.
+            # Parallel lane already read the file + uploaded it + OCR'd it; the
+            # pages-per-call prepass already OCR'd it (ocr_ready) but the file
+            # still needs its own upload here.
             storage_url = pre.get("storage_url")
             parsed = pre.get("parsed")
             candidates = pre.get("candidates")
-            if storage_url is None:            # the lane's upload failed
+            if storage_url is None and pre.get("ocr_ready"):
+                with open(item.file_path, "rb") as fh:
+                    raw = fh.read()
+                phase = "Supabase upload"
+                file_event("uploading", "Uploading to Supabase Storage")
+                storage_url = upload_file(cfg, item.source_id, raw,
+                                          item.mime_type, on_problem=on_problem)
+                check_stop("Supabase upload")
+            elif storage_url is None:          # the lane's upload failed
                 raise pre.get("error") or faults.FaultError(
                     faults.fault("unknown"), "parallel lane produced no upload")
         else:
@@ -754,7 +884,7 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
                     raise pre.get("error") or faults.FaultError(
                         faults.fault("unknown"), "parallel lane produced no OCR")
             else:
-                parsed = _call_ocr(cfg, QUESTION_PROMPT, data_b64, item.mime_type,
+                parsed = _call_ocr(cfg, question_prompt(), data_b64, item.mime_type,
                                    on_problem=on_problem, on_route=on_route)
             check_stop("gemini-ocr")
             rows = build_question_rows(item, parsed, storage_url)
@@ -771,9 +901,12 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
             # ---------- ANSWER BRANCH ----------
             phase = "DB context read"
             file_event("ocr", "Fetching related questions from DB")
-            if pre is None:
-                candidates = db.fetch_context_questions(item.subject, item.topic, item.grade)
-                prompt = build_answer_prompt(candidates)
+            if pre is None or candidates is None:
+                # the pages-per-call prepass carries the OCR but not the bank
+                candidates = db.fetch_context_questions(item.subject, item.topic,
+                                                        item.grade)
+                if pre is None:
+                    prompt = build_answer_prompt(candidates)
 
             phase = "OCR"
             file_event("ocr", f"{ocr_label} is extracting answers")
