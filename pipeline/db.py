@@ -295,7 +295,11 @@ class Database:
           year            = EXCLUDED.year,
           difficulty      = EXCLUDED.difficulty,
           tags            = EXCLUDED.tags,
-          review_status   = EXCLUDED.review_status,
+          review_status   = CASE
+            WHEN questions.review_status IN ('approved', 'rejected')
+              THEN questions.review_status
+            ELSE EXCLUDED.review_status
+          END,
           raw_ocr_text    = EXCLUDED.raw_ocr_text,
           content_hash    = EXCLUDED.content_hash,
           split           = EXCLUDED.split,
@@ -385,7 +389,7 @@ class Database:
         ON CONFLICT (id) DO UPDATE SET
           legacy_id            = EXCLUDED.legacy_id,
           source_id            = EXCLUDED.source_id,
-          question_id          = EXCLUDED.question_id,
+          question_id          = COALESCE(EXCLUDED.question_id, answers.question_id),
           legacy_question_id   = EXCLUDED.legacy_question_id,
           question_number      = EXCLUDED.question_number,
           answer_explanation   = EXCLUDED.answer_explanation,
@@ -399,7 +403,11 @@ class Database:
           year                 = EXCLUDED.year,
           difficulty           = EXCLUDED.difficulty,
           tags                 = EXCLUDED.tags,
-          review_status        = EXCLUDED.review_status,
+          review_status        = CASE
+            WHEN answers.review_status IN ('approved', 'rejected')
+              THEN answers.review_status
+            ELSE EXCLUDED.review_status
+          END,
           raw_ocr_text         = EXCLUDED.raw_ocr_text,
           content_hash         = EXCLUDED.content_hash,
           grade                = EXCLUDED.grade
