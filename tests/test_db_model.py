@@ -170,6 +170,27 @@ class QuestionUpsertTests(unittest.TestCase):
         self.assertIn("h", params)
 
 
+class ReimportProtectionTests(unittest.TestCase):
+    """Re-imports must not erase human decisions or manually repaired links."""
+
+    def test_question_upsert_preserves_terminal_review_status(self):
+        call = make_db()
+        call.upsert_questions([question_row(review_status="approved")])
+        sql = call.calls[0]["sql"]
+        self.assertIn("WHEN questions.review_status IN ('approved', 'rejected')", sql)
+        self.assertIn("THEN questions.review_status", sql)
+        self.assertIn("ELSE EXCLUDED.review_status", sql)
+
+    def test_answer_upsert_preserves_terminal_review_status_and_existing_link(self):
+        db = make_db()
+        db.upsert_answers([answer_row(review_status="approved", question_id=None)])
+        sql = db.calls[0]["sql"]
+        self.assertIn("COALESCE(EXCLUDED.question_id, answers.question_id)", sql)
+        self.assertIn("WHEN answers.review_status IN ('approved', 'rejected')", sql)
+        self.assertIn("THEN answers.review_status", sql)
+        self.assertIn("ELSE EXCLUDED.review_status", sql)
+
+
 class FolderIdTests(unittest.TestCase):
     def test_folder_id_from_rel_path(self):
         self.assertEqual(folder_id("zist/10/gavarish/question/a.jpg"),
