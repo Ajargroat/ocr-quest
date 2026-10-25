@@ -24,7 +24,7 @@ from pipeline.revision.polish import (apply_digit_policy, delimiters_balanced,  
                                       fix_coeffs, polish_answer_row, polish_row,
                                       sanitize_math, wrap_bare)
 from pipeline.scanner import SourceItem                                      # noqa: E402
-from pipeline.utils import norm_text, parse_number, sha1_hex, to_english_digits
+from pipeline.utils import norm_text, parse_grade, parse_number, sha1_hex, to_english_digits
 
 
 def source_item(**overrides):
@@ -46,6 +46,14 @@ class TestUtils(unittest.TestCase):
     def test_norm_text_collapses_whitespace(self):
         self.assertEqual(norm_text("  a\n\t b  "), "a b")
         self.assertEqual(norm_text(None), "")
+
+    def test_parse_grade_is_the_digit_a_smallint_column_stores(self):
+        self.assertEqual(parse_grade("دوازدهم"), 12)
+        self.assertEqual(parse_grade("۱۲"), 12)
+        self.assertEqual(parse_grade(" 11 "), 11)
+        self.assertIsNone(parse_grade("نامعلوم"))
+        self.assertIsNone(parse_grade(""))
+        self.assertIsNone(parse_grade(None))
 
 
 class TestGeminiJsonExtraction(unittest.TestCase):

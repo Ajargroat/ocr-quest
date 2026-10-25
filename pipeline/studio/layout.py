@@ -117,14 +117,16 @@ _LEAD_MARKS = "\u0654\u064b\u064c\u064d\u064e\u064f\u0650\u0651\u0652\u0670"
 
 # A value followed by an option label: "200 , NaNO3 )1". The label comes last
 # in the stream because the producer draws the number after the value it
-# belongs to, so the pair is read back to front.
+# belongs to, so the pair is read back to front. The bracket is sometimes
+# drawn as "(1" instead of ")1" — the vision lane transcribes the print's two
+# glyph shapes as it sees them — so both are read.
 _TAIL_LABEL_RE = re.compile(
-    r"^(?P<value>.*?\S)\s*\)\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])\s*$")
+    r"^(?P<value>.*?\S)\s*[\)(]\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])\s*$")
 
 # A row of four value/label pairs on one line, drawn right to left:
 # "120 )4 100 )3 90 )2 80 )1". The labels are the anchors.
 _PAIR_RE = re.compile(
-    r"(?P<value>.*?)\s*\)\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])(?=\s|$)")
+    r"(?P<value>.*?)\s*[\)(]\s*(?P<label>[1-4\u06F1-\u06F4\u0661-\u0664])(?=\s|$)")
 # A lone dash opens a numberless question (the booklet prints no number).
 _DASH_STEM_RE = re.compile(r"^[\-–—ـ]")
 

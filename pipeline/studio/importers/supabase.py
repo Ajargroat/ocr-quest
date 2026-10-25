@@ -1,4 +1,4 @@
-﻿"""Supabase target — upload the approved crops, then upsert rows.
+"""Supabase target — upload the approved crops, then upsert rows.
 
 Sources never enter the bucket: they stay in the folder tree and the row
 references one by its folder id (Q8/Q11). Every approved crop uploads under a
@@ -21,6 +21,7 @@ from pipeline.scanner import ALLOWED_EXTENSIONS, TYPE_DIRS, SourceItem
 from pipeline.studio import geometry, merge, workspace
 from pipeline.studio.importers.rows import (build_rows, diagram_urls,
                                             job_source_id)
+from pipeline.utils import parse_grade
 
 def _external_crop(job_id, block, cfg, folder, cache, emit):
     """Upload the reviewer's finished picture — as-is, never re-cut.
@@ -116,18 +117,17 @@ def _job_meta(job_id):
         return {}
 
 def _grade(value):
-    """The sources.grade column is an INTEGER: a non-numeric grade is None."""
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
+    """sources.grade is a SMALLINT: a Persian grade name becomes its digit."""
+    return parse_grade(value)
 
 def _source_item(job_id, view, rows):
     """The `sources` row the imported rows point at.
 
-    The studio keeps its sources in the folder tree (never in the bucket), so
-    there is no storage url and no rel_path - folder_id stays empty, which
-    the column allows (NOT NULL, but empty is a value).
+    The studio keeps its sources in its own folder system
+    (``STUDIO_SOURCE_ROOT``, ``<INPUT_ROOT>/studio`` by default) - a tree the
+    old scanner shape never walks - and the row references its folder by the
+    same sha1 id the scanner derives, so the source can be found and backed up
+    later.
     """
     meta = _job_meta(job_id)
     static = (view.get("profile") or {}).get("static") or {}
@@ -138,7 +138,7 @@ def _source_item(job_id, view, rows):
     ext = os.path.splitext(name)[1].lower()
     return SourceItem(
         source_id=job_source_id(view),
-        rel_path="",
+        rel_path=meta.get("rel_path") or "",
         subject=static.get("subject") or first.get("subject"),
         grade=_grade(static.get("grade")),
         topic=static.get("topic") or first.get("topic"),

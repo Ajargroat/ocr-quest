@@ -20,7 +20,6 @@ from pipeline import storage
 from pipeline import recrop
 from pipeline import gemini as gemini_mod
 from pipeline.dataconsole import DataConsole, GuardError
-from pipeline.revision import runner as revision_runner
 from pipeline.config import load_config, ENV_PATH, seed_proxy_profile, save_proxy_store
 from pipeline.db import Database
 from pipeline.gemini_router import router, usage_chart
@@ -573,58 +572,12 @@ async def db_source(source_id: str):
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
 
-class RevisionResolve(BaseModel):
-    id: str
-    action: str
-    entity: str = "question"  # 'question' | 'answer'
-
-
-@app.post("/api/revision/run")
-async def revision_run():
-    started = revision_runner.start(hub, cfg, db)
-    return JSONResponse({"started": started}, status_code=200 if started else 409)
-
-@app.post("/api/revision/stop")
-async def revision_stop():
-    """Halt the revision scan after the current chunk (AI-skipped rows stay
-    pending and are retried by the next run)."""
-    stopping = revision_runner.request_stop()
-    return JSONResponse({"stopping": stopping},
-                        status_code=200 if stopping else 409)
-
-@app.get("/api/revision/state")
-async def revision_state():
-    st = revision_runner.get_state()
-    st["logs"] = hub.rev_tail(160)
-    return JSONResponse(st)
-
-
-@app.get("/api/revision/summary")
-async def revision_summary():
-    return JSONResponse(db.fetch_revision_summary())
-
-
-@app.get("/api/revision/items")
-async def revision_items(view: str = "flagged", limit: int = 200, entity: str = "question"):
-    items = db.fetch_revision_items(view, limit, entity)
-    reports = db.fetch_revision_reports([it["id"] for it in items], entity)
-    for it in items:
-        it["reports"] = reports.get(it["id"], [])
-        if isinstance(it.get("revision_notes"), str):
-            try:
-                it["revision_notes"] = json.loads(it["revision_notes"])
-            except Exception:
-                pass
-    return JSONResponse({"items": items})
-
-
-@app.post("/api/revision/resolve")
-async def revision_resolve(body: RevisionResolve):
-    try:
-        db.resolve_revision(body.id, body.action, body.entity)
-        return JSONResponse({"ok": True})
-    except ValueError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+# The revision engine is retired: its UI was removed, nothing calls these
+# routes and revision_reports/revision_summary are gone from the DB. Its code
+# stays in pipeline/revision/ as a dormant reference for a possible revival,
+# deliberately unimported - so this module holds no /api/revision/* surface.
+# The QBank review fields it used to share (review_status, needs_review) are
+# live and unrelated to it.
 
 class BboxUpdate(BaseModel):
     id: str
@@ -2004,8 +1957,12 @@ async def studio_commit(job_id: str, body: StudioCommitBody):
             commit_mod.apply, cfg, job_id, body.edits, body.crops,
             body.target, body.dry_run, emit)
     except ValueError as exc:
+        emit("commit", "error", str(exc))
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     except Exception as exc:
+        # a failed commit leaves a classified line in the job log, not only a
+        # red response the dashboard never keeps
+        emit("commit", "error", "commit failed: %s" % exc)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True, **result})
 

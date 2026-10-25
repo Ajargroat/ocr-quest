@@ -11,15 +11,17 @@ Layout (all under ``<project>/workspace/`` by default, gitignored):
         crops/            on-demand crop cache
         log.jsonl         append-only, per-stage, cite-able events
 
-The uploaded source does not live here: it is streamed once into the folder
-tree (``<INPUT_ROOT>/studio/<job>/`` by default, ``STUDIO_SOURCE_ROOT``
-overrides it) and ``source_meta.json`` records its tree-relative path plus the
-scanner-derived folder id (Q8/Q11). Nothing here talks to a database or the
-network; it is pure file I/O so the stage code and the UI can both read the
-same bytes.
+The uploaded source does not live here: it is streamed once into the studio's
+own folder system (``<INPUT_ROOT>/studio/<job>/`` by default,
+``STUDIO_SOURCE_ROOT`` overrides it - a tree separate from the old scanned
+``konkour-ocr/{subject}/{grade}/{topic}/{question|answer}`` shape, which the
+scanner never walks) and ``source_meta.json`` records its tree-relative path
+plus the folder id (Q8/Q11). Nothing here talks to a database or the network;
+it is pure file I/O so the stage code and the UI can both read the same bytes.
 """
 import json
 import os
+import posixpath
 import re
 import time
 
@@ -162,8 +164,14 @@ def source_dir(job_id: str) -> str:
 
 
 def folder_id(rel_path: str) -> str:
-    """The scanner's own id derivation, applied to a tree-relative path."""
-    return sha1_hex(rel_path.replace(os.sep, "/"))
+    """The sources row's ``folder_id``: the DIRECTORY a tree-relative path sits in.
+
+    Same derivation ``pipeline/db.folder_id`` applies to a scanned file, so a
+    studio source and a scanned source describe their folder the same way, and
+    the id matches the folder shown on disk under ``STUDIO_SOURCE_ROOT``.
+    """
+    rel = str(rel_path or "").replace(os.sep, "/").strip("/")
+    return posixpath.dirname(rel) or ""
 
 
 def _safe_name(name: str) -> str:

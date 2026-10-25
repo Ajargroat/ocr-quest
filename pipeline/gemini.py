@@ -71,11 +71,17 @@ def proxy_proxies():
 def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 temperature=0.1, max_tokens=16384, retries=None,
                 on_problem=None, on_attempt=None, labels=None,
-                json_mode=False, thinking=None):
+                json_mode=False, thinking=None, raw=False):
     """Sends one image/PDF plus the prompt to Gemini.
     Returns (parsed_json, raw_text, usage) where usage is
     ``{"tokens_in": int, "tokens_out": int}`` (zeros when the response
     carries no ``usageMetadata``).
+
+    ``raw=True`` is for a lane that wants the words, not a JSON body (the OCR
+    prompt): the reply comes back verbatim as the text and ``parsed`` is None.
+    Parsing a page of Persian prose as JSON can only fail, and that failure
+    reads as "the model answered badly" — the ladder then walks every rung for
+    every page.
 
     ``on_problem(fault, attempt, retries, wait)`` is called before every
     back-off sleep so the caller can log tunnel hiccups live.
@@ -136,7 +142,16 @@ def call_gemini(api_key, model, prompt, data_b64, mime_type,
                 parsed, text = outcome["result"]
                 usage = outcome.get("usage") or {}
                 return parsed, text, usage
-            last = outcome
+            if "raw" in outcome and raw:
+                # The lane asked for words, not JSON: hand them over as-is.
+                return None, outcome["raw"], outcome.get("usage") or {}
+            if "raw" in outcome:
+                # JSON was asked for and the reply is not JSON. The words are
+                # not a fault — report the parse, which the router retries on
+                # the next model.
+                last = faults.fault("model_garbage", outcome["error"])
+            else:
+                last = outcome
         if not last["retryable"]:
             raise faults.FaultError(
                 last, f"{last['label']} — {last['hint']} · {last['raw'][:200]}")
@@ -250,13 +265,14 @@ def _outcome(resp):
     text = _extract_text(body)
     if not text:
         return faults.fault("model_empty", "Gemini returned no text content.")
+    tokens_in, tokens_out = _extract_usage(body)
+    usage = {"tokens_in": tokens_in, "tokens_out": tokens_out}
     try:
         parsed = extract_json(text)
     except ValueError as exc:
-        return faults.fault("model_garbage", str(exc))
-    tokens_in, tokens_out = _extract_usage(body)
-    return {"result": (parsed, text),
-            "usage": {"tokens_in": tokens_in, "tokens_out": tokens_out}}
+        # The words are still good — a raw lane reads them (see ``raw``).
+        return {"raw": text, "error": str(exc), "usage": usage}
+    return {"result": (parsed, text), "usage": usage}
 
 
 def _extract_usage(body):

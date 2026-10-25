@@ -1,4 +1,4 @@
-﻿"""Row building: merged view → DB-shaped questions + answers (pure).
+"""Row building: merged view → DB-shaped questions + answers (pure).
 
 Kept free of I/O on purpose: the batch importer, the JSON export and the
 tests all build rows through here, so what the UI approved is exactly what a
@@ -8,7 +8,8 @@ import json
 import re
 
 from pipeline import questions as questions_mod
-from pipeline.utils import norm_text, parse_number, sha1_hex, to_english_digits
+from pipeline.utils import (norm_text, parse_grade, parse_number, sha1_hex,
+                            to_english_digits)
 
 from pipeline.studio import merge
 
@@ -301,7 +302,7 @@ def _question_row(source_id, block, image):
         "diagram_url": url or None,
         "diagram_bbox": json.dumps(real) if real else None,
         "media_images": json.dumps(pictures, ensure_ascii=False),
-        "grade": block.get("grade"),
+        "grade": parse_grade(block.get("grade")),
         "corp": block.get("corp"),
         "year": block.get("year"),
     }
@@ -329,5 +330,5 @@ def _answer_row(source_id, block, by_number):
         "review_status": "pending" if linked else "unlinked",
         "raw_ocr_text": block.get("raw_ocr_text"),
         "content_hash": sha1_hex(norm_text(block.get("key") or "")),
-        "grade": block.get("grade"),
+        "grade": parse_grade(block.get("grade")),
     }

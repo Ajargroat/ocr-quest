@@ -104,6 +104,66 @@ class StudioFaultTests(unittest.TestCase):
             got = studio_faults.classify(exc)
         self.assertEqual(got["kind"], "no_source")
 
+    def test_a_rejected_database_write_is_a_database_fault(self):
+        # Phase-1 live import: a Persian grade reached a smallint column and
+        # the reply the log kept was a bare, unnamed failure string.
+        cases = (
+            'invalid input syntax for type smallint: "\u062f\u0648\u0627\u0632\u062f\u0647\u0645"',
+            'duplicate key value violates unique constraint "questions_legacy_id_key"',
+            'relation "public.questions" does not exist',
+            "terminating connection due to administrator command",
+        )
+        for text in cases:
+            got = studio_faults.classify_text(text)
+            self.assertEqual(got["kind"], "db_down", text)
+            self.assertTrue(got["hint"], text)
+
+
+class StudioImportFailureLogTests(unittest.TestCase):
+    """A failed import leaves a classified line in the job log."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="studio-log-")
+        self._old = os.environ.get("STUDIO_WORKSPACE")
+        os.environ["STUDIO_WORKSPACE"] = self.root
+        self.job = workspace.new_id()
+        workspace.job_dir(self.job, create=True)
+        workspace.write_artifact(self.job, "layer2", {
+            "version": 1, "job_id": self.job, "profile": {},
+            "blocks": [{"key": "p1-b1", "kind": "question", "page": 1,
+                        "number": 1, "text": "x", "options": [], "status": "ready",
+                        "issues": [], "missing": [], "bbox": None, "images": [],
+                        "source": {"method": "text", "page": 1}}],
+            "pages": [], "assets": [], "stats": {}})
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop("STUDIO_WORKSPACE", None)
+        else:
+            os.environ["STUDIO_WORKSPACE"] = self._old
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def test_a_failing_supabase_target_logs_chip_advice_and_raw_text(self):
+        from unittest import mock
+        from pipeline.studio import importers
+        from pipeline.studio.importers import supabase
+
+        boom = Exception('invalid input syntax for type smallint: "12"')
+
+        def fail(*args, **kwargs):
+            raise boom
+        with mock.patch.object(supabase, "run", side_effect=fail):
+            with self.assertRaises(Exception):
+                importers.run(object(), self.job, target="supabase")
+        rows = workspace.read_log(self.job)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["stage"], "import")
+        self.assertEqual(row["level"], "error")
+        self.assertEqual(row["fault"]["kind"], "db_down")
+        self.assertTrue(row["fault"]["hint"])
+        self.assertIn("invalid input syntax", row["message"])
+
 
 class StudioLogTests(unittest.TestCase):
     """Every error emit carries a fault; the history keeps it."""

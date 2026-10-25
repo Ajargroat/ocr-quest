@@ -33,8 +33,6 @@ CATALOG = (
      "pipeline.questions:PAGES_PROMPT"),
     ("pipeline.answers_pages", "Answers · pages-per-call prompt", "Pipeline",
      "pipeline.answers:ANSWER_PAGES_TEMPLATE"),
-    ("revision.audit", "Revision · audit prompt", "Revision",
-     "pipeline.revision.audit:PROMPT_HEADER"),
     ("studio.ocr", "Extract · page OCR prompt", "Studio",
      "pipeline.studio.extract:OCR_PAGE_PROMPT"),
     ("studio.organize", "Extract · page organize prompt", "Studio",

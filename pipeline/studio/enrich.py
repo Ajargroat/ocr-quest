@@ -17,8 +17,7 @@ import time
 
 from pipeline import gemini as gemini_mod
 from pipeline import prompts
-from pipeline.revision.pairing import norm_scalar
-from pipeline.utils import to_english_digits
+from pipeline.utils import norm_scalar, to_english_digits
 
 from pipeline.studio import (faults as studio_faults, layout, llm,
                              profile as profile_mod, tags, workspace)

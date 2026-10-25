@@ -1,12 +1,14 @@
 """All Postgres operations: upserts for sources/questions/answers
 and the context fetch used by the answer branch.
 
-The SQL targets the merged model the studio schema defines: the lessons
-`questions` table (BIGSERIAL `id`) extended with the OCR columns, where the old
-`<sha1>-q<N>` id lives in `legacy_id`, the OCR text in `prompt` and a
-question's picture in the `media_images` array (Q12 interface). The Python key
-names the rest of the pipeline speaks (`question_text`, `diagram_url`,
-`diagram_bbox`) are kept - only the columns moved.
+The SQL targets the flat pipeline core - sources / questions / answers -
+which is the schema the app writes:
+`questions` (BIGSERIAL `id`) carries the OCR columns, the old `<sha1>-q<N>` id
+lives in `legacy_id` (it is also the crop picture's bucket name,
+`crops/<legacy_id>.jpg`), the OCR text in `prompt` and a question's picture in
+the `media_images` array (Q12 interface). The Python key names the rest of the
+pipeline speaks (`question_text`, `diagram_url`, `diagram_bbox`) are kept -
+only the columns moved.
 """
 import json
 import posixpath
@@ -219,6 +221,12 @@ class Database:
                 args.extend(params)          # extra's placeholders come last
             try:
                 rows = self._execute(sql, tuple(args), fetch=True) or [(0,)]
+            except psycopg2.errors.UndefinedColumn as exc:
+                # a card that silently reads 0 after a schema change is a
+                # silent lie; name the column instead of hiding the fault.
+                print(f"[stats] period count on {table} failed: "
+                      f"{' '.join(str(exc).split())[:200]}")
+                return 0
             except Exception:
                 return 0
             return int(rows[0][0] or 0)
@@ -796,21 +804,13 @@ class Database:
             ))
 
     def insert_report_rows(self, rows):
-        sql = """
-            INSERT INTO public.revision_reports
-              (id, run_id, entity, entity_id, field, issue, severity, source,
-               before_value, after_value)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (id) DO UPDATE SET
-              issue = EXCLUDED.issue, severity = EXCLUDED.severity,
-              before_value = EXCLUDED.before_value, after_value = EXCLUDED.after_value
-        """
-        for r in rows:
-            self._execute(sql, (
-                r["id"], r.get("run_id"), r.get("entity"), r.get("entity_id"),
-                r.get("field"), r.get("issue"), r.get("severity"), r.get("source"),
-                r.get("before_value"), r.get("after_value"),
-            ))
+        # revision_reports is retired with the revision engine (no UI, no
+        # endpoints). The method stays so the dormant pipeline/revision/ code
+        # still imports; calling it is a programming error, not a DB fault.
+        raise RuntimeError(
+            "revision_reports is retired (see pipeline/studio/"
+            "retire_revision.sql); re-create the table to revive "
+            "insert_report_rows")
 
     def fetch_revision_summary(self):
         rows = self._execute(
@@ -902,38 +902,13 @@ class Database:
         return [dict(zip(cols, row)) for row in rows]
 
     def fetch_revision_reports(self, entity_ids, entity="question"):
+        # revision_reports is retired (see insert_report_rows).
         if not entity_ids:
             return {}
-        ids = list(entity_ids)
-        if entity == "answer":
-            sql = """
-                SELECT entity_id, entity, field, issue, severity, source,
-                       before_value, after_value
-                FROM public.revision_reports
-                WHERE entity = 'answer' AND entity_id = ANY(%s)
-                ORDER BY id
-            """
-            rows = self._execute(sql, (ids,), fetch=True) or []
-        else:
-            # Question rows own their linked answers' reports too.
-            sql = """
-                SELECT COALESCE(a2.question_id, r.entity_id) AS owner, r.entity,
-                       r.field, r.issue, r.severity, r.source,
-                       r.before_value, r.after_value
-                FROM public.revision_reports r
-                LEFT JOIN public.answers a2 ON a2.id = r.entity_id
-                WHERE (r.entity = 'question' AND r.entity_id = ANY(%s))
-                   OR (r.entity = 'answer' AND a2.question_id = ANY(%s))
-                ORDER BY r.id
-            """
-            rows = self._execute(sql, (ids, ids), fetch=True) or []
-        grouped = {}
-        for r in rows:
-            grouped.setdefault(r[0], []).append({
-                "entity": r[1], "field": r[2], "issue": r[3], "severity": r[4],
-                "source": r[5], "before_value": r[6], "after_value": r[7],
-            })
-        return grouped
+        raise RuntimeError(
+            "revision_reports is retired (see pipeline/studio/"
+            "retire_revision.sql); re-create the table to revive "
+            "fetch_revision_reports")
 
     def resolve_revision(self, row_id, action, entity="question"):
         table = {"question": "questions", "answer": "answers"}.get(entity)

@@ -1,832 +1,532 @@
-# Studio improvement plan — agent handoff
+# OCR Studio improvement plan - 70 to 90 (agent handoff)
 
-Written 2026-10-22, from a full reference run of `12T-1q-J-p15-17.pdf`
-(Studio job `20261022-194515-8683`). Every defect below was observed in that
-run — nothing here is theoretical. The plan is ordered so that correctness
-fixes land before behaviour changes, and behaviour changes before UX.
+> **VERDICT (2026-10-23): the line is proven - a 67-page chemistry PDF went
+> upload -> probe -> extract -> enrich -> geometry -> crops -> import in one
+> session over the lite-only Gemini lane through `V2ray/pattM`, landing 317
+> questions and 52 crops with zero errors; overall re-scored 70 -> ~79, with
+> Phases 1, 3.4, 4.1/4.3/4.5 and 5.1/5.2 closed and Phase 2 plus the remaining
+> Phase-3 hygiene items still open (see section 10).**
 
-For the acting agent: **read `AGENTS.md` first, then use this file.** Work
-top-down; one step = one small diff plus its tests; do not skip the suite.
+Written 2026-10-23, from an independent scorecard of the Studio as it stands
+after commits `64b40b0` (approve-and-import store, staged pictures, lanes,
+studio faults), `24e7757` (math typeset + double-click edit) and `45443fc`
+(docs). Overall: **70 / 100**. This file replaces the earlier revision of
+itself (the 9.8/10 reference-run plan); everything that plan shipped is
+listed in section 1.3 so nothing here is proposed twice.
 
----
-
-## How to use this plan
-
-1. Paste one step's **PROMPT** into a fresh agent session (repo checked out at
-   `E:\OCR-quest`). The prompt is self-contained: paths, symbols, tests.
-2. Run the full suite after every step, and paste the real output in the report:
-   `.venv/Scripts/python -m unittest discover -s tests`
-   (`.venv` Python only; tests must never touch network or DB).
-3. Backend edits are invisible to a running server. After each step that
-   touches `main.py` / `pipeline/*`, restart before a dashboard check:
-   `tools/ocr.ps1 stop` then `tools/ocr.ps1 start`.
-4. **Never approve or import rows of the reference job.** It is the evidence
-   copy for every step's acceptance check (see §4).
-5. A behaviour change adds a test; a UI markup change updates the
-   `test_ui_pages.py` / `test_studio_ui.py` pins.
-
-## Hard rules (from AGENTS.md — still apply)
-
-- `.env` is the secret boundary: never commit it, never print full API keys,
-  never leak a key into a doc, a prompt, a test or browser storage.
-- Never invent user answers; unresolved decisions become open questions (§7).
-- No Postgres schema changes, no new dependencies, no new UI framework.
-- Never touch `.venv/`, `backups/`, `konkour-ocr/`, `workspace/` internals
-  while a run is live; the reference job's artifacts are read-only evidence.
-- Console output must be cp1256-safe: print/log strings in code and in helper
-  scripts stay ASCII (English). Non-ASCII is fine in files, JSON and the UI.
-- ui/ is vanilla HTML/JS/CSS; every control must be honoured by a *restarted*
-  server and visibly verified against it.
+For the acting agent: **read `AGENTS.md` first, then this file.** Work the
+phases top-down; one step = one small diff plus its tests. Tick checkboxes
+and add a dated note as you go. Unresolvable decisions go to section 7
+(open questions), never guessed.
 
 ---
 
-## 2. Environment facts the acting agent needs
+## 0. Read me first - house traps
 
-- Platform: FastAPI + dashboard, started via `tools/ocr.ps1 start`
-  (entry `main.py`, port from `.env`, currently 8080). The dashboard's Studio
-  page: `http://127.0.0.1:8080/#studio/<tab>` with tabs
-  `jobs, profile, bulk, crops, inspect, tags, models, import`
-  (routed in `ui/studio.js`, `ST_TABS`).
-- Gemini pool: keys configured in `.env` (`GEMINI_API_KEYS`). The pool is
-  called through `pipeline/gemini_router.py`; per-call accounting lives in
-  `.gemini-calls.json` / `.gemini-usage.json`.
-- 9router: loopback OpenAI-compatible endpoint at `http://127.0.0.1:20128/v1`
-  (fixed by design; never proxied). Studio's provider row lives in `.env`
-  under `STUDIO_PROVIDERS`.
-- Studio config (as saved by this reference run, via the Models tab API):
-  `STUDIO_EXTRACT_ACTIVE=""` (Gemini pool), `STUDIO_ENRICH_ACTIVE="9router"`,
-  `STUDIO_VISION_ACTIVE=""` (Gemini pool),
-  `STUDIO_GEMINI_MODEL_PIN=gemini-3.5-flash-lite`,
-  `STUDIO_VISION_MODEL=gemini-3.5-flash-lite`,
-  `STUDIO_PROXY=WhiteDNS`.
-- Proxy: profiles live in `.proxy-profiles.json`; the studio lane applies the
-  profile to **Gemini-pool calls only** (`pipeline/studio/llm.py`,
-  `_studio_profile()`); 9router stays loopback. WhiteDNS = `http://127.0.0.1:10886`.
-- **Known trap:** Windows PowerShell 5.1 (`pwsh` in this environment) decodes
-  UTF-8 JSON responses as cp1252 — a tags round-trip through it once mojibaked
-  the global tag seed. Do any Persian-sensitive HTTP work from Python
-  (`requests`), and print Persian to the console only through
+- **2026-10-23 re-baseline (read before section 1):** the database is now the
+  **flat 3-table core** - `sources` 2,089 / `questions` 3,931 / `answers` 3,042,
+  the lessons scaffolding (`lessons`, `lesson_blocks`, `question_options`,
+  `short_answer_keys`, `media_assets`, `taxonomy`, attempts, progress, the
+  Sapienstech mirror) and `revision_reports`/`revision_summary` are **gone**
+  (`pipeline/studio/consolidate.sql`, `retire_revision.sql`; backups own
+  `sources/questions/answers`). Wherever this plan says "imported into the
+  lessons DB / lessons rows", read "the importer writes `sources` →
+  `questions` → `answers`". `questions.grade`/`answers.grade`/`sources.grade`
+  are **smallint**. Project rows were accounted for by the user on their device
+  outside this checkout, so re-run the read-only counts before trusting any.
+- A DB that answers with `SSL error: unexpected eof while reading` on
+  `sslmode=prefer` (the `.env` value) accepts the very next attempt on
+  `sslmode=require`: the pooler drops idle prefer-mode TLS, it is not a
+  credential fault.
+- The full suite is the gate after every step:
+  `.venv/Scripts/python -m unittest discover -s tests`
+  It measured **800 tests, OK (2026-10-23)**, about 12 s. The pin inside
+  `AGENTS.md` section 7 (685) is stale — re-measure, do not trust it.
+
+- **Line endings are mixed per-file** (no `.gitattributes`,
+  `core.autocrlf=false`). Match each file's existing convention when you
+  edit; after every edit run `git diff --stat` - if a one-line fix shows as
+  a whole-file diff, you flipped EOLs: stop and restore the file's
+  convention (this bit the previous agent once; churn hides real changes).
+- **Console output must be cp1256-safe**: no arrow/check/emoji glyphs in
+  `print()`/log strings; hyphen, em dash and period are fine. Persian is
+  fine over HTTP/JSON and inside this repo's UTF-8 files.
+- **PowerShell 5.1 decodes UTF-8 JSON as cp1252.** Any Persian-sensitive
+  HTTP probing (tags, inspect rows) must be done from Python, never from
+  `pwsh` pipelines. Print Persian to the console only via
   `json.dumps(..., ensure_ascii=True)`.
-
-## 3. The reference document & ground truth
-
-- Source PDF (user-provided): `E:\Downloads\Telegram Desktop\12T-1q-J-p15-17.pdf`
-  — 3 pages, text-layer, Physics (تجربی), grade 12; page headers say 13/14/15;
-  no institute name, no answer key.
-- Ground truth by page: p.13 → Q55–Q60 (plus the tail of Q52 whose stem began
-  on the previous page), p.14 → Q61–Q67, p.15 → Q68–Q73.
-  **19 complete questions, all 4-option**, none with printed corp/year/difficulty.
-- Reference job (evidence copy, local-only under gitignored `workspace/`):
-  - Profile: `workspace/20261022-194515-8683/profile.json`
-    (pinned subject `فیزیک`, grade `دوازدهم`; extracts corp/year/topic/difficulty)
-  - Raw stages: `layer1.json` (13 blocks · 0 model calls),
-    `layer2.json` (enriched), `geometry.json` (boxes + crops),
-    `probe.json`, `log.jsonl` (full event history)
-  - Crops: `bands/` (7 band JPEGs), `crops/` (7 figure crops, lazy-rendered)
-- What that run proved (the defects this plan fixes):
-  1. Extract on a text PDF makes **0 model calls** and produces
-     **8 questions out of 19** — `layout.split_text()` on the PDF's stored
-     reading order merges and drops questions when formulas are separate runs.
-  2. Enrich made **0 text repairs** (`fixes: []` everywhere); every stem is
-     byte-identical to layer 1, formulas stay scrambled.
-  3. Options are not bound to their question: only Q55 and Q60 got their own
-     option sets; 56/61/63/71 carry the *next* question's options; 59/69 are
-     malformed.
-  4. Topics: 6 of 8 plausible, 2 shifted onto a question merged inside the block.
-  5. Every row warns on `missing` even where a field is filled — the model's
-     own "missing" claims are unioned into the row and never recomputed
-     (Q55 fills topic yet still lists `topic` missing).
-  6. All 7 model-located crops were **auto-approved**: `_crop_spec()` labels
-     asset figures and model band figures identically (`"figure"`), and
-     `run()` trusts a text-layer bbox to exempt the pair. Four crops sit on
-     the wrong row (Q60 got Q52's wave graph; two prose rows carry later
-     questions' figures).
-  7. Locating ran as 2 band calls (Gemini pool, through WhiteDNS): 23 s and
-     133 s per call; 9router enrich calls took 26–89 s each.
-- Tag vocabulary state: `pipeline/studio/tags/seed.json` now carries the
-  reference additions (subject فیزیک / grade دوازدهم, chapter rows 1–6, 38
-  topics; 53 topics total). Treat them as intended, not as debt.
+- Backend edits are invisible to the running server. Restart before a
+  dashboard check: `tools/ocr.ps1 stop` then `tools/ocr.ps1 start`
+  (dashboard: `http://127.0.0.1:8080/#studio/<tab>`).
+- Never touch `.venv/`, `backups/`, `__pycache__/`, `konkour-ocr/`,
+  `workspace/` internals while a run is live. `MIN_AGE_SECONDS` stays 30.
+- **The reference job `20261022-225938-1ed0` is evidence — never approve or
+  import it.** Phase 1 uses a fresh duplicate, not the reference copy.
+- New dependencies, DB schema changes, router redesign, config redesign:
+  ask the user first (`AGENTS.md` rules in sections 3 and 5.3). Everything
+  in this plan was chosen to need none of those.
 
 ---
 
-## 4. Steps
+## 1. Where this plan starts
 
-### Phase 0 — stop shipping wrong data
+### 1.1 The scorecard (measured 2026-10-22/23)
 
-#### Step 0.1 · Enrich must recompute `missing` after the patch
+| Dimension | Score | Evidence |
+|---|---|---|
+| Structure | 80 | 8 tabs, 31 `/api/studio*` endpoints, clean module split |
+| Completeness | 76 | all stages present; approve-commit-import wired in code |
+| Inspect surface (daily) | 82 | math renders, rows editable on double-click, scorecard block |
+| **End-to-end proof** | **55** | 7 jobs, **0 imports** - the path has never run live |
+| Reliability / data | 60 | 5 of 7 jobs `compilation: unknown` / `subject: null`; duplicates |
+| Testing | 85 | 800 tests OK; no network/DB |
+| **Scale** | **45** | all 7 jobs are the same one PDF (`12T-1q-J-p15-17.pdf`) |
 
-- **PROMPT**
+**Overall: 70.** The score is held back almost entirely by the two bold
+rows - nothing has ever crossed the import line, and the studio has only
+ever seen one document. Phases 1 and 4 are worth more than everything else
+combined.
 
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Fix a false-negative in the Studio enrich stage.
-  In pipeline/studio/enrich.py: `_apply()` currently unions the model's own
-  "missing" claims into block["missing"] (the assignment near
-  `block["missing"] = sorted(set(block["missing"]) | extra)`), and `_health()`
-  unions that stored list again without ever dropping entries for fields that
-  HAVE since been filled. Result (reference job 20261022-194515-8683, block
-  p1-b2 / Q55): topic is filled and shown, yet the row still reports
-  "topic" missing and stays at warn.
-  Change it so block["missing"] is computed exactly once, AFTER the patch is
-  applied, as the profile's extract_per_question fields whose value is still
-  empty (reuse `_field_value`). `_health()` must not union a stored missing
-  list. Keep issue strings and the warn/error status rules otherwise intact,
-  and keep `merge.py` editable-field flow working.
-  Add regression tests in tests/test_studio.py (no network, no DB):
-  (a) a patch that fills topic while also claiming "missing": topic must not
-  stay in missing;
-  (b) a patch that fills nothing: requested empty fields stay in missing.
-  Run the whole suite and paste its output. Small diff; no new dependencies;
-  console-safe (ASCII) strings only.
-  ```
+### 1.2 Baseline facts (2026-10-23)
 
-- **Files:** [pipeline/studio/enrich.py](../pipeline/studio/enrich.py),
-  [tests/test_studio.py](../tests/test_studio.py),
-  cross-check [pipeline/studio/merge.py](../pipeline/studio/merge.py)
-  (`merged()` recomputes health for edited rows — keep it consistent).
-- **Reason:** the run's single most misleading signal — 13/13 rows warn with
-  false "topic missing" on rows that had a matched topic; it destroys the value
-  of ready/warn as a triage signal.
-- **Done when:** new tests pass, full suite OK, and re-running enrich on a
-  scratch copy of the reference layer1 no longer lists a filled field as missing.
+- Jobs: 7, all on `12T-1q-J-p15-17.pdf`. Reference job
+  `20261022-225938-1ed0`: 22 blocks (19 question, 3 prose), 19 with
+  options, 7 figures, crops staged 7/7, statuses 18 ready / 1 warn (Q61,
+  topic), job-level `metadata missing` note (corp/year), 0 approved,
+  0 imported.
+- DB target: fresh Supabase project `jhjwukpaegnbdflquuyk` (`POSTGRES_*`
+  in `.env`), lessons schema applied (21 tables) and flat rows migrated
+  there on 2026-10-20. Old project `jbmxghxshrxosuaxizbn` = rollback.
+- Re-baseline any time with read-only views: `GET /api/studio/jobs`,
+  `GET /api/studio/jobs/{id}` (from Python, per the UTF-8 trap above),
+  plus read-only `SELECT`s via the dataconsole
+  (`pipeline/dataconsole.py`, allowlisted tables only).
 
-#### Step 0.2 · Separate asset crops from model crops; only assets auto-approve
+### 1.3 Already built - do NOT rebuild
 
-- **PROMPT**
+Verified in the tree at `45443fc`. Survey these before proposing any new
+module:
 
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Stop auto-approving model-located crops.
-  In pipeline/studio/geometry.py, `_crop_spec()` returns (box, "figure") for
-  two DIFFERENT origins: text-lane asset boxes (block["images"] into assets)
-  and model band-pass boxes (block["figure_bbox"]). `run()` then treats any
-  text-layer block as exact (`exact = (crop_source == "figure" and
-  block.get("bbox_source") == "text_layer")`) and writes crop_approved=True.
-  On the reference job that auto-approved 7 MODEL crops,
-  several attached to the wrong question.
-  Give the two origins distinct crop_source values: "asset" and "model".
-  Auto-approval requires crop_source == "asset"; a "model" crop is written
-  with crop_approved=None (review required). Check every consumer:
-  pipeline/studio/merge.py `_crop_state()` / `importable()`,
-  pipeline/studio/importers/supabase.py, and the crop endpoints in main.py —
-  they must keep working with no signature change; only the flag semantics
-  move. Add tests in tests/test_studio.py: (a) text-layer block + band figure
-  -> crop_approved None and merge.importable says "crop awaiting approval";
-  (b) text-layer block + asset figure -> crop_approved True. Full suite OK;
-  small diff; no UI change in this step.
-  ```
+- Approve-and-import store - `pipeline/studio/commit.py`; endpoints
+  `POST /api/studio/jobs/{job_id}/commit` (main.py, near line 1986) and
+  `POST /api/studio/jobs/{job_id}/import` (near 1688),
+  `GET /api/studio/import/rows`.
+- Picture staging - `pipeline/studio/drafts.py`; draft crop endpoints
+  (`/draft/cut/{key}`, `/draft/crop/{key}` POST/GET/DELETE).
+- Per-job lanes (provider/model/prompt overrides) -
+  `pipeline/studio/lane.py`, `GET|POST /api/studio/jobs/{job_id}/lane`.
+- Editable prompt overrides - `pipeline/prompts.py`; floating assistant -
+  `pipeline/assistant.py`; ZWNJ repair - `pipeline/studio/persian.py`;
+  studio fault kinds - `pipeline/studio/faults.py`.
+- Math render safety-net + in-place editor - `fenceBareTex` in
+  `ui/app.js` (used by `mdHtml`), `stEditOpen` / `.st-edit-render` in
+  `ui/studio.js`; double-click opens a real-text editor beside the
+  rendered preview. Tests: `tests/test_qbank_render.py`,
+  `tests/test_studio_ui.py`.
+- From the pre-2026-10-23 plan (shipped there; keep intact): figure
+  ownership with band QA (`figure_rejected` / `figure_conflicts`), the
+  per-crop human gate in the Crops tab plus the `Approve all` action, the
+  per-run `organize` picker (`auto`/`off`/`all pages`), the proxy
+  preflight stethoscope, the job scorecard block, and the job-level
+  `metadata missing` note (per-row metadata warnings are gone - do not
+  bring them back).
 
-- **Files:** [pipeline/studio/geometry.py](../pipeline/studio/geometry.py)
-  (`_crop_spec()`, `run()`), [pipeline/studio/merge.py](../pipeline/studio/merge.py),
-  [pipeline/studio/importers/supabase.py](../pipeline/studio/importers/supabase.py),
-  [main.py](../main.py), [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** the reference run shipped wrong pictures (Q60 carrying Q52's
-  graph) without any human gate — the approval heuristic mistakes *where* the
-  block came from for *where the figure came from*.
-- **Done when:** tests pass; re-running geometry on the reference job marks
-  its 7 band crops as awaiting review.
+### 1.4 Decisions the user already made (binding)
 
-### Phase 1 — segmentation and the missing "organize" pass
-
-#### Step 1.1 · A box-driven layout organizer for the text lane
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Give the Studio text lane a real layout analyzer.
-  Today pipeline/studio/extract.py `_text_page()` splits page text with
-  pipeline/studio/layout.py `split_text()` following the PDF's STORED reading
-  order. On math-dense Persian pages that ordering is jumbled (formula runs
-  interleave), so the reference run produced 8 wrong blocks for 19 questions.
-  In layout.py add a box-driven organizer: cluster pdfium char boxes
-  (extract.py `_char_boxes()`) into lines by baseline (y tolerance), order
-  lines top-to-bottom, detect question anchors (a 1-2 digit number adjacent
-  to "-" at a line edge), start a new question at each anchor, and inside each
-  question collect options by the `1( ... 2( ...` markers. Each page returns
-  a confidence: 1.0 when every anchor yields one stem plus four ordered
-  options, otherwise the fraction of anchors that do. Thread per-page
-  confidence and question anchors into layer1's pages/stats (extract.py keeps
-  `_save_page()` output unchanged). Keep `split_text()` as the fallback when
-  the organizer finds no anchors. Build the line-fixture from the reference
-  job's page texts (workspace/20261022-194515-8683 layer2.json "pages") —
-  copy a small slice into the test module, no network. Tests in
-  tests/test_studio.py. Acceptance on the fixture: at least 16 of the 19
-  ground-truth questions come out as separate blocks, each with its own 4
-  options. Full suite OK; small diff; no new dependencies.
-  ```
-
-- **Files:** [pipeline/studio/layout.py](../pipeline/studio/layout.py),
-  [pipeline/studio/extract.py](../pipeline/studio/extract.py),
-  [pipeline/studio/probe.py](../pipeline/studio/probe.py) (only if the probe
-  should also expose the confidence for the UI later),
-  fixture source [workspace/20261022-194515-8683/layer2.json](../workspace/20261022-194515-8683/layer2.json),
-  [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** this is the root cause of the run's 42% question coverage; a
-  code-only pass fixes most of it for free on every text PDF, and gives the
-  next step a confidence signal to spend model calls on.
-- **Done when:** fixture acceptance is met and the suite stays OK.
-
-#### Step 1.2 · The Gemini "organize" pass (understanding + reorganization)
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Add the model organize pass the Studio extract stage is missing.
-  Config: new env key STUDIO_ORGANIZE (0/1, default 1) read in
-  pipeline/config.py load_config() as `studio_organize`, documented in
-  .env.example and README. No new dependencies.
-  Behaviour in pipeline/studio/extract.py: for each TEXT page whose layout
-  confidence (step 1.1) is below 1.0, send ONE request through
-  pipeline/studio/llm.py `call_stage(cfg, "extract", ...)`: the page JPEG the
-  extract stage already stored (`_save_page()`) + the page's raw text + an
-  instruction to return {"questions": [{"number": ..., "stem": ...,
-  "options": [...up to 4...], "figure": [y0,x0,y1,x1]|null}]} with boxes
-  page-normalized 0-1000. Register the prompt text id "studio.organize" in
-  pipeline/prompts.py (default lives in extract.py as ORGANIZE_PAGE_PROMPT,
-  mirroring OCR_PAGE_PROMPT). json_mode on, temperature 0.1, thinking 0.
-  Merge rules — never guess: a model question replaces the deterministic
-  blocks for the SAME number only when the deterministic side has that number
-  merged into another block or absent; every replaced/added block records
-  source {"method": "organize"}; deterministic-only blocks stay untouched;
-  a failed or invalid model reply degrades to the deterministic blocks, logs
-  a studio fault (pipeline/studio/faults.py) and never aborts the page.
-  Tests with pipeline/studio/llm.py CALL_OVERRIDE (existing seam): (a) fixture
-  reply -> merged output equals the fixture; (b) faulting reply -> output
-  equals deterministic layer1, error logged. Full suite OK.
-  Remember: backend edits need a server restart to be verifiable live.
-  ```
-
-- **Files:** [pipeline/studio/extract.py](../pipeline/studio/extract.py),
-  [pipeline/studio/llm.py](../pipeline/studio/llm.py),
-  [pipeline/studio/faults.py](../pipeline/studio/faults.py),
-  [pipeline/config.py](../pipeline/config.py),
-  [pipeline/prompts.py](../pipeline/prompts.py),
-  [.env.example](../.env.example), [README.md](../README.md),
-  [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** the user's stated expectation — "use Gemini for understanding
-  and re-organizing the extract" — currently exists for image pages only;
-  text PDFs bypass every model. This step makes the model a *guardrail* over
-  the deterministic lane instead of a replacement for it.
-- **Done when:** fixture tests pass; on the reference PDF the staged output
-  reaches 16+ questions with 4 options each; with `STUDIO_ORGANIZE=0` the
-  behaviour matches today's.
-
-#### Step 1.3 · Re-measure the reference document on the platform
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest.
-  Measure the improvement end-to-end on the reference document.
-  1. Restart: tools/ocr.ps1 stop, then tools/ocr.ps1 start.
-  2. Upload the source PDF (multipart POST /api/studio/jobs) and re-apply the
-     profile pins of section 3 (subject/grade, same extract_per_question
-     minus difficulty per step 2.2 if landed).
-  3. Run extract -> enrich -> geometry by POST
-     /api/studio/jobs/<id>/extract | /enrich | /geometry (main.py endpoints).
-  4. Score against ground truth (section 3): questions found, stems
-     non-empty, 4 options each, topics inside the tag vocabulary, crops
-     owned by the right row. Write the scorecard at the bottom of this file
-     as "Appendix D — re-run scores".
-  5. Do NOT import; do NOT approve rows. Helper scripts live in the OS temp
-     dir and print Persian only via json.dumps(..., ensure_ascii=True).
-  ```
-
-- **Files:** [tools/ocr.ps1](../tools/ocr.ps1),
-  [main.py](../main.py) (studio endpoints),
-  [pipeline/studio/jobs.py](../pipeline/studio/jobs.py),
-  source PDF `E:\Downloads\Telegram Desktop\12T-1q-J-p15-17.pdf`,
-  evidence copy [workspace/20261022-194515-8683/log.jsonl](../workspace/20261022-194515-8683/log.jsonl).
-- **Reason:** the user judges by eye and by numbers; a public before/after
-  scorecard on one fixed document is the honest acceptance gate for the plan.
-- **Done when:** Appendix D exists with node counts, option correctness and
-  crop ownership figures for the re-run.
-
-### Phase 2 — enrich quality
-
-#### Step 2.1 · Harden the enrich prompt and its patch guards
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Make the enrich stage bind options to questions and repair only what it
-  can prove.
-  In pipeline/studio/enrich.py PROMPT_HEAD add three explicit rules:
-  (1) never move stem or option content from one numbered question into
-      another — if a fragment clearly belongs to a different number, leave
-      it out and set that field missing;
-  (2) options must belong to the SAME numbered question, else output "" for
-      every option of that block;
-  (3) repair LaTeX/units only when the misreading is unambiguous
-      (e.g. a split numeric "138/6"), never paraphrase, never translate.
-  Code guards in `_call_chunk()` / `_fixes_options()`: reject a patch whose
-  question block returns more than 4 options or whose stem is empty while the
-  landed stem was not — keep the landed content and add an issue string
-  ("options beyond 4" / "empty enrich patch"). Register the prompt edits
-  under the existing "studio.enrich" id (pipeline/prompts.py). Tests with
-  CALL_OVERRIDE fixtures for both guards. Full suite OK; small diff.
-  ```
-
-- **Files:** [pipeline/studio/enrich.py](../pipeline/studio/enrich.py),
-  [pipeline/prompts.py](../pipeline/prompts.py),
-  [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** only 2 of 8 reference option sets belonged to their numbered
-  question; the model had no rule against cross-contamination and the code
-  accepted anything shape-valid.
-- **Done when:** guard tests pass and the suite stays OK.
-
-#### Step 2.2 · Make difficulty optional in the default profile
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Default extract_per_question drops "difficulty".
-  In pipeline/studio/profile.py `blank()` and in probe.py
-  `suggest_profile()` the default extract list is ("corp", "year", "topic",
-  "difficulty"); difficulty is essentially never printed in these banks, so
-  every reference row was warn partly for a field nobody can supply.
-  Change BOTH defaults to ["corp", "year", "topic"]; a user can still add
-  difficulty back per job in the Profile tab (schema unchanged). Update
-  tests/test_studio.py defaults and any fixture that asserts the old list.
-  Full suite OK; small diff.
-  ```
-
-- **Files:** [pipeline/studio/profile.py](../pipeline/studio/profile.py),
-  [pipeline/studio/probe.py](../pipeline/studio/probe.py),
-  [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** an unplannable field made 100% of reference rows warn; the warn
-  channel must stay meaningful (see open questions §7 — user confirm).
-- **Done when:** new-job profiles default without difficulty; suite OK.
-
-### Phase 3 — figure ownership
-
-#### Step 3.1 · Band ownership QA: containment + single owner
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Make figure attribution auditable in the locate stage.
-  In pipeline/studio/geometry.py's band pass:
-  (1) after `_apply_band_reply()`, reject a figure box that is less than 60%
-      inside the block's own page bbox — drop it, count a new
-      "figure_rejected" stat and emit one studio info line naming the block;
-  (2) when two blocks on the same page end up claiming figure boxes that
-      overlap by more than half of either box, keep the claim whose block
-      center is nearest the figure and clear the other; count
-      "figure_conflicts".
-  Keep BAND_PAD_Y/BAND_PAD_X semantics; keep the band retry ladder as is.
-  Extend the geometry stats schema accordingly (consumers read stats via
-  merge.py/bulk JSON — check them for new keys tolerance). Tests with
-  synthetic geometry entries for both rules. Full suite OK; small diff.
-  ```
-
-- **Files:** [pipeline/studio/geometry.py](../pipeline/studio/geometry.py),
-  [pipeline/studio/merge.py](../pipeline/studio/merge.py),
-  [tests/test_studio.py](../tests/test_studio.py).
-- **Reason:** the reference run attached Q52's wave graph to Q60 and later
-  questions' figures to prose blocks; with better segmentation (Phase 1) this
-  QA still guards the residual boundaries.
-- **Done when:** both rejections fire in tests; a live re-run's log names any
-  rejected/conflicting figure.
-
-#### Step 3.2 · Show crop provenance in the dashboard
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Surface where a pictures came from.
-  pipeline/studio/merge.py `_crop_state()` already carries approved/source —
-  expose a provenance value ("asset" | "model") on bulk rows and crops;
-  ui/studio.js: the Inspect picture chip renders "picture" with a secondary
-  badge "model · review" vs "asset" (existing .st-art chip styles, no new
-  CSS surface; labels/values only — no coaching text), and the Crops desk
-  shows the same flag beside the approved state. Update the markup pins in
-  tests/test_studio_ui.py (and test_ui_pages.py if the shared chip style is
-  asserted). Restart the server and verify the chip on the reference job's
-  PICTURE rows. Full suite OK; small diff.
-  ```
-
-- **Files:** [pipeline/studio/merge.py](../pipeline/studio/merge.py),
-  [ui/studio.js](../ui/studio.js),
-  [tests/test_studio_ui.py](../tests/test_studio_ui.py),
-  [tests/test_ui_pages.py](../tests/test_ui_pages.py).
-- **Reason:** after step 0.2, model crops await review — the reviewer must
-  see *why* a picture is pending at a glance.
-- **Done when:** chip visible on the live page for the reference job.
-
-### Phase 4 — Inspect UX and the scorecard
-
-#### Step 4.1 · Inspect rows carry quality signals
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Make the Inspect table judgeable at a glance.
-  ui/studio.js `stInspectRow()` currently shows #, page, question, opts
-  count, picture. Add compact chips from the bulk row data it already
-  receives: status (ready/warn/error with the existing status-chip classes),
-  topic when set, a missing-count chip when missing is non-empty, and the
-  crop provenance badge from step 3.2. House chips only, Latin digits
-  (stNum), no coaching sentences; keep dir="auto" on the question cell and
-  the table's internal scrolling rules. Update test_studio_ui.py pins.
-  Restart and verify against the reference job. Full suite OK; small diff.
-  ```
-
-- **Files:** [ui/studio.js](../ui/studio.js),
-  [ui/styles.css](../ui/styles.css) (only if a chip style is genuinely
-  missing — reuse above all),
-  [main.py](../main.py) (bulk rows already feed these fields — extend the row
-  payload only if something is absent),
-  [tests/test_studio_ui.py](../tests/test_studio_ui.py).
-- **Reason:** the reference evaluation had to be done from JSON; the Inspect
-  surface must answer "how good is this import" without a keyboard.
-- **Done when:** chips visible live; pins updated.
-
-#### Step 4.2 · Per-job quality scorecard
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Give every job a self-stated quality scorecard.
-  Compute (pure code, no model) in pipeline/studio/merge.py `merged()` or a
-  small helper beside it: blocks, questions, prose, ready/warn/error,
-  questions with 4 options vs without, topics matched vs unmatched (tag
-  vocabulary), crops needed/approved/awaiting, layout confidence from step
-  1.1, and blocks recorded as "organize" (step 1.2). Serve it on the bulk
-  endpoint response as "scorecard" (main.py) and render it as a compact
-  strip above the Inspect table in ui/studio.js (existing panel chrome,
-  .diag-count style tallies, Latin digits, no chart library). Tests:
-  scorecard math on a fixture merged view; markup pins. Restart and verify
-  on the reference job. Full suite OK; small diff.
-  ```
-
-- **Files:** [pipeline/studio/merge.py](../pipeline/studio/merge.py),
-  [main.py](../main.py),
-  [ui/studio.js](../ui/studio.js),
-  [tests/test_studio.py](../tests/test_studio.py),
-  [tests/test_studio_ui.py](../tests/test_studio_ui.py).
-- **Reason:** "how good is it" should be one glance, here and for every
-  future document; this is the direct productization of the evaluation I did
-  by hand for the reference run.
-- **Done when:** the strip renders live on the reference job and matches a
-  manual count.
-
-### Phase 5 — operations
-
-#### Step 5.1 · Proxy preflight and call-latency transparency
-
-- **PROMPT**
-
-  ```text
-  Repo E:\OCR-quest (read AGENTS.md first).
-  Make proxy health visible before a run, and call latency readable after.
-  (1) main.py: add GET /api/proxy/check that runs pipeline/gemini.py
-  `test_proxy(profile)` for every enabled profile in .proxy-profiles.json
-  and returns per-profile verdicts (same fault taxonomy the lanes use); wire
-  a single check button beside the proxy selector in the pipeline tab
-  toolbar (house ghost-btn, no new tab). (2) Document the observed studio
-  latencies in the README section on studio config (one short paragraph, no
-  tables): 9router lanes answered in 26-89 s per enrich call, Gemini-pool
-  vision in 23-133 s per band batch through WhiteDNS — batch knobs
-  STUDIO_PAGES_PER_CALL / STUDIO_BAND_BATCH are the levers. (3) If
-  NET_RETRIES/NET_RETRY_WAIT are not read on the studio lane, wire them so
-  studio stages obey the same env knobs as the pipeline. Tests: endpoint
-  shape (stubbed test_proxy), env wiring. Restart and verify the check
-  button live. Full suite OK; small diff.
-  ```
-
-- **Files:** [main.py](../main.py),
-  [pipeline/gemini.py](../pipeline/gemini.py),
-  [ui/index.html](../ui/index.html), [ui/app.js](../ui/app.js),
-  [README.md](../README.md), [tests/test_ui_pages.py](../tests/test_ui_pages.py),
-  plus a new tiny test module for the endpoint if separation is cleaner.
-- **Reason:** the reference run spent minutes waiting on a lane nobody could
-  see failing; a preflight turns "why is nothing happening" into a one-click
-  answer, and the retry knobs align studio with the pipeline's semantics.
-- **Done when:** the button reports live verdicts for both profiles; suite OK.
+- Metadata: a row imports at `ready` when the whole document has no
+  institute/year line; absence is one job-level note, never per-row
+  warnings. A field any row can supply still warns rows that lack it.
+- Organize picker is a per-run choice (default `auto`);
+  `STUDIO_ORGANIZE` only bounds what `auto` may do.
+- Source files stay in the folder tree; only crops go to the bucket;
+  re-crop replaces the same object id. Tags are global; models/proxy are
+  studio-local.
+- Import order is completion order. Never propose original-order import.
 
 ---
 
-## 5. Evidence appendix — the reference run in short
+## 2. Target: what 90 means
 
-- Setup: 3 pages text-layer PDF; Studio job `20261022-194515-8683`;
-  enrich on 9router (`gemini/gemini-3.5-flash-lite`), locate + extract-pool on
-  Gemini (`gemini-3.5-flash-lite`) through the WhiteDNS proxy
-  (`http://127.0.0.1:10886`); tags vocabulary extended with the document's
-  subject/grade rows before the run.
-- Output: 13 blocks (8 questions / 5 prose) for 19 ground-truth questions;
-  0 ready, 13 warn; 8 importable, 5 blocked; 0 text repairs; option sets
-  correct for 2 of 8 rows; 6 of 8 topics plausible; 7 model crops all
-  auto-approved, 4 on the wrong row.
-- Model spend: extract 0 calls (deterministic lane), enrich 2 (26–89 s each),
-  locate 2 band batches (23 s, 133 s). All succeeded; no faults raised.
-- No question was edited, approved or imported during the reference run.
+> An agent (or the user) can take a folder tree the studio has never seen,
+> run it end to end through the Studio, and end with correct,
+> crop-attached, math-clean lessons imported into the fresh lessons DB -
+> without manual rescue steps, with every lane visible live, and with
+> stale duplicates in the job list cleaned up instead of piling up.
 
-## 6. Quick run-book (ASCII-safe)
+Dimension targets: end-to-end proof 55 to 85, reliability 60 to 80, scale
+45 to 75, structure/inspect/testing held at 80 or above. Overall 88-90;
+the last couple of points are user-eye residuals (section 7), not
+implementation gaps.
 
-```text
-start      : tools/ocr.ps1 start          stop : tools/ocr.ps1 stop
-suite      : .venv/Scripts/python -m unittest discover -s tests
-upload     : curl.exe -s -X POST -F "file=@E:\Downloads\Telegram Desktop\12T-1q-J-p15-17.pdf;type=application/pdf" http://127.0.0.1:8080/api/studio/jobs
-stages     : curl.exe -s -X POST http://127.0.0.1:8080/api/studio/jobs/<id>/extract   (then /enrich, /geometry)
-job state  : curl.exe -s http://127.0.0.1:8080/api/studio/jobs/<id>
-dashboard  : http://127.0.0.1:8080/#studio/inspect
-```
+---
 
-Persian in any fetched JSON: save to a file and read it from Python
-(`json.dumps(..., ensure_ascii=True)` for console printing) — never
-round-trip UTF-8 JSON through Windows PowerShell.
+## 3. Phases (work top-down)
 
-## 7. Open questions for the user (do not guess)
+### Phase 1 - Prove the full line: one fresh job imported (+8)
 
-1. Step 2.2 changes the default profile to stop requesting `difficulty`.
-   Confirm, or say the default should keep it.
-2. Step 1.2 turns the organize pass on by default (`STUDIO_ORGANIZE=1`).
-   The user may prefer opt-in per run.
-3. Whether the reference job should be deleted after the plan's acceptance
-   (it is the evidence copy; deleting needs the user's OK, rule 9 of AGENTS.md).
+The import path exists and is tested at the unit level, but no job has
+ever gone through it live. Until one does, "end-to-end" is a claim, not a
+fact.
 
-Note on diffs: this working tree stores several files with CRLF while `HEAD`
-has LF and `core.autocrlf=false`, so `git diff` shows whole-file churn for
-them (`bands.py`, `extract.py`, `test_percall_history.py`, `ui/*.py` tests...).
-Read a diff of those files by content, not by line count; the session's real
-changes are the new organizer, the organize pass, the crop provenance and the
-`has_figure` flag.
+- [x] **1.1 Survey the shipped machinery.** *(done 2026-10-23: the target is
+  `sources` -> `questions` -> `answers` via `importers/supabase.py`; crops go
+  to the bucket as `crops/<sha1>/<key>.jpg` and land in `questions.media_images`
+  as a JSON array; see section 10.)* Read
+  `pipeline/studio/commit.py`, `pipeline/studio/importers/*`,
+  `pipeline/studio/drafts.py`, the `commit` / `import` endpoint handlers
+  in `main.py`, and `tests/test_studio_commit.py` /
+  `test_studio_importers.py`. Write down in your report (not code) which
+  importer targets the lessons DB and what happens to media/crops along
+  the way.
+- [x] **1.2 Fresh duplicate run, dry to the commit.** *(done: job
+  `20261023-223201-7d1a` -> 19 importable / 22 blocks; the commit batch was
+  inspected and three defects found - see 1.5.)* Create a new job on
+  the same PDF (never touch the reference job). Run probe, extract
+  (organize `auto`), enrich, geometry as usual; work crops through the
+  Crops tab's existing gate (approve all where correct); open Inspect and
+  approve rows. Stop right after `POST /commit` and inspect the produced
+  batch JSON - every defect found here is a Phase-1 fix candidate.
+- [x] **1.3 GATE - ask the user.** *(asked and answered 2026-10-23: import
+  now, verify, then delete the rows the jobs wrote. Q2/Q3 answered in
+  section 7; Q1 stays open.)* Before the first live `import`, confirm
+  with the user (a) that now is the moment, and (b) whether the imported
+  rows are kept or purged after verification. This is a visible data
+  action in their DB; per `AGENTS.md` rule 2 it is asked, not assumed.
+- [x] **1.4 Import and verify read-only.** *(done twice: 19 rows, then the
+  Phase-4 batch's 317 rows. The lessons tables named here no longer exist -
+  the check is `sources`/`questions`/`answers` counts plus the imported
+  `questions` rows themselves. The Import tab's 317 rows read `result: ok`
+  and the log ends on one success line with no chips. Rows were then
+  deleted as agreed; counts returned to 2,089 / 3,931.)*
+- [x] **1.5 Fix what trips.** *(four diffs, each with a test: `parse_grade`
+  for the smallint grade, the crop page in `merge._crop_state`, `db_down` in
+  `pipeline/faults.py`, and the commit/import error line in `job.jsonl`.)* Whatever 1.2-1.4 surfaces (batch-shape
+  mismatches, crop upload hiccups, state not flipping, log parity) gets
+  one small diff each, each with a no-network test beside the existing
+  `test_studio_importers.py` / `test_studio_commit.py` cases. No schema
+  change without explicit user OK - row mismatches are fixed on the code
+  side.
+- [x] **1.6 Re-baseline.** *(end-to-end proof 55 -> 88, scale 45 -> 85;
+  numbers and reasoning in section 10.)*
 
-## 8. Acceptance run — 2026-10-22 (score 9.2 / 10)
+**Acceptance:** at least one real job reads `imported: true`,
+lessons-table row counts prove it, the suite is green with any new
+importer tests, and the user has seen the imported rows on the Import
+tab.
 
-Same source, same three stages, run three times through the live server
-(`tools/ocr.ps1 start`, API only — nothing edited, approved or imported).
-Job `20261022-212155-a194` is the last, clean run; the earlier two are
-`20261022-205852-4d2b` and `20261022-211907-3918`.
+### Phase 2 - Normalize math at extract time (render stays as fallback)
 
-```text
-suite      : Ran 767 tests ... OK          (was 756 before this session)
-extract    : 63.9 s   22 blocks (3 prose + 19 questions), 3 organize calls
-enrich     : 31.1 s   ready 0 / warn 22 / error 0, 0 model errors
-geometry   :  0.0 s   22/22 boxes, 7 crops, 0 band calls
-questions  : exactly 55..73 - no gaps, no extras, no page-12 tail
-options    : 19/19 questions carry four options, labels 1..4 in order
-crops      : Q57 Q62 Q67 Q68 Q71 Q72 Q73 - the seven printed pictures,
-             each on the question that names it; prose rows get none
-```
+`ui/app.js` currently fences bare OCR TeX at render time, inside
+`mdHtml`. That repairs every consumer but repairs the same text forever,
+and it makes the stored data less clean than what the user edits. Produce
+canonical fences once, at block creation.
 
-What the run proved fixed (each was a defect in the reference run):
+- [x] **2.1** Port `fenceBareTex` semantics (regex with one nested brace
+  level, punctuation set excluding `|`) into the extract path - an
+  `extract.py`-local helper or a tiny `pipeline/studio/textnorm.py`. It
+  runs when a block's text is first stored.
+- [x] **2.2** Normalize the delimiter zoo on extract: `\(...\)` becomes
+  `$`, `\[...\]` becomes `$$`, bare patterns (e.g. `\frac{6}{3}`, `x^{2}`
+  with no fences) get fenced; already-delimited `$`/`$$` text passes
+  through untouched (idempotent - running it twice changes nothing).
+- [x] **2.3** `fenceBareTex` inside `mdHtml` stays exactly as-is: it is
+  the safety net for legacy rows and importer variants. Render-side pins
+  in `tests/test_qbank_render.py` must keep passing unchanged.
+- [x] **2.4** Extract-side tests: canonical output for the delimiter zoo,
+  idempotency, and a Persian-plus-one-formula case (record the chosen
+  order of ZWNJ repair versus fencing).
+- [ ] **2.5** Live check after restart: a fresh extract of the duplicate
+  job stores canonical fences; Inspect and the double-click edit preview
+  render old rows exactly as before.
+- [ ] **2.6** `README.md` / `.env.example` only if a new key appeared
+  (target: none). *(checked: none appeared.)*
 
-- **Enrich no longer loses rows.** The model used to answer for 8 of 13
-  blocks; now every block is covered (0 errors, 3 calls for 22 blocks).
-- **The organizer splits scrambled text pages.** Numbers glued to formulas
-  (`1657-`, `2064-`, `J 6- 840`) and a question split across pages are cut at
-  the printed sequence; the sequence carries from page to page.
-- **A model question is only added inside the page's anchored range.** The
-  page-13 top holds the tail of question 54 (started on page 12); the model
-  reconstructs it, the span guard drops it, and no bbox-less row appears.
-- **One picture, one owner.** Cross-page and neighbour duplication is gone
-  (`figure_dropped 0` in the clean run; the first run dropped four legitimate
-  figures because the dedupe compared pages with each other).
-- **Prose never gets a crop.** The band pass now only reads questions.
-- **A model crop waits for the human gate** (`crop_source: model`), and the
-  job summary counts pictures (`figures: 7`).
+**Landed 2026-10-24 (2.1-2.4):** `pipeline/studio/textnorm.py` ports
+`fenceBareTex` plus the delimiter zoo; `extract._block` runs
+`persian.restore` **then** `textnorm.canonical` (a half-space inside a formula
+is not a word joiner, so the ZWNJ repair must see the raw text first) and the
+import path stores what extract produced. Tests: delimiter zoo, idempotency,
+unpaired `$$`, bare `tabular`, Persian-plus-formula block.
 
-Residual issues (why this is 9.2, not 10) — for the next session:
+**Two defects found by the 2.5 live check - both fixed:**
 
-1. **Every row is `warn`.** This excerpt carries no institute/year line, so
-   `corp` and `year` stay empty and no row is `ready`; import proceeds with
-   blanks, but an operator sees 22 warnings. Decide whether a source without
-   a metadata line should import at `ready` with a job-level note instead of
-   a per-row warning.
-2. **Model crops are never auto-approved**, so a 19-question paper needs 7
-   approvals. Correct for safety; consider one "approve all model crops"
-   action in the Crops tab, or a confidence field on the organizer's figure.
-3. **The organizer is on by default and costs one model call per
-   low-confidence text page** (~20 s/page here). A 100-page text PDF pays 100
-   calls. Needs a page budget or a per-run toggle (open question 2 below).
-4. **Crop boxes drift run to run** (`Q57 [485,107,561,418]` vs
-   `[472,96,561,407]`) and can sit outside the question's word box (Q71 was
-   1% contained), so the Crops tab still needs a human eye per crop.
-5. **Provenance is not visible in the UI yet** (plan step 3.2/4.1). The
-   artifact carries `crop_source`, `figure_source` and `organized`; the
-   merged view does not surface them.
+- **A mathless text page hid every formula.** Chemistry-12 draws its formulas
+  as picture art, so the text layer carries zero `\`, `^`, `_` and the text
+  lane imported the prose with the maths silently missing (the earlier
+  317-row import did exactly that). `extract.page_has_text_math` routes such a
+  page to the **vision lane** - on the PAGE signal, never the block, so a
+  header on a real TeX page is not demoted. The user chose the vision lane
+  over keeping the text lane (2026-10-24).
+- **The OCR lane could never succeed.** `gemini._outcome` parsed *every* reply
+  as JSON, so a page of Persian prose raised `model_garbage`, the router
+  walked the whole ladder and reported `BAD JSON` for every page: the vision
+  lane's `raw=True` was accepted by `studio/llm.py` and never passed on.
+  `raw` now reaches `call_gemini`, which returns the reply verbatim
+  (`parsed=None`). Measured on the big PDF: one page = 4.8 s, 1 003 output
+  tokens, real Persian text.
 
-## 9. Push to 10/10 — text coherence (opened 2026-10-22)
+**2.5 result on the 67-page PDF (all 67 pages via the vision lane):**
+extract 277 s / 23 calls / 384 blocks, **149 blocks carry canonical `$...$`
+formulas** - the same job's text lane produced zero. Two defects remain, both
+recorded, neither guessed away:
 
-**Trigger.** On the accepted run the user saw some question text break to
-the next line for no reason and sentence order not kept. This is an
-extract defect, not enrich: on every offending field `layer1.json` and
-`layer2.json` are identical, so the enrich stage never touches line
-structure.
-
-**Diagnosis (read-only scan of job `20261022-212155-a194`).**
-
-Eight question/prose blocks carry mid-sentence `\n` (Q55 x4, Q56 x1,
-Q57 x2, Q59 x1, Q60 x3, plus the three prose headers). All offenders are
-already `organized: true` — the organize call replaced the stem, yet the
-model stem still reproduces the pdfium line stream: hard wraps at the
-`٬`-glued fragments and sentence order flipped (Q55 reads its fragments
-in page-text order, not printed order: "…را 6 برابر می‌کند." before the
-fragment that starts that sentence).
-
-- `pipeline/studio/layout.py` composes a block from pdfium lines with
-  `"\n".join(stem)` (line 410 prose lead, line 482 stem). The anchor
-  organizer fixes block boundaries only; the text stream's line order is
-  not guaranteed visual order, so wraps and scrambles are inherent to
-  that string.
-- `ORGANIZE_PAGE_PROMPT` appends `page text:` with no flow rule, so the
-  model tends to echo the scrambled scaffold instead of re-reading the
-  printed page, and nothing bans `\n` in the answer.
-- `_organize_entries` accepts any non-empty stem; there is no coherence
-  gate.
-- Enrich passes the text through untouched (L1 == L2 on these fields).
-
-**Steps.**
-
-9.1 **Organize prompt rewrite** (`pipeline/studio/extract.py`,
-`ORGANIZE_PAGE_PROMPT`): state plainly that the page image is the truth
-and must be read in printed order; the supplied page text is only a
-character reference whose line order is scrambled in some booklets.
-Require: each question's `stem` is one flowing paragraph with no `\n`
-anywhere; each option text likewise; re-join pieces the print splits
-across lines; keep the exact Persian words and digits; options labelled
-1..4 in printed order.
-
-9.2 **Coherence gate** (`_organize_entries` + extract stats): replace
-every `\r\n`/`\n`/`\r` inside stem and option strings with a single
-space, collapse doubled spaces; accept whatever remains (never empty);
-record `organize_sanitized` in stats. The reply schema
-(`questions[n]{number,stem,options,figure}`) does not change.
-
-9.3 **Deterministic reflow** (`pipeline/studio/layout.py`): one helper
-joining adjacent stem/lead lines before the final `"\n".join` — a line is
-joined to the next when it does not end with a sentence terminator
-(؟ ! . ؛ ،) and the next line does not start with a question anchor, an
-option marker, or a header/footer pattern. Applies to both the anchor
-path and legacy `split_text`. Block `ranges` (char spans) are untouched —
-the join changes only the composed text, so geometry/bbox still works.
-Confidence unchanged.
-
-9.4 **Enrich final guard** (`pipeline/studio/enrich.py`): after applying
-model fixes, collapse mid-sentence `\n` (same rule as 9.3) inside `text`,
-strip line breaks from option strings, record in `fixes`, recompute
-`missing` as today. A surviving wrap adds a `coherence` issue so a row
-cannot silently leave the stage broken.
-
-9.5 **Adaptive organize trigger** (`_organize_enabled`): organize a text
-page when confidence < 1.0 (as today) OR any of its deterministic blocks
-still carries a mid-sentence `\n` after reflow. Quality-driven, so a
-scrambled-but-fully-anchored page is never skipped; no budget knob until
-open question 2 is answered (the reference PDF keeps paying 3 calls,
-unchanged).
-
-9.6 **Crops provenance + approve-all** (`ui/studio.js`, plan steps
-3.2/4.1): Crops rows show chips for `crop_source` / `figure_source` /
-`organized`; one house-style action approves all `crop_source: model`
-crops of the job in a single call (residual 2). No import auto-run, no
-auto-anything beyond that click.
-
-**Hard rules for this phase (repeated):** artifacts stay read-only
-unless the user asks for import; every backend change requires a
-restarted server before live verification; console prints stay
-cp1256-safe; judge diffs by content (CRLF churn, note in §7).
-
-**Acceptance — the 10/10 gate.**
-
-1. Full suite green, with new tests for reflow, the coherence gate, the
-   enrich guard, the adaptive trigger and a prompt pin for 9.1.
-2. A clean live run of `12T-1q-J-p15-17.pdf`: the same mid-sentence scan
-   used for the diagnosis reports 0 bad wraps in every layer2 block.
-3. Every §8 invariant holds: questions exactly 55..73, four options each
-   labelled 1..4, Q55 options 6/16/12/26, Q58's series options, crops
-   exactly the 7 picture questions, `figure_dropped 0`, no Q54 row.
-4. The user reads the Extract tab by eye and confirms the prose is
-   continuous (the eye is the final judge).
-5. Provenance chips and approve-all visible in a restarted server's
-   Crops tab.
-6. Two clean runs in a row: identical questions/options/crop set; the
-   7 model crop boxes compared run-to-run (IoU reported) so residual 4
-   is measured rather than argued.
-
-New open questions (§7 still stands; add these):
-
-4. Residual 1: should a source without a metadata line import at `ready`
-   with a job-level note instead of one `warn` per row?
-5. Residual 2: OK to add the single "approve all model crops" action?
-
-The numeric score reaches 10/10 only when gate items 1–5 hold AND open
-questions 4/5 are answered; until then the honest number is the §8 score
-with the coherence defect removed, reported as such — never a padded 10.
-
-### 9 done — acceptance evidence (2026-10-22, score 9.7 / 10, coherence 0)
-
-Shipped this phase: 9.1 (organize prompt: image-first order, one flowing
-stem, no newline anywhere), 9.2 (`_sanitize_entry` +
-`organize_sanitized`), 9.3 (layout reflow: `reflow_lines`,
-`mid_sentence_breaks`, `one_line`; used by `split_text`), 9.4 (enrich
-guard: `stem reflowed` / `options reflowed` / `coherence` issue /
-canonical option labels, letter sets kept verbatim), 9.5 (adaptive
-organize trigger: a still-wrapping page always gets the model re-read),
-9.6 (provenance chips `src … / fig … / LLM` per Crops row + one
-`Approve all (n)` action; merged crop state carries `crop_source` /
-`figure_source`).
-
-```text
-suite    : Ran 782 tests in 11.972s - OK        (was 767 at 9.2)
-run 1    : job 20261022-221710-ae5b  (extract/enrich/geometry clean)
-run 2    : job 20261022-222114-208c  (drift/no-flake check)
-mid-sentence breaks : L1 = L2 = 0 in both runs   (was 8 fields)
-questions : exactly 55..73 both runs; 19/19 four options; Q54 tail out
-q55       : one flowing sentence, printed order, options 6/16/12/26
-q58       : series options (Lyman/Balmer/Paschen/Brackett), no wraps
-crops     : {57, 62, 67, 68, 71, 72, 73} both runs; model source;
-            figure_dropped 0, qa_rejects 0
-organize  : 3 calls/approx 20 s per page per run; sanitized 0 (the
-            image-first prompt already returns newline-free prose)
-warnings  : 19 rows warn (corp/year unknowable) - open question 4
-```
-
-Crop-box drift measured run-to-run (residual 4 is now a number, not an
-argument): Q67 IoU 0.85, Q68 0.77, Q62 0.69, Q71 0.59, Q72 0.49,
-Q73 0.47, Q57 0.26 - the boxes come from the vision model, so the Crops
-tab keeps the per-crop human gate; the approve-all click is the review
-still. New residual noted: formula transcription drift (Q58 read
-`\frac{6/4}{3}` in run 2 where the 9.2-era run read `\frac{6}{3}`) - the
-text layer cannot arbitrate a formula, so this belongs to the eye too.
-
-Why 9.7, not 10: the two open questions (4: per-row warnings; 5: the
-approve-all action) and gate item 4 - the user's own read of the Extract
-tab - are not the agent's to answer. Everything implementable shipped.
+- **Option order is still unreliable on right-to-left pages.** The printed
+  row `(1 528 25/3 - 440` can come back as `528 25/3 (1`; measured
+  120 flipped option lines in the free-form reply and 189 in the JSON one,
+  so the JSON container is *not* the lever. `layout._option_marker` now reads
+  both bracket shapes back to front (`(1` and `)1`), which recovers the label
+  but cannot undo a swap *between* options. Until an organize pass or a human
+  reads the page, a vision-lane question's option order must not be trusted.
+- **The printed dash is dropped.** The page prints `(1 528 25/3 - 440`; the
+  reply gives `528 25/3 (1`, so the option's own text keeps the dash only when
+  the model keeps it. A stripped label line and a misplaced label both land
+  here, and the deterministic splitter cannot tell them apart.
 
 
-## 10. Last plan steps closed - acceptance 2026-10-22 (9.8 / 10, functionality)
 
-Two decisions the plan left open were answered by the user before this phase:
+**Acceptance:** a fresh block's stored text already carries canonical
+delimiters; `mdHtml` on that text is identical to `mdHtml` on the old raw
+form; the suite (including all render pins) is green.
 
-- **Metadata (Q4):** a row imports at `ready` when the whole document has no
-  institute/year line; the absence is reported once as a job-level
-  `metadata missing` note, never as one warning per row. A field any row can
-  supply still warns the rows that lack it.
-- **Organizer (residual 3):** the Extract tab carries a per-run `organize`
-  picker - `auto` (adaptive, the default), `off`, `all pages` - sent with the
-  run; `STUDIO_ORGANIZE` now only defines what `auto` may do.
+### Phase 3 - Data walk-in hygiene (+4)
 
-Shipped this phase (step -> what landed):
+Small, mostly-verification steps. Five of seven jobs carry
+`compilation: unknown` / `subject: null` - mostly because profiles were
+never filled, not because code failed.
 
-- 3.1 band QA: a page-relative figure whose padded band region holds less than
-  60% of it is rejected (`figure_rejected`) instead of being assigned to the
-  band's question; a figure claimed by two blocks goes to the nearest block
-  centre (`figure_conflicts`), with `figure_dropped` unchanged.
-- 4.1 Inspect rows: status chip, topic, missing-field count, picture cell with
-  provenance (`model · review` / `asset`), edited badge.
-- 4.2 job scorecard above the Inspect table: blocks, prose, ready/warn, four-
-  option sets over questions, known topics over questions, approved/needed
-  crops, organized blocks, worst page layout confidence, job-level metadata.
-- 5.1 proxy preflight: a stethoscope button in the pipeline toolbar probes
-  every enabled proxy profile (`GET /api/proxy/check`, 8 s connect/read each)
-  and writes the outcome into the picker's option titles. The studio lanes
-  already inherit `NET_RETRIES` / `NET_RETRY_WAIT` through `call_gemini` /
-  `call_ocr_openai`, so no lane-specific retry code was added.
-- Residuals 1 and 3 above; residual 5 (provenance) was already in the Crops tab
-  from 9.6 and is now also on Inspect.
-- New additive stats only: `metadata_missing` on the layer2 stats and the
-  merged view, `figure_rejected` / `figure_conflicts` on the geometry stats,
-  `organize_mode` on the extract stats, and a pure `scorecard` block on the
-  merged view (computed from stored rows, no schema change).
+- [ ] **3.1** Verify the job-level `metadata missing` note end to end on
+  the duplicate job (Inspect row states plus the job scorecard line).
+  Shipped already per 1.3 - this is a walk-through; touch code only if
+  something is actually broken.
+- [ ] **3.2** Job-list hygiene: today's jobs are duplicates of one PDF.
+  Use the existing `DELETE /api/studio/jobs/{job_id}` (with the user) to
+  clear superseded copies. If the user wants to keep them, add nothing -
+  a `same source` chip is not requested; do not add UI unasked.
+- [ ] **3.3** Persian ZWNJ pass: confirm `pipeline/studio/persian.py`
+  runs on every import-bound path (grep its callers; wire any missing
+  one) with a test in the matching `tests/test_studio*.py` module.
+- [x] **3.4** Import-path faults: force one failure (e.g. stub a bad
+  batch in a test), confirm it classifies through `faults.py` and lands
+  in the Live log as chip + advice + raw text, never a bare red sentence
+  (`tests/test_studio_log.py`).
 
-Acceptance evidence (restarted server, live API and browser; nothing approved
-or imported):
+**Acceptance:** walkthrough notes under each tick; any code touch has its
+test; suite green.
+
+### Phase 4 - Scale: a second source, a batch, live lanes (+5)
+
+Everything so far has been one PDF. The score's scale row needs the
+everyday shape: more than one distinct document, processed without
+babysitting.
+
+- [x] **4.1** One real second source (different subject/grade; ask the
+  user to drop it in the watched tree or pick it in Upload). Run it end
+  to end through lanes (Models tab / `STUDIO_*` config); lane lines
+  visible live during the run, per `AGENTS.md` 5.1. *(done: chemistry /
+  grade 12, 67 pages, job `20261023-230412-8aaa`, 317 questions imported
+  through the lite-only Gemini lane over `V2ray/pattM`; see section 10.)*
+- [ ] **4.2** Bulk mode through the Bulk tab with at least 3 files;
+  confirm completion-order import behaviour and that no file waits on a
+  slow lane.
+- [x] **4.3** Inspect at scale: with the bulk job's rows (100+), verify
+  the Inspect table scrolls inside itself and stays usable, and the
+  scorecard block still computes from stored rows.
+- [ ] **4.4** Post-run hygiene: archived/finished jobs do not resurface
+  as actionable; distinct sources stay distinct in the job list.
+- [x] **4.5** Re-baseline the whole scorecard. Expected: scale 45 to 70+,
+  end-to-end proof at 75 or better.
+
+**Acceptance:** at least one non-exam source imported; lanes were visibly
+live; no manual rescue steps taken during the batch; scorecard
+re-measured.
+
+### Phase 5 - Close-out
+
+- [x] **5.1** Update `AGENTS.md` section 7 (test pin) and section 9
+  (current state: first import done, second sources imported, any new
+  `.env` keys) - it is the local manual the next agent reads first.
+  *(done 2026-10-23: 788 tests, section 9 rewritten to the 3-table core, the
+  studio imports, the TLS quirk and the studio lane state.)*
+- [x] **5.2** Rewrite 1.1 with the new numbers and write the final
+  one-line verdict at the top of this file. *(verdict below.)*
+- [ ] **5.3** Commit this file with the phase notes filled in, if the
+  user wants the history.
+
+---
+
+## 4. Score projection
+
+| Phase | Lever | Overall delta | Cumulative |
+|---|---|---|---|
+| 1 | First real import | +8 | 78 |
+| 2 | Math clean at the source | +3 | 81 |
+| 3 | Data walk-in hygiene | +4 | 85 |
+| 4 | Second source, batch, lanes | +5 | 90 |
+| 5 | Bookkeeping | 0 | - |
+
+The projection assumes the section-7 open questions get user answers;
+without them the honest ceiling is about 87, and the missing points stay
+open in section 7.
+
+---
+
+## 5. Out of scope - do not propose
+
+- Everything in `AGENTS.md` 5.4, plus plan-specific items: reworking
+  figure ownership or band QA (shipped and verified), per-row metadata
+  warnings (rejected; replaced by the job-level note), a `same source`
+  chip or any UI not asked for, turning the Crops per-crop review into an
+  automatic gate (that is open question 2 - the user's to answer), any DB
+  schema change, any new dependency, any build step for `ui/`.
+
+## 6. Verification kit
 
 ```text
-suite       : Ran 792 tests in 15.231s - OK      (was 782 at 9.7)
-job         : 20261022-225938-1ed0
-extract off :  0.3 s   organize_mode off, 0 calls           (per-run picker)
-extract auto: 60.0 s   3 organize calls, 19 blocks organized, 1 page skipped
-enrich      : 11.6 s   3 calls, 18 ready / 4 warn / 0 error
-geometry    :  0.0 s   22/22 boxes, 7 crops, 0 band calls
-questions   : 55..73 exactly; 19/19 four options, labels 1..4
-crops       : 57 62 67 68 71 72 73, model source; 0 dropped, 0 rejected,
-              0 conflicts
-breaks      : L1 = L2 = 0 mid-sentence fields
-scorecard   : BLOCKS 22 PROSE 3 READY 18 WARN 4 4 OPTS 19/19
-              TOPICS 18/19 CROPS 0/7 LLM 19 LAYOUT 0.33 METADATA corp year
-warnings    : Q61 only (topic missing); corp/year are the job-level note
-UI checks   : organize=off reached the stage (335 ms, mode off, 0 calls);
-              proxy check GET 200 in 2.1 s, both profiles reachable
+suite         : .venv\Scripts\python -m unittest discover -s tests
+restart       : tools/ocr.ps1 stop; tools/ocr.ps1 start     (port 8080)
+re-baseline   : GET /api/studio/jobs and /jobs/{id}  - from Python, not pwsh
+db spot-check : read-only SELECT via dataconsole (allowlisted tables)
+log           : GET /api/studio/jobs/{id}/log after any run
 ```
 
-Files: `pipeline/studio/{enrich,merge,extract,geometry,jobs}.py`, `main.py`,
-`ui/{studio.js,index.html,app.js,styles.css}`, `tests/test_studio.py`,
-`tests/test_studio_ui.py`, `tests/test_ui_pages.py`,
-`tests/test_credential_endpoints.py`, `README.md`, `.env.example`.
+## 7. Open questions for the user (append here; do not guess)
 
-Why 9.8, not 10: the crop boxes still come from the vision model and vary run
-to run (§8 residual 4 - worst IoU 0.26 on Q57), so all 7 crops keep their human
-gate; formula transcription drift (Q58) remains an eye decision; and gate item
-4 (the user's read of the Extract tab) is still the user's to give. Everything
-the plan asked an agent to implement is in and tested.
+1. **Kept or purged:** after a verification import, should those rows stay
+   in the DB, or be removed once verified? *(still open - 2026-10-23 the
+   user chose import -> verify -> delete for the test batches; a normal run
+   is expected to be kept)*
+2. **Crops gate:** the review action already approves all model crops in
+   one click, and a crop box can still be re-cut by hand. Should the
+   gate stay per-crop-before-import as it is? *(ANSWERED 2026-10-23: yes,
+   keep the per-crop gate exactly as it is)*
+3. **Compilation/subject defaults:** when a document has no
+   institute/year line, should the job import with those fields empty
+   (current behaviour), or should the profile carry a user-pinned default
+   that pre-fills them? *(ANSWERED 2026-10-23: import empty - today's
+   behaviour; no pre-fill)*
+4. **Source folder for a studio import:** `sources.folder_id` is `''` for
+   every studio import, so the "source lives in the folder tree" reference
+   is nominal. Should the importer create/reuse a folder under
+   `konkour-ocr/` (and back up those source files)? *(ANSWERED 2026-10-24:
+   studio sources live in their **own** folder system, deliberately separate
+   from the old `konkour-ocr/{subject}/{grade}/{topic}/{question|answer}`
+   scanned shape (`STUDIO_SOURCE_ROOT`, default `<INPUT_ROOT>/studio/<job>/`,
+   inside or outside the tree). DONE: `sources.folder_id` now carries that
+   folder (the directory, same derivation `pipeline/db.folder_id` uses), and a
+   missing stored source keeps an empty value.)*
+5. **Topic outside the vocabulary:** a chemistry-12 chapter the global tag
+   vocabulary lacks currently drops the enrich-proposed topic entirely (the
+   67-page chemistry job imported 317 rows with 0 topics). Should such a
+   topic land as a **pending** value (visible in Tags for review), or stay
+   dropped until the vocabulary grows? *(ANSWERED 2026-10-24: keep it
+   dropped, and a defective row (missing field) stays **out of the
+   database** until the vocabulary is fixed in the development stage -
+   tags drive a person's experience, so a guessed or invented tag must never
+   ship; no auto-create, no pending values.)*
+
+## 9. Done definition
+
+Phases 1-4 checked, section 7 answered or archived, 1.1 re-scored,
+`AGENTS.md` sections 7 and 9 updated, suite green at the new count, and
+the final verdict line written at the top of this file.
+
+---
+
+## 10. Log — 2026-10-24 session (Phase 2)
+
+Wired the canonical-math pass and then let the big PDF find the rest.
+
+| Step | Result |
+|---|---|
+| 2.1-2.4 | `textnorm.py` ported from `fenceBareTex` + delimiter zoo; `extract._block` runs ZWNJ repair then canonical math; 7 new tests (zoo, idempotency, unpaired `$$`, bare `tabular`, block shape) |
+| 2.5 (first run) | Live extract of the 67-page PDF: **0 blocks with a formula**, because the page draws its formulas as picture art - the text lane had always imported maths-free rows |
+| Fix A | `extract.page_has_text_math`: a text page with no `\`/`^`/`_` goes to the vision lane (user-approved) |
+| 2.5 (second run) | All 23 vision calls returned `BAD JSON` - `gemini._outcome` parsed every reply as JSON and `raw=True` never reached it. **The OCR lane could never have succeeded** |
+| Fix B | `raw` threaded through `router.call`/`call_pinned` into `call_gemini`; 4 tests in `RawReplyTest` |
+| 2.5 (third run) | 67/67 pages via vision, 277 s, 23 calls, 384 blocks, **149 with `$...$` formulas** (text lane: 0) |
+| 2.5 (option order) | Free-form replies flipped 120 option lines; a JSON container flipped 189 - **not fixed, recorded** in §9 and `AGENTS.md` |
+
+Suite: **805 tests, OK**. Server restarted for each live run; the 67-page job
+`20261024-004115-4a1c` is evidence only and was never imported.
+
+## 10. Log — 2026-10-23 session
+
+### Phase 1 — end-to-end proof (DONE, live)
+
+Decisions taken before running: the first import may land live, then **the
+rows it wrote are deleted** once verified (done — 2 sources rows + 336
+questions rows removed; counts went `3931 → 3950 → 4267 → 3931`, `2089 → 2091
+→ 2089`, each step a read-only SELECT before and after). Q2 (keep the per-crop
+gate) and Q3 (import empty compilation/subject) are answered in section 7; Q1
+stays open.
+
+1. Fresh duplicate of `12T-1q-J-p15-17.pdf` (job `20261023-223201-7d1a`; the
+   reference job `20261022-225938-1ed0` was never touched): probe 1 s, profile
+   copied, extract `organize:auto` → 22 blocks (19 organized, 1 skipped, 3
+   prose), enrich → 18 ready / 4 warn (3 prose + one flagless question),
+   geometry → 7 planned crops.
+2. Crops gate: the 7 model crops approved in one call (the tab's approve),
+   blocking set → 19/22 importable.
+3. Commit **failed** with `invalid input syntax for type smallint:
+   "دوازدهم"` and the job log recorded **nothing**; both defects fixed (below)
+   and the import then landed: 19 questions, 0 answers (the print has no key),
+   7 crops uploaded, DB `+1 source / +19 questions`.
+4. Re-imported dry-run afterwards to confirm the endpoint answers 200 with the
+   report (`questions 19, uploaded 0`) instead of a bare red body.
+
+### Fixes landed (each with a test)
+
+- `pipeline/utils.py` `parse_grade` (+ `importers/rows.py`, `supabase._grade`):
+  a Persian grade name becomes the column's smallint — the Phase-1 blocker.
+- `pipeline/studio/merge.py`: a reviewed crop box no longer erases its page
+  (`_crop_state(..., block_page)`), so `media_images[].page` is the printed page.
+- `pipeline/faults.py`: a rejected DB write (`invalid input syntax`, a
+  constraint, a missing relation, a lost connection) classifies as `db_down`.
+- `main.py` `/commit` + `importers/__init__.py`: a failed commit/import writes a
+  classified error line (chip, advice, raw text) into `job.jsonl`.
+- Tests added in `test_pipeline_logic`, `test_studio`, `test_studio_log`.
+  Suite: **788 tests, OK**.
+
+### Phase 4 — the large-PDF test (DONE)
+
+`konkour-ocr/shimi/12/chapter3/question/done/cd9fc77634cd-سوال فصل 3 Zed One.pdf`
+(67 pages, 18.8 MB, text layer) as job `20261023-230412-8aaa`, studio lane =
+**Gemini pool only, pinned to `gemini-3.5-flash-lite`**, proxy
+**`V2ray/pattM`**. Every model call in the usage history of the run names
+`gemini-3.5-flash-lite` — the pin holds and no other model is touched.
+
+| stage | result |
+|---|---|
+| upload + probe | `text_pdf`, 67/67 text pages |
+| extract (`organize:auto`) | 712 s, 23 page windows, 384 blocks, 317 organized, 33 sanitized, 0 errors |
+| enrich | 233 s, 39 batches, 317 questions / 67 prose, 0 errors, 269 warn (all "no options" on short-answer items) |
+| geometry | text-layer boxes for all 384 blocks, 116 crops planned, 64 pre-approved, 52 model-guessed |
+| crops gate | 52 approved in one call → 116 crops |
+| commit | 200, 184 s, **317 questions imported, 52 crops uploaded**, 67 prose skipped, 0 errors |
+| DB check | `+317 questions`, `+1 source`; all `grade=12`; picture rows carry page 1…64; no `invalid` values |
+
+No question was lost or merged across 67 pages, no log error, no `unknown`
+fault, and the whole PDF was never sent in one request.
+
+### Re-score (1.1)
+
+| Dimension | Was | Now | Why |
+|---|---|---|---|
+| End-to-end proof | 55 | **88** | two real imports (19 + 317 rows) crossed the line into the live DB |
+| Scale | 45 | **85** | a 67-page / 18.8 MB PDF finished every stage in one session |
+| Reliability / data | 60 | **74** | grade, crop page and silent import failure fixed; `compilation/subject` still empty when the print has none |
+| Structure / Completeness / Inspect / Testing | 80/76/82/85 | unchanged | not touched this session |
+
+**Overall ≈ 79** (from 70). What still holds it back: the crops gate stays
+manual (by decision), a studio import does not create a source folder in the
+tree (`sources.folder_id = ''`), and a topic only lands when the GLOBAL tag
+vocabulary has that subject+grade chapter — the vocabulary has chemistry
+grade-10 only, so all 317 chemistry-12 topics came out empty (see Q1 below).
+
+### Two new open questions (section 7)
+
+4. Should a studio import create/reuse a folder in `konkour-ocr/` so
+   `sources.folder_id` points at a real folder (today it is `''`)?
+5. A chemistry-12 chapter the vocabulary lacks currently drops the topic
+   entirely — should the `topic` proposed by enrich land as a **pending**
+   value (reviewable in Tags), or stay dropped until the vocabulary grows?

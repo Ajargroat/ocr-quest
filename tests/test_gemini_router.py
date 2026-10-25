@@ -847,5 +847,74 @@ class TextOnlyGeminiTest(unittest.TestCase):
                          captured["payload"]["generationConfig"])
 
 
+class RawReplyTest(unittest.TestCase):
+    """``raw=True``: the OCR lane wants the page's words, not a JSON body.
+
+    Parsing a page of Persian prose as JSON always fails, and the failure used
+    to read as "the model answered badly" — the ladder then walked every rung
+    for every page and the whole run reported BAD JSON.
+    """
+
+    PAGE = "=== PAGE 1 ===\nآقای کنکور\n1) همانند - افزایش"
+
+    def _call(self, text, **kwargs):
+        class Resp:
+            status_code = 200
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": text}]}}],
+                        "usageMetadata": {"promptTokenCount": 7,
+                                          "candidatesTokenCount": 9}}
+
+        real_post = gemini.requests.post
+        gemini.requests.post = lambda *a, **k: Resp()
+        try:
+            return gemini.call_gemini("k", "gemini-3.5-flash-lite", "hi", "",
+                                      "text/plain", **kwargs)
+        finally:
+            gemini.requests.post = real_post
+
+    def test_a_page_of_prose_comes_back_verbatim(self):
+        parsed, text, usage = self._call(self.PAGE, raw=True)
+        self.assertIsNone(parsed)
+        self.assertEqual(text, self.PAGE)
+        self.assertEqual(usage, {"tokens_in": 7, "tokens_out": 9})
+
+    def test_the_same_reply_without_raw_is_still_a_fault(self):
+        from pipeline import faults
+        with self.assertRaises(faults.FaultError) as caught:
+            self._call("not json at all", retries=1)
+        self.assertEqual(caught.exception.fault["kind"], "model_garbage")
+
+    def test_json_that_happens_to_be_a_page_still_parses(self):
+        parsed, text, _usage = self._call('{"questions": []}', json_mode=True)
+        self.assertEqual(parsed, {"questions": []})
+        self.assertEqual(text, '{"questions": []}')
+
+
+class RouterRawLaneTest(unittest.TestCase):
+    """The router must hand ``raw`` to the lane that asked for it."""
+
+    def test_the_router_passes_raw_through(self):
+        from unittest import mock
+        from pipeline import gemini_router
+        seen = {}
+
+        def fake_call(*args, **kwargs):
+            seen.update(kwargs)
+            return None, "page words", {"tokens_in": 1, "tokens_out": 2}
+
+        cfg = type("Cfg", (), {
+            "gemini_key_pool": ["k"], "gemini_model_ladder": ["m"],
+            "gemini_pin": "", "key_labels": {}, "studio_vision_model": ""})()
+        router = gemini_router.router
+        with mock.patch.object(gemini_router, "call_gemini", fake_call):
+            parsed, text, _route = router.call(cfg, "p", "", "text/plain",
+                                               raw=True)
+        self.assertTrue(seen.get("raw"))
+        self.assertIsNone(parsed)
+        self.assertEqual(text, "page words")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

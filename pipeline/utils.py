@@ -45,3 +45,39 @@ def parse_number(value):
         return float(text)
     except (TypeError, ValueError):
         return None
+
+
+# Persian grade names -> the smallint digit both grade columns store.
+GRADE_WORDS = {"دهم": 10, "یازدهم": 11, "دوازدهم": 12}
+
+
+def parse_grade(value):
+    """'12', '۱۲' or 'دوازدهم' -> 12; a value that is not a grade -> None.
+
+    The sources/questions/answers grade columns are smallint, and a Persian
+    grade name is what a profile carries by default, so every writer and
+    reader reasons about the same number through this one helper.
+    """
+    text = to_english_digits(norm_text(value))
+    if not text:
+        return None
+    if text.isdigit():
+        number = int(text)
+        return number if 1 <= number <= 12 else None
+    return GRADE_WORDS.get(text)
+
+
+def norm_scalar(v):
+    """Normalized comparable form: numbers collapse 12/12.0/'۱۲' -> '12'.
+
+    Lives here rather than in a feature module because both the Studio's
+    question-number matching and the answer-pairing code compare the same way.
+    """
+    if v is None:
+        return None
+    n = parse_number(to_english_digits(str(v)))
+    if n is not None:
+        f = float(n)
+        return str(int(f)) if f.is_integer() else str(f)
+    t = norm_text(to_english_digits(str(v))).lower()
+    return t or None

@@ -7,9 +7,14 @@ saved once under a content id — deduped across the whole job, referenced by
 blocks, so storage holds each picture exactly one time.
 
 Image lane: each page is rendered through the shared 200 KB compressor and
-sent to the stage-1 model with ``OCR_PAGE_PROMPT`` (verbatim output — a
-low-thinking task any model can serve); the reply runs through the SAME
-splitter, so both lanes produce one bulk schema.
+sent to the stage-1 model with ``OCR_JSON_PROMPT`` (a JSON body carrying the
+verbatim transcription — a low-thinking task any model can serve, and the
+container keeps the model from re-ordering a right-to-left line); the reply
+runs through the SAME splitter, so both lanes produce one bulk schema.
+
+A text page whose layer carries no TeX character is read by the image lane
+instead: the formulas on such a page are picture art, and the text lane would
+import the prose with the maths silently missing.
 
 Mixed PDFs use both lanes page by page. A vision page that fails is logged
 and left empty — the rest of the job still extracts.
@@ -24,11 +29,25 @@ import time
 from pipeline import converter, prompts
 from pipeline.utils import to_english_digits
 from pipeline.studio import (chunker, faults as studio_faults, layout, llm,
-                             persian, workspace)
+                             persian, textnorm, workspace)
 from pipeline.studio import probe as probe_mod
 
 # Render resolution for figures, page images and (later) crops.
 RENDER_DPI = int(os.getenv("STUDIO_RENDER_DPI", "170"))
+
+# A text page whose TeX characters (``\``, ``^``, ``_``) pdfium exposes is a
+# text page; one that draws its formulas as vector art exposes none, and the
+# text lane would import the prose with the maths silently missing. That page
+# is read by the model instead. The signal is the PAGE, not the block: a page
+# that printed real TeX may still have a prose-only block (a header), and
+# "the block has no TeX" must not demote that block on its own.
+TEXT_MATH_MARKS = ("\\", "^", "_")
+
+
+def page_has_text_math(text):
+    """True when a text layer carries TeX characters a reader can reason on."""
+    return any(mark in (text or "") for mark in TEXT_MATH_MARKS)
+
 # Vision pages are capped by pixels, not bytes: the old 200 KB byte cap forced
 # a 4968 px page down to JPEG quality 20, which is bigger *and* blurrier than
 # a 3000 px page at quality 88.
@@ -56,7 +75,36 @@ Rules:
 7. When the request carries more than one page image, start each page with one line exactly "=== PAGE <n> ===", n counting from 1 in the order the images were sent.
 8. Never cut a question: one question stays one entry. If the last question on this page continues onto the next page, end this page with one line exactly "SPLIT: tail".
 9. If the first question on this page continues a question that started on an earlier page, print one line exactly "SPLIT: head" right before that question's text. A question that both continues and continues onwards gets both marker lines.
+10. An option's label goes on the LEFT of its text exactly as printed: an option printed "(1 ... " starts its line "(1 ... " and one printed "1) ... " starts "1) ... ". Never move a label to the other end of its line, and never swap two options.
 Output only the page text."""
+
+# Rule 10 exists because of a measured miss: on a right-to-left page the model
+# put the label on the wrong side of the value ("(4 25/3 - 440" for a printed
+# "(4 440 - 25/3"), which turns every option into a different answer.
+
+# The same transcription asked for as a JSON body. The container was tried as
+# a lever on option ORDER and measured over the whole 67-page booklet: it did
+# not settle it (free-form lane 120 flipped option lines, JSON lane 189), so
+# the JSON body is kept for a different reason - it returns exactly one field
+# per page and the page-marker parse can never split a page wrongly. Option
+# order still needs the organize pass (or a human) before an import.
+OCR_JSON_PROMPT = """You are a precise OCR engine for Iranian exam pages.
+
+Transcribe the text of every page image in this request, verbatim, in natural
+reading order.
+
+Rules:
+1. Reproduce Persian text exactly, keeping half-spaces (ZWNJ) and punctuation.
+2. Keep question numbers and option labels exactly as printed, on the side of the line the print puts them (۱، ۲، 1) ، الف) …).
+3. Keep the line structure: a question stem, each option and each metadata line stay their own line, in the printed order.
+4. If formulas, physics, chemistry or math notation appear, write them in clean LaTeX.
+5. Do not translate, summarise, explain, renumber or add commentary.
+6. If a word is genuinely unreadable, give your best single reading — never a placeholder like [?].
+7. When the request carries more than one page image, start each page with one line exactly "=== PAGE <n> ===", n counting from 1 in the order the images were sent.
+8. Never cut a question: one question stays one entry. If the last question on this page continues onto the next page, end this page with one line exactly "SPLIT: tail".
+9. If the first question on this page continues a question that started on an earlier page, print one line exactly "SPLIT: head" right before that question's text. A question that both continues and continues onwards gets both marker lines.
+10. An option's label goes on the LEFT of its text exactly as printed: an option printed "(1 ... " starts its line "(1 ... " and one printed "1) ... " starts "1) ... ". Never move a label to the other end of its line, and never swap two options.
+Output ONE JSON object: {"text": "<the whole transcription, newlines as \\n>"} - the transcription and nothing else, no page commentary, no markdown fences."""
 
 # The organize pass: a text page whose deterministic anchor pass is unsure is
 # re-read as ONE structure. The image is the source of truth; the text layer is
@@ -96,6 +144,27 @@ Rules:
 
 # The vision lane's per-page section marker (rule 7 of the prompt).
 PAGE_MARK_RE = re.compile(r"^\s*=+\s*PAGE\s+(\d+)\s*=+\s*$", re.IGNORECASE)
+
+
+def _reply_text(result):
+    """The transcription out of a lane reply, JSON container or plain text.
+
+    The JSON body is preferred (see ``OCR_JSON_PROMPT``); a lane that answered
+    with prose anyway still carries the page, so its ``text`` is used. An
+    ``"text"`` key that is not a string is ignored rather than trusted.
+    """
+    parsed = (result or {}).get("parsed")
+    if isinstance(parsed, str):
+        return parsed.strip()
+    if isinstance(parsed, dict):
+        for key in ("text", "pages"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+            if isinstance(value, list) and value:
+                joined = [v if isinstance(v, str) else str(v) for v in value]
+                return "\n".join(joined).strip()
+    return ((result or {}).get("text") or "").strip()
 
 
 # ── pdfium helpers ──────────────────────────────────────────────────────────
@@ -243,13 +312,17 @@ def _block(key, kind, page_no, order, number=None, label=None, text="",
     metadata = layout.metadata_fields(metadata_line)
     # The text layer of a scanned-but-textual PDF carries no half-spaces
     # (see pipeline.studio.persian), so every block is repaired here - the one
-    # place every lane and every source shape passes through.
-    text = persian.restore(text or "")
+    # place every lane and every source shape passes through. Math is folded to
+    # its canonical delimiters AFTER that repair (a half-space inside a formula
+    # is not a word joiner), so a stored block already carries the form the
+    # renderer shows.
+    text = textnorm.canonical(persian.restore(text or ""))
     options = _option_texts(options)
     return {
         "key": key, "kind": kind, "page": page_no, "order": order,
         "number": number, "label": label,
-        "text": text, "options": [persian.restore(o) for o in options],
+        "text": text,
+        "options": [textnorm.canonical(persian.restore(o)) for o in options],
         "metadata_line": metadata_line,
         "corp": metadata["corp"], "year": metadata["year"],
         "topic": None, "difficulty": metadata["difficulty"],
@@ -577,11 +650,12 @@ def _vision_texts(cfg, image_paths, page_nos):
         batch_pages = page_nos[start:start + per_call]
         blob = batch[0] if len(batch) == 1 else batch
         prompt = llm.stage_prompt(
-            cfg, "extract", prompts.get("studio.ocr", OCR_PAGE_PROMPT))
+            cfg, "extract", prompts.get("studio.ocr_json", OCR_JSON_PROMPT))
         result = llm.call_stage(cfg, "extract", prompt, blob,
-                                "image/jpeg", raw=True)
+                                "image/jpeg", raw=False, json_mode=True,
+                                thinking=0)
         route = result.get("route") or route
-        text = (result.get("text") or "").strip()
+        text = _reply_text(result)
         texts.update(_split_page_markers(text, batch_pages))
     return texts, route
 
@@ -632,11 +706,20 @@ def _apply_split(blocks, flag):
 
 
 def _vision_blocks(text, page_no, source):
+    """A vision page's TEXT becomes blocks.
+
+    The page was read by the model because the text lane cannot trust its
+    structure (a scan, or formulas drawn as vector art). The reply is the
+    organized text (rule 5 of the OCR prompt), so the deterministic splitter
+    turns it into question/prose blocks with their options — the same blocks
+    a text page would get. An empty reply yields none: inventing a block for
+    a page the model could not read would put empty rows in the job list.
+    """
     clean, split = layout.parse_split(text)
     if probe_mod._looks_like_answer_key(clean):
         return _key_entry_blocks(clean, page_no, source)
     blocks = [
-        _block("p%d-b%d" % (page_no, index), raw["kind"], page_no, index,
+        _block("p%d-o%d" % (page_no, index), raw["kind"], page_no, index,
                number=raw["number"], text=raw["text"], options=raw["options"],
                metadata_line=raw["metadata_line"], bbox=None,
                bbox_source=None, images=[], raw_ocr=clean, source=source)
@@ -697,7 +780,7 @@ def run(job_id, cfg, emit=None, organize="auto"):
 
     assets, pages, blocks = [], [], []
     stats = {"text_pages": 0, "vision_pages": 0, "assets": 0, "calls": 0,
-             "blocks": 0, "joined": 0, "errors": [],
+             "blocks": 0, "joined": 0, "errors": [], "mathless_pages": 0,
              "organized_pages": 0, "organize_calls": 0,
              "organized_blocks": 0, "organize_skipped": 0,
              "organize_sanitized": 0, "organize_mode": mode,
@@ -712,6 +795,19 @@ def run(job_id, cfg, emit=None, organize="auto"):
             emit("extract", "info", "reading %d page(s)" % total)
             counts = [len(re.sub(r"\s", "", _page_text(doc[index])))
                       for index in range(total)]
+            # A text page that draws its formulas as vector art exposes no TeX
+            # characters, so the text lane would import prose with the maths
+            # silently missing (the crop keeps the picture, the text does not
+            # point at it). Such a page is handed to the vision lane instead.
+            mathless = sum(1 for page_no in range(1, total + 1)
+                           if counts[page_no - 1]
+                           >= probe_mod.TEXT_PAGE_MIN_CHARS
+                           and not page_has_text_math(_page_text(
+                               doc[page_no - 1])))
+            if mathless:
+                emit("extract", "info",
+                     "%d page(s) carry no TeX in their text layer - read by "
+                     "the vision lane" % mathless)
             max_chars, max_pages = _chunk_bounds(cfg)
             windows = chunker.chunk_pages(counts, max_chars=max_chars,
                                           max_pages=max_pages)
@@ -726,7 +822,8 @@ def run(job_id, cfg, emit=None, organize="auto"):
                 results, vision = {}, []
                 for page_no in window["pages"]:
                     page = doc[page_no - 1]
-                    if counts[page_no - 1] >= probe_mod.TEXT_PAGE_MIN_CHARS:
+                    if (counts[page_no - 1] >= probe_mod.TEXT_PAGE_MIN_CHARS
+                            and page_has_text_math(_page_text(page))):
                         results[page_no] = _text_page(
                             job_id, page, page_no, page_no in key_pages, assets,
                             start=layout_prev)
@@ -736,6 +833,8 @@ def run(job_id, cfg, emit=None, organize="auto"):
                         stats["text_pages"] += 1
                     else:
                         vision.append(page_no)
+                        if counts[page_no - 1] >= probe_mod.TEXT_PAGE_MIN_CHARS:
+                            stats["mathless_pages"] += 1
                 if vision:
                     paths = []
                     for page_no in vision:
@@ -837,8 +936,9 @@ def run(job_id, cfg, emit=None, organize="auto"):
     workspace.write_artifact(job_id, "layer1", layer1)
     workspace.log_event(
         job_id, "extract", "success",
-        "extracted %d block(s) - text pages %d, vision pages %d, "
-        "assets %d, joined %d, organized pages %d"
+        "extracted %d block(s) - text pages %d, vision pages %d "
+        "(mathless %d), assets %d, joined %d, organized pages %d"
         % (len(blocks), stats["text_pages"], stats["vision_pages"],
-           stats["assets"], stats["joined"], stats["organized_pages"]))
+           stats["mathless_pages"], stats["assets"], stats["joined"],
+           stats["organized_pages"]))
     return {"job": workspace.summary(job_id), "stats": stats}

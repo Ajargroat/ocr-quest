@@ -161,11 +161,29 @@ class StudioImporterSourceRowTests(unittest.TestCase):
         self.assertEqual(item.type, TYPE_DIRS["question"])
         # the studio keeps its sources in the folder tree, never in the bucket
         self.assertEqual(recorder.source_url(), "")
-        # no rel_path -> the sources folder_id stays empty (the column is
-        # NOT NULL and db.upsert_source turns an empty path into "")
-        self.assertEqual(item.rel_path, "")
+        # the studio tree's own relative path -> the scanner's sha1 folder id,
+        # so the sources row can find its folder later
+        meta = workspace.read_artifact(jid, "source_meta", {}) or {}
+        self.assertEqual(item.rel_path, meta.get("rel_path"))
         from pipeline import db as db_mod
-        self.assertIsNone(db_mod.folder_id(item.rel_path))
+        self.assertTrue(item.rel_path.endswith("exam.pdf"))
+        self.assertTrue(db_mod.folder_id(item.rel_path))
+
+    def test_a_job_without_a_stored_source_keeps_an_empty_folder(self):
+        jid = workspace.new_id()
+        workspace.job_dir(jid, create=True)
+        view = {
+            "job_id": jid, "source": "gone.pdf",
+            "profile": {"static": {"subject": "Chemistry", "grade": "10"}},
+            "crops": {},
+            "blocks": [{"key": "p1-b1", "kind": "question", "status": "ready",
+                        "number": 1, "text": "first",
+                        "options": ["A) one", "B) two"]}],
+        }
+        report, recorder = self._run(view)
+        self.assertEqual(recorder.source_item().rel_path, "")
+        from pipeline import db as db_mod
+        self.assertIsNone(db_mod.folder_id(""))
 
     def test_a_grade_that_is_not_a_number_is_left_out(self):
         jid, view = self._job()

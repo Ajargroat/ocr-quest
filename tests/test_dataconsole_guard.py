@@ -50,7 +50,7 @@ class GuardAllows(unittest.TestCase):
         self.assertEqual(allowed(sql), "write")
 
     def test_delete_with_where(self):
-        sql = "DELETE FROM revision_reports WHERE severity = 'err'"
+        sql = "DELETE FROM answers WHERE review_status = 'rejected'"
         self.assertEqual(allowed(sql), "write")
 
     def test_insert(self):

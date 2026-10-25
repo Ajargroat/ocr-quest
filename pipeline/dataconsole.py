@@ -358,7 +358,7 @@ class DataConsole:
         colnames = self._column_names(table)
         clean = {k: v for k, v in (values or {}).items()
                  if k in colnames and k not in _SKIP_SEARCH
-                 and k not in ("created_at", "last_at") and v != ""}
+                 and k != "created_at" and v != ""}
         if not clean:
             raise GuardError("Nothing to insert — fill in at least one column.")
         cols = list(clean)

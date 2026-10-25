@@ -107,9 +107,9 @@ class SourceSnapshotTests(unittest.TestCase):
 class BackupJsonAdapterTests(unittest.TestCase):
     """The SQL dump must adapt jsonb containers (the dict crash).
 
-    lesson_blocks/questions/media_assets carry jsonb columns, and psycopg2
-    has no default adapter for a dict: without Json() the whole backup dies
-    with "can't adapt type 'dict'" and writes no set at all.
+    answers (and questions) carry jsonb columns, and psycopg2 has no default
+    adapter for a dict: without Json() the whole backup dies with "can't
+    adapt type 'dict'" and writes no set at all.
     """
 
     def test_a_container_becomes_the_json_adapter(self):
@@ -145,16 +145,24 @@ class BackupJsonAdapterTests(unittest.TestCase):
 class TableListTests(unittest.TestCase):
     """C1d: one allowlist drives the backup job, the console and its guard."""
 
+    CORE = ("sources", "questions", "answers")
     LESSONS = ("courses", "chapters", "lessons", "lesson_blocks", "media_assets",
-               "questions", "question_options", "short_answer_keys", "attempts",
+               "question_options", "short_answer_keys", "attempts",
                "lesson_progress")
-    OCR = ("sources", "answers", "revision_reports", "revision_summary")
+    REVISION = ("revision_reports", "revision_summary")
 
-    def test_tables_cover_the_lessons_model(self):
-        for table in self.LESSONS + self.OCR:
-            self.assertIn(table, backups.TABLES)
-        self.assertEqual(backups.TS_COL["revision_summary"], "last_at")
+    def test_tables_are_exactly_the_flat_pipeline_core(self):
+        self.assertEqual(tuple(backups.TABLES), self.CORE)
         self.assertEqual(backups.TS_COL["questions"], "created_at")
+
+    def test_the_retired_lessons_tables_are_not_backed_up(self):
+        for table in self.LESSONS:
+            self.assertNotIn(table, backups.TABLES)
+
+    def test_the_retired_revision_tables_are_not_backed_up(self):
+        for table in self.REVISION:
+            self.assertNotIn(table, backups.TABLES)
+            self.assertNotIn(table, backups.TS_COL)
 
     def test_the_console_shares_the_same_allowlist(self):
         from pipeline.dataconsole import TABLES as console_tables

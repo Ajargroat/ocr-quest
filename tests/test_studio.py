@@ -210,12 +210,15 @@ class StudioSourceTreeTests(unittest.TestCase):
         self.assertEqual(workspace.source_path(jid), stored)
 
     def test_source_meta_carries_rel_path_and_folder_id(self):
-        from pipeline.utils import sha1_hex
+        from pipeline import db as db_mod
         jid = workspace.new_id()
         workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
         meta = workspace.read_artifact(jid, "source_meta")
         self.assertEqual(meta["rel_path"], jid + "/exam.pdf")
-        self.assertEqual(meta["folder_id"], sha1_hex(jid + "/exam.pdf"))
+        # the same folder derivation a scanned source gets: the directory the
+        # file sits in, not a hash of the file path
+        self.assertEqual(meta["folder_id"], jid)
+        self.assertEqual(meta["folder_id"], db_mod.folder_id(meta["rel_path"]))
         self.assertEqual(meta["name"], "exam.pdf")
 
 
@@ -779,7 +782,7 @@ def _figure_pdf(path):
     """One text page — marker, four options, a metadata line, one figure."""
     content = (
         "q 200 0 0 200 300 400 cm /Im1 Do Q\n"
-        "BT /F1 12 Tf 40 800 Td (1\\) Which option matches the figure?) Tj ET\n"
+        "BT /F1 12 Tf 40 800 Td (1\\) Which option matches x^{2}?) Tj ET\n"
         "BT /F1 12 Tf 40 770 Td (A\\) first option) Tj ET\n"
         "BT /F1 12 Tf 40 750 Td (B\\) second option) Tj ET\n"
         "BT /F1 12 Tf 40 730 Td (C\\) third option) Tj ET\n"
@@ -1322,6 +1325,53 @@ class StudioProvenanceTests(_StudioStageCase):
         self.assertEqual(first["crop"]["figure"], "organize")
         self.assertTrue(first["organized"])
 
+    def test_a_reviewed_box_on_a_planned_crop_keeps_the_blocks_page(self):
+        # review.json's crop patch carries a box, never a page; the planned
+        # geometry entry still names the page, so media_images is not page 0.
+        from pipeline.studio import merge
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        block = _blk("p1-b1", "question", order=1, number=57, text="...",
+                     page=2, crop={"needed": True, "approved": True,
+                                   "bbox": [10, 10, 50, 90], "page": 2})
+        workspace.write_artifact(jid, "layer2", {
+            "version": 1, "job_id": jid, "profile": {},
+            "blocks": [block], "pages": [], "assets": [], "stats": {}})
+        workspace.write_artifact(jid, "geometry", {
+            "version": 1, "job_id": jid,
+            "boxes": {"p1-b1": {"bbox": [10, 10, 50, 90],
+                                "source": "text_layer",
+                                "crop_bbox": [10, 10, 50, 90],
+                                "crop_source": "model", "crop_page": 2,
+                                "crop_approved": None}},
+            "stats": {}})
+        workspace.write_artifact(jid, "review", {
+            "version": 1, "job_id": jid,
+            "crops": {"p1-b1": {"bbox": [12, 12, 60, 92],
+                                "approved": True}}, "edits": {}})
+        view = merge.merged(jid)
+        self.assertEqual(view["crops"]["p1-b1"]["page"], 2)
+
+    def test_a_planned_crop_without_a_page_falls_back_to_the_block_page(self):
+        from pipeline.studio import merge
+        jid = workspace.new_id()
+        workspace.save_source(jid, io.BytesIO(b"%PDF-1.4 x"), "exam.pdf")
+        block = _blk("p1-b1", "question", order=1, number=57, text="...",
+                     page=3, crop={"needed": True, "approved": True,
+                                   "bbox": [10, 10, 50, 90]})
+        workspace.write_artifact(jid, "layer2", {
+            "version": 1, "job_id": jid, "profile": {},
+            "blocks": [block], "pages": [], "assets": [], "stats": {}})
+        workspace.write_artifact(jid, "geometry", {
+            "version": 1, "job_id": jid,
+            "boxes": {"p1-b1": {"bbox": [10, 10, 50, 90],
+                                "source": "text_layer",
+                                "crop_bbox": [10, 10, 50, 90],
+                                "crop_source": "model"}},
+            "stats": {}})
+        view = merge.merged(jid)
+        self.assertEqual(view["crops"]["p1-b1"]["page"], 3)
+
 
 class StudioRowsTests(unittest.TestCase):
     """B6 — the row carries one media_images JSON array beside the old columns."""
@@ -1339,6 +1389,20 @@ class StudioRowsTests(unittest.TestCase):
              "page": 1}])
         self.assertEqual(row["diagram_url"], "https://cdn/p1-b1.jpg")
         self.assertEqual(row["diagram_bbox"], "[10, 10, 50, 90]")
+
+    def test_a_persian_grade_name_becomes_the_smallint_digit(self):
+        # grades are smallint columns; a profile says "دوازدهم" (D-12), so the
+        # row must carry 12 or the insert is rejected (Phase-1 live import).
+        from pipeline.studio.importers import rows as rows_mod
+        from pipeline.studio.importers import supabase as supabase_mod
+        block = _blk("p1-b1", "question", number=1, text="متن",
+                     grade="دوازدهم")
+        row = rows_mod._question_row("studio-j", block, {})
+        self.assertEqual(row["grade"], 12)
+        answer = rows_mod._answer_row("studio-j", block, {})
+        self.assertEqual(answer["grade"], 12)
+        self.assertEqual(supabase_mod._grade("دوازدهم"), 12)
+        self.assertIsNone(supabase_mod._grade("unknown"))
 
     def test_figure_without_text_keeps_one_inline_marker(self):
         from pipeline.studio.importers import rows as rows_mod
@@ -1637,7 +1701,7 @@ class StudioGeometryTests(_StudioStageCase):
                         "route": {}, "lane": "stub"}
             if kw["stage"] == "vision":
                 return {"text": "", "parsed": {"boxes": [
-                    {"key": "p1-b1", "bbox": [80, 60, 620, 940],
+                    {"key": "p1-o1", "bbox": [80, 60, 620, 940],
                      "figure": [300, 70, 600, 930]}]},
                     "route": {}, "lane": "stub"}
             return {"text": "", "parsed": {"blocks": []}, "route": {},
@@ -1660,7 +1724,7 @@ class StudioGeometryTests(_StudioStageCase):
         self.assertEqual(reason, "crop awaiting approval")
         workspace.write_artifact(jid, "review", {
             "version": 1, "edits": {},
-            "crops": {"p1-b1": {"bbox": [300, 70, 600, 930], "approved": True}}})
+            "crops": {"p1-o1": {"bbox": [300, 70, 600, 930], "approved": True}}})
         block = merge.merged(jid)["blocks"][0]
         self.assertTrue(block["crop"]["approved"])
         ok, _ = merge.importable(block)
@@ -1677,7 +1741,7 @@ class StudioGeometryTests(_StudioStageCase):
                         "route": {}, "lane": "stub"}
             if kw["stage"] == "vision":
                 return {"text": "", "parsed": {"boxes": [
-                    {"key": "p1-b1", "bbox": [80, 60, 620, 940],
+                    {"key": "p1-o1", "bbox": [80, 60, 620, 940],
                      "figure": None}]}, "route": {}, "lane": "stub"}
             return {"text": "", "parsed": {"blocks": []}, "route": {},
                     "lane": "stub"}
@@ -1690,7 +1754,7 @@ class StudioGeometryTests(_StudioStageCase):
         enrich.run(jid, {}, emit=lambda *a, **k: None)
         out = geometry.run(jid, {}, emit=lambda *a, **k: None)
         self.assertEqual(out["stats"]["crops"], 0)
-        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-b1"]
+        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-o1"]
         self.assertEqual(entry["bbox"], [80, 60, 620, 940])
         self.assertIsNone(entry["crop_bbox"])
         block = merge.merged(jid)["blocks"][0]
@@ -1712,7 +1776,7 @@ class StudioGeometryTests(_StudioStageCase):
                         "route": {}, "lane": "stub"}
             if kw["stage"] == "vision":
                 return {"text": "", "parsed": {"boxes": [
-                    {"key": "p1-b1", "bbox": [80, 60, 620, 940],
+                    {"key": "p1-o1", "bbox": [80, 60, 620, 940],
                      "figure": [300, 70, 600, 930]}]},
                     "route": {}, "lane": "stub"}
             return {"text": "", "parsed": {"blocks": []}, "route": {},
@@ -1728,7 +1792,7 @@ class StudioGeometryTests(_StudioStageCase):
         self.assertTrue(merge.merged(jid)["blocks"][0]["crop"]["needed"])
         workspace.write_artifact(jid, "review", {
             "version": 1, "edits": {},
-            "crops": {"p1-b1": {"bbox": None, "approved": False}}})
+            "crops": {"p1-o1": {"bbox": None, "approved": False}}})
         block = merge.merged(jid)["blocks"][0]
         self.assertFalse(block["crop"]["needed"])
         ok, _ = merge.importable(block)
@@ -1748,10 +1812,10 @@ class StudioGeometryTests(_StudioStageCase):
             if kw["stage"] == "vision":
                 calls.append(kw)
                 return {"text": "", "parsed": {"pages": [
-                    {"page": 1, "boxes": [{"key": "p1-b1",
+                    {"page": 1, "boxes": [{"key": "p1-o1",
                                            "bbox": [80, 60, 300, 940],
                                            "figure": None}]},
-                    {"page": 2, "boxes": [{"key": "p2-b1",
+                    {"page": 2, "boxes": [{"key": "p2-o1",
                                            "bbox": [80, 60, 300, 940],
                                            "figure": None}]}]},
                     "route": {}, "lane": "stub"}
@@ -1770,8 +1834,8 @@ class StudioGeometryTests(_StudioStageCase):
         self.assertEqual(calls[0]["labels"], ["PAGE 1:", "PAGE 2:"])
         self.assertEqual(len(calls[0]["images"]), 2)
         boxes = workspace.read_artifact(jid, "geometry")["boxes"]
-        self.assertEqual(boxes["p1-b1"]["bbox"], [80, 60, 300, 940])
-        self.assertEqual(boxes["p2-b1"]["bbox"], [80, 60, 300, 940])
+        self.assertEqual(boxes["p1-o1"]["bbox"], [80, 60, 300, 940])
+        self.assertEqual(boxes["p2-o1"]["bbox"], [80, 60, 300, 940])
         self.assertEqual(out["stats"]["vision_pages"], 2)
 
     def _one_figure_stub(self, band_reply):
@@ -1780,13 +1844,15 @@ class StudioGeometryTests(_StudioStageCase):
 
         def stub(**kw):
             if kw["stage"] == "extract":
-                return {"text": "۱) پرسش؟\nالف) یک\nب) دو",
+                # the OCR prompt asks for the organized text: the splitter
+                # mints the page's block from it
+                return {"text": "1) question?\nA) one\nB) two",
                         "parsed": None, "route": {}, "lane": "stub"}
             if kw["stage"] == "vision":
                 calls.append(kw)
                 if len(calls) == 1:
                     return {"text": "", "parsed": {"boxes": [
-                        {"key": "p1-b1", "bbox": [80, 60, 620, 940],
+                        {"key": "p1-o1", "bbox": [80, 60, 620, 940],
                          "figure": [300, 70, 600, 930]}]},
                         "route": {}, "lane": "stub"}
                 return {"text": "", "parsed": band_reply,
@@ -1806,7 +1872,7 @@ class StudioGeometryTests(_StudioStageCase):
         from unittest import mock
         from pipeline.studio import geometry
         jid, calls = self._one_figure_stub({"bands": [
-            {"key": "p1-b1", "figures": [[250, 250, 750, 750]]}]})
+            {"key": "p1-o1", "figures": [[250, 250, 750, 750]]}]})
         real_cut = geometry.bands.cut
         seen = {}
 
@@ -1818,11 +1884,11 @@ class StudioGeometryTests(_StudioStageCase):
         with mock.patch.object(geometry.bands, "cut", side_effect=cut):
             out = geometry.run(jid, {}, emit=lambda *a, **k: None)
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["labels"], ["BAND p1-b1:"])
+        self.assertEqual(calls[1]["labels"], ["BAND p1-o1:"])
         self.assertEqual(len(calls[1]["images"]), 1)
         self.assertTrue(all(isinstance(img, str) for img in calls[1]["images"]))
         expected = seen["band"].to_page([250, 250, 750, 750])
-        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-b1"]
+        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-o1"]
         self.assertEqual(entry["crop_bbox"], expected)
         self.assertEqual(entry["figure_bboxes"], [expected])
         self.assertIsNone(entry["crop_approved"])       # human gate
@@ -1835,7 +1901,9 @@ class StudioGeometryTests(_StudioStageCase):
 
         def stub(**kw):
             if kw["stage"] == "extract":
-                return {"text": "۱) پرسش؟\nالف) یک\nب) دو",
+                # the OCR prompt asks for the organized text: the splitter
+                # mints the page's block from it
+                return {"text": "1) question?\nA) one\nB) two",
                         "parsed": None, "route": {}, "lane": "stub"}
             if kw["stage"] == "vision":
                 raise RuntimeError("quota down")
@@ -1847,10 +1915,10 @@ class StudioGeometryTests(_StudioStageCase):
         jid = self._job(pdf)
         extract.run(jid, {}, emit=lambda *a, **k: None)
         enrich.run(jid, {}, emit=lambda *a, **k: None)
-        workspace.write_artifact(jid, "geometry", {"boxes": {"p1-b1": {
+        workspace.write_artifact(jid, "geometry", {"boxes": {"p1-o1": {
             "bbox": [11, 22, 333, 444], "source": "vision"}}})
         out = geometry.run(jid, {}, emit=lambda *a, **k: None)
-        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-b1"]
+        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-o1"]
         self.assertEqual(entry["bbox"], [11, 22, 333, 444])
         self.assertEqual(out["stats"]["kept_previous"], 1)
         self.assertIsNone(entry["crop_bbox"])
@@ -1859,16 +1927,24 @@ class StudioGeometryTests(_StudioStageCase):
         """Gemini's empty band is authoritative; do not keep DeepSeek's guess."""
         from pipeline.studio import geometry
         jid, calls = self._one_figure_stub({"bands": [
-            {"key": "p1-b1", "figures": []}]})
+            {"key": "p1-o1", "figures": []}]})
         out = geometry.run(jid, {}, emit=lambda *a, **k: None)
-        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-b1"]
+        entry = workspace.read_artifact(jid, "geometry")["boxes"]["p1-o1"]
         self.assertIsNone(entry["crop_bbox"])
         self.assertEqual(entry["figure_bboxes"], [])
         self.assertIsNone(entry["crop_approved"])
         self.assertEqual(out["stats"]["figure_missing"], 1)
         self.assertEqual(out["stats"]["crops"], 0)
 def _echo_stub(**kw):
-    """Enrich lane stub: echo every block back unchanged (offline)."""
+    """Lane stub: echo every block back unchanged (offline).
+
+    The extract lane answers with text — the OCR prompt asks for the page's
+    organized words, and the splitter mints the blocks — so an endpoint chain
+    that uploads a page with no TeX still gets a block to work with.
+    """
+    if kw.get("stage") == "extract":
+        return {"text": "1) HELLO WORLD\nA) one\nB) two",
+                "parsed": None, "route": {}, "lane": "stub"}
     payload = json.loads(kw["prompt"].split("\nblocks: ", 1)[1])
     return {"text": "", "parsed": {"blocks": [
         {"key": b["key"], "kind": b["kind"], "text": b["text"],
@@ -2188,6 +2264,111 @@ class StudioPersianTests(unittest.TestCase):
         self.assertEqual(block["options"][0],
                          "\u0646\u0645\u06cc\u200c\u06a9\u0646\u062f")
 
+    def test_an_extracted_block_stores_canonical_math_after_the_zwnj_pass(self):
+        from pipeline.studio import extract
+        # a bare formula AND a half-space word in the same stem: the repair
+        # runs first (a half-space inside a formula is not a word joiner), the
+        # fence second, and the result renders like the raw text did.
+        block = extract._block(
+            "p1-b1", "question", 1, 1,
+            text="\u0645\u06cc\u0634\u0648\u062f \\frac{6}{3}",
+            options=["\\(a+b\\)", "x^{2}"])
+        self.assertEqual(block["text"],
+                         "\u0645\u06cc\u200c\u0634\u0648\u062f $\\frac{6}{3}$")
+        self.assertEqual(block["options"], ["$a+b$", "$x^{2}$"])
+
+    def test_canonical_math_is_idempotent_on_a_stored_block(self):
+        from pipeline.studio import textnorm
+        for raw in ("x^{2} = 4", "already $a^2$", "$$\\frac{1}{2}$$",
+                    "\\[ \\frac{1}{2} \\]", "no math", "$$$$",
+                    "\\begin{tabular}{|c|c|} 1 & 2 \\end{tabular}"):
+            once = textnorm.canonical(raw)
+            self.assertEqual(textnorm.canonical(once), once, raw)
+
+    def test_delimiters_already_fenced_are_left_alone(self):
+        from pipeline.studio import textnorm
+        for raw in ("$a+b$", "$$x^2$$", "a $b_1$ c $$d_2$$ e",
+                    "\\$5 and \\$6"):
+            self.assertEqual(textnorm.canonical(raw), raw)
+
+    def test_an_unpaired_display_fence_never_stitches_onto_its_neighbour(self):
+        from pipeline.studio import textnorm
+        out = textnorm.canonical("stray $$6\\text{A}$ inside")
+        self.assertNotIn("$$$", out)
+        self.assertEqual(textnorm.canonical(out), out)
+
+    def test_a_bare_table_environment_becomes_display_math(self):
+        from pipeline.studio import textnorm
+        out = textnorm.canonical(
+            "\\begin{table}[] \\centering "
+            "\\begin{tabular}{|c|c|} 1 & 2 \\end{tabular} \\end{table}")
+        self.assertEqual(out,
+                         " $$\\begin{array}{|c|c|} 1 & 2 \\end{array}$$ ")
+
+class StudioMathLaneTests(unittest.TestCase):
+    """A text page whose formulas are vector art must not skip the model.
+
+    The text lane reads a page's characters; a page that DRAWS its formulas
+    exposes none of the TeX that says "maths here", so the lane imports the
+    prose with the maths silently missing. The page signal routes it instead.
+    """
+
+    def test_a_page_with_tex_characters_keeps_the_text_lane(self):
+        from pipeline.studio import extract
+        self.assertTrue(extract.page_has_text_math(r"\frac{6}{3} = 2"))
+        self.assertTrue(extract.page_has_text_math("x^{2} + 1"))
+        self.assertTrue(extract.page_has_text_math("a_{n} = 3"))
+
+    def test_a_page_of_bare_prose_and_drawn_formulas_goes_to_the_model(self):
+        from pipeline.studio import extract
+        # the real shape: Persian prose, numbers, a g.mol^-1 that lost its
+        # exponent, no backslash, no brace
+        page = ("\u062f\u0631\u0635\u062f \u062c\u0631\u0645\u06cc "
+                "\u06a9\u0631\u0628\u0646 (S = 32 \u0648 O = 16) "
+                "g.mol-1")
+        self.assertFalse(extract.page_has_text_math(page))
+
+    def test_an_empty_text_layer_is_not_maths(self):
+        from pipeline.studio import extract
+        self.assertFalse(extract.page_has_text_math(""))
+        self.assertFalse(extract.page_has_text_math(None))
+
+
+class StudioOcrReplyTests(unittest.TestCase):
+    """The vision lane asks for JSON and reads either shape back.
+
+    A JSON container is what kept the model's transcription verbatim on the
+    67-page booklet (free-form replies re-ordered option pieces on 20 pages).
+    A lane that answers with prose must still be read, not dropped.
+    """
+
+    def test_a_json_body_gives_its_text(self):
+        from pipeline.studio import extract
+        reply = {"parsed": {"text": "=== PAGE 1 ===\n1) کدام؟\n(1) الف"},
+                 "text": '{"text": "..."}'}
+        self.assertEqual(extract._reply_text(reply),
+                         "=== PAGE 1 ===\n1) کدام؟\n(1) الف")
+
+    def test_a_plain_prose_reply_is_still_read(self):
+        from pipeline.studio import extract
+        self.assertEqual(
+            extract._reply_text({"parsed": None, "text": "1) پرسش\nالف) یک"}),
+            "1) پرسش\nالف) یک")
+
+    def test_an_empty_or_odd_body_never_becomes_a_block(self):
+        from pipeline.studio import extract
+        for reply in ({}, {"parsed": {"text": ""}, "text": ""},
+                      {"parsed": {"text": 12}, "text": ""},
+                      {"parsed": ["x"], "text": ""}, None):
+            self.assertEqual(extract._reply_text(reply), "")
+
+    def test_the_prompt_forbids_moving_an_option_label(self):
+        from pipeline.studio import extract
+        self.assertIn("Never move a label to the other end",
+                      extract.OCR_JSON_PROMPT)
+        self.assertIn('{"text"', extract.OCR_JSON_PROMPT)
+
+
 class StudioFigureHintTests(unittest.TestCase):
     """Which text-lane blocks are sent to the model to look for a figure.
 
@@ -2306,9 +2487,13 @@ class StudioOrganizerTests(unittest.TestCase):
 
 
 def _two_question_pdf(path):
-    """One text page: Q1 with four options, Q2 with none (confidence 0.5)."""
+    """One text page: Q1 with four options, Q2 with none (confidence 0.5).
+
+    Q1 carries real TeX so the page reads as a text page (a text page with no
+    TeX character is routed to the vision lane, see ``StudioMathLaneTests``).
+    """
     content = (
-        "BT /F1 12 Tf 40 800 Td (1- first question?\\)) Tj ET\n"
+        "BT /F1 12 Tf 40 800 Td (1- first question, x^{2}?\\)) Tj ET\n"
         "BT /F1 12 Tf 40 770 Td (A\\) one) Tj ET\n"
         "BT /F1 12 Tf 40 750 Td (B\\) two) Tj ET\n"
         "BT /F1 12 Tf 40 730 Td (C\\) three) Tj ET\n"

@@ -650,7 +650,7 @@ class GeminiRouter:
     def call(self, cfg, prompt, data_b64, mime_type,
              temperature=0.1, max_tokens=16384, retries=None,
              on_problem=None, on_route=None, labels=None,
-             json_mode=False, thinking=None, source="pipeline"):
+             json_mode=False, thinking=None, source="pipeline", raw=False):
         """Run real work through the best key×model, rotating on failure.
 
         Returns (parsed_json, raw_text, route) where `route` is
@@ -708,7 +708,7 @@ class GeminiRouter:
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries, labels=labels, json_mode=json_mode,
-                        thinking=thinking,
+                        thinking=thinking, raw=raw,
                         on_problem=self._problem_cb(on_problem, label, model),
                         on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0
@@ -767,7 +767,8 @@ class GeminiRouter:
     def call_pinned(self, cfg, key, prompt, data_b64, mime_type,
                     temperature=0.1, max_tokens=16384, retries=None,
                     on_problem=None, on_route=None, labels=None,
-                    json_mode=False, thinking=None, source="pipeline"):
+                    json_mode=False, thinking=None, source="pipeline",
+                    raw=False):
         """Same contract as call(), but PINNED to one key: it walks only that
         key's own ladder (blocked models / spent day caps / sticky model all
         honoured) and never rotates to another key. Does NOT touch
@@ -807,7 +808,7 @@ class GeminiRouter:
                         key, model, prompt, data_b64, mime_type,
                         temperature=temperature, max_tokens=max_tokens,
                         retries=retries, labels=labels, json_mode=json_mode,
-                        thinking=thinking,
+                        thinking=thinking, raw=raw,
                         on_problem=self._problem_cb(on_problem, label, model),
                         on_attempt=self._attempt_cb(key, label, model))
                     elapsed_ms = (time.monotonic() - started) * 1000.0

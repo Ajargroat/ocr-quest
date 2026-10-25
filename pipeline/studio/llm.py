@@ -175,7 +175,8 @@ def call_stage(cfg, stage, prompt, data_b64=None, mime_type=None,
                                           temperature=temperature,
                                           max_tokens=max_tokens,
                                           labels=labels, json_mode=json_mode,
-                                          thinking=thinking, source="studio")
+                                          thinking=thinking, source="studio",
+                                          raw=raw)
     finally:
         gemini_mod._proxy_url["url"] = saved
     return {"text": text or "", "parsed": parsed, "route": route,

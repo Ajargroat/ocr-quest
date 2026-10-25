@@ -1,4 +1,4 @@
-"""Weekly snapshots of the five pipeline tables, stored inside the project.
+"""Weekly snapshots of the three pipeline tables, stored inside the project.
 
 Each run writes ``backups/<UTC-stamp>/<table>.json`` + ``<table>.sql`` plus a
 ``manifest.json`` for the Data Console tab, and rotates away all but the most
@@ -22,21 +22,13 @@ from psycopg2.extras import Json
 BACKUP_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backups")
 GRAVEYARD_FILE = os.path.join(BACKUP_ROOT, "row_graveyard.jsonl")
 
-# The tables the Data Console + the backup job own: all of the new model.
-# revision_summary is the one table without created_at, so it keeps its own
-# ordering key; a table whose created_at is missing is backed up unordered
-# (run_backup guards on that) and one the target DB does not have yet is
-# skipped instead of failing the run.
-TABLES = (
-    # lessons model (root PDF)
-    "courses", "chapters", "lessons", "lesson_blocks", "media_assets",
-    "questions", "question_options", "short_answer_keys",
-    "attempts", "lesson_progress",
-    # OCR side
-    "sources", "answers", "revision_reports", "revision_summary",
-)
+# The tables the Data Console + the backup job own: the flat pipeline core.
+# The revision engine is retired, so revision_reports/revision_summary are not
+# here (see pipeline/studio/retire_revision.sql). A table whose created_at is
+# missing is backed up unordered (run_backup guards on that) and one the
+# target DB does not have yet is skipped instead of failing the run.
+TABLES = ("sources", "questions", "answers")
 TS_COL = {t: "created_at" for t in TABLES}
-TS_COL["revision_summary"] = "last_at"
 
 SET_NAME_RE = re.compile(r"^\d{8}-\d{6}Z$")
 TABLE_RE = re.compile(r"^[a-z_]+$")

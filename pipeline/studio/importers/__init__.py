@@ -7,6 +7,7 @@ block key, and every write is an upsert.
 """
 import time
 
+from pipeline.studio import faults as studio_faults
 from pipeline.studio import merge, workspace
 from pipeline.studio.importers import file_export, supabase
 from pipeline.studio.importers.rows import TARGETS, build_rows, marks, targets
@@ -33,8 +34,17 @@ def run(cfg, job_id, target="supabase", dry_run=False, emit=None):
     if target == "file":
         report = file_export.run(job_id, view, dry_run=dry_run)
     else:
-        report = supabase.run(cfg, job_id, view, imports, dry_run=dry_run,
-                              emit=emit)
+        try:
+            report = supabase.run(cfg, job_id, view, imports, dry_run=dry_run,
+                                  emit=emit)
+        except Exception as exc:
+            # The log keeps the failure with its classified fault: a stage
+            # error that only echoed back as a red HTTP body vanished on reload.
+            if not dry_run:
+                workspace.log_event(
+                    job_id, "import", "error", "import failed: %s" % exc,
+                    fault=studio_faults.payload(studio_faults.classify(exc)))
+            raise
 
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     if not dry_run:

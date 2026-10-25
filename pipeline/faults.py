@@ -217,6 +217,19 @@ def _decide(blob, names):
             or "no such file" in blob:
         return kind("local_io")
 
+    # --- the connection worked, the write did not ------------------------------
+    # A rejected value, a constraint, a missing table or a lost connection
+    # mid-batch is a database fault, not an unnamed one: the importer's own
+    # batch errors are plain strings, so they are named here.
+    if "psycopg2" in names or any(
+            w in blob for w in ("invalid input syntax", "violates",
+                                "duplicate key value", "does not exist",
+                                "undefinedtable", "undefinedcolumn",
+                                "null value in column", "out of memory",
+                                "terminating connection",
+                                "server closed the connection")):
+        return kind("db_down")
+
     if supa:
         return kind("storage_fail", f"(HTTP {status})" if status else "")
     return kind("unknown", f"(HTTP {status})" if status else "")

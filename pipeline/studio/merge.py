@@ -19,7 +19,7 @@ KEEP_ISSUES = ("duplicate number in the answer key",
                "sorting call returned nothing")
 
 
-def _crop_state(entry, job_id, key):
+def _crop_state(entry, job_id, key, block_page=None):
     # An EXTERNAL crop is a finished picture the reviewer chose (Inspect's
     # local-first draft). It has no page box: the bytes in the crop cache are
     # the picture, and the importer uploads them as-is instead of re-cutting.
@@ -31,8 +31,11 @@ def _crop_state(entry, job_id, key):
         os.path.join(workspace.job_dir(job_id), rel))
     if external and cached and os.path.exists(cached):
         exists = True
+    # A planned crop names crop_page; a REVIEWED box in review.json names no
+    # page, so the block's own page is what the crop belongs to.
     state = {"key": key, "needed": needed, "approved": entry.get("crop_approved"),
-             "bbox": entry.get("crop_bbox"), "page": entry.get("crop_page"),
+             "bbox": entry.get("crop_bbox"),
+             "page": entry.get("crop_page") or block_page,
              "file": rel, "bytes": entry.get("crop_bytes"),
              "external": external, "exists": exists,
              "source": entry.get("crop_source"),
@@ -166,7 +169,7 @@ def merged(job_id):
         if entry.get("bbox"):
             block["bbox"] = entry["bbox"]
             block["bbox_source"] = entry.get("source") or block.get("bbox_source")
-        state = _crop_state(entry, job_id, key)
+        state = _crop_state(entry, job_id, key, block.get("page"))
         block["crop"] = state
         if _figure_marker(block):
             block["figure_marker"] = True
