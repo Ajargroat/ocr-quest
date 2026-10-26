@@ -1,6 +1,7 @@
 """Port of the 'Scan Folder' code node."""
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -38,6 +39,20 @@ class SourceItem:
     file_path: str
     file_size: int
     mime_type: str
+
+
+_DIGITS = re.compile(r"(\d+)")
+
+
+def _natural_key(entry):
+    """Sort directory entries with numbers compared as numbers.
+
+    A paper arrives one page per file, so its pages must be scanned in reading
+    order: a plain string sort puts ``-10`` before ``-2`` and ``-20`` after
+    ``-3``, which breaks every page number in the run. Splitting on digit
+    groups keeps "chapter 4 zedone-2.jpg" before "chapter 4 zedone-10.jpg"."""
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part)
+            for part in _DIGITS.split(entry.name) if part != ""]
 
 
 def _split_layout(rel_parts):
@@ -82,7 +97,7 @@ def scan(cfg: Config, warn: Callable[[str], None] | None = None) -> list[SourceI
 
     def walk(directory: str) -> None:
         try:
-            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+            entries = sorted(os.scandir(directory), key=_natural_key)
         except OSError:
             return
         entries = list(entries)

@@ -52,60 +52,6 @@ class MinAgeDefaultTests(unittest.TestCase):
             self.assertIn("MIN_AGE_SECONDS=30", fh.read())
 
 
-class StudioChunkDefaultsTests(unittest.TestCase):
-    """STUDIO_CHUNK_* — the request-window budget (Q1/Q10)."""
-
-    def test_chunk_keys_default_when_absent(self):
-        names = ("STUDIO_CHUNK_CHARS", "STUDIO_CHUNK_IMAGES")
-        saved = {n: os.environ.pop(n, None) for n in names}
-        try:
-            cfg = config.load_config()
-            self.assertEqual(cfg.studio_chunk_chars, 24000)
-            self.assertEqual(cfg.studio_chunk_images, 3)
-        finally:
-            for n, v in saved.items():
-                if v is not None:
-                    os.environ[n] = v
-
-    def test_chunk_keys_read_the_env(self):
-        os.environ["STUDIO_CHUNK_CHARS"] = "500"
-        os.environ["STUDIO_CHUNK_IMAGES"] = "2"
-        try:
-            cfg = config.load_config()
-            self.assertEqual(cfg.studio_chunk_chars, 500)
-            self.assertEqual(cfg.studio_chunk_images, 2)
-        finally:
-            os.environ.pop("STUDIO_CHUNK_CHARS", None)
-            os.environ.pop("STUDIO_CHUNK_IMAGES", None)
-
-
-class StudioStorageConfigTests(unittest.TestCase):
-    """Studio storage keys — source root + crop prefix (Q8/Q11)."""
-
-    def test_source_root_defaults_under_input_root(self):
-        names = ("STUDIO_SOURCE_ROOT", "INPUT_ROOT")
-        saved = {n: os.environ.pop(n, None) for n in names}
-        try:
-            cfg = config.load_config()
-            self.assertEqual(cfg.studio_source_root,
-                             os.path.join(cfg.input_root, "studio"))
-        finally:
-            for n, v in saved.items():
-                if v is not None:
-                    os.environ[n] = v
-
-    def test_crop_prefix_default_and_override(self):
-        saved = os.environ.pop("STUDIO_CROP_PREFIX", None)
-        try:
-            self.assertEqual(config.load_config().studio_crop_prefix, "crops")
-            os.environ["STUDIO_CROP_PREFIX"] = "/crops/"
-            self.assertEqual(config.load_config().studio_crop_prefix, "crops")
-        finally:
-            os.environ.pop("STUDIO_CROP_PREFIX", None)
-            if saved is not None:
-                os.environ["STUDIO_CROP_PREFIX"] = saved
-
-
 class LaneModelToggleTests(unittest.TestCase):
     """_lane_model — a provider's own models_enabled toggle steers the lane."""
 
@@ -134,17 +80,3 @@ class LaneModelToggleTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-
-class StudioOrganizeConfigTests(unittest.TestCase):
-    """STUDIO_ORGANIZE — on by default, opt-out via env."""
-
-    def test_default_is_on_and_can_be_disabled(self):
-        saved = os.environ.pop("STUDIO_ORGANIZE", None)
-        try:
-            self.assertEqual(config.load_config().studio_organize, 1)
-            os.environ["STUDIO_ORGANIZE"] = "0"
-            self.assertEqual(config.load_config().studio_organize, 0)
-        finally:
-            os.environ.pop("STUDIO_ORGANIZE", None)
-            if saved is not None:
-                os.environ["STUDIO_ORGANIZE"] = saved

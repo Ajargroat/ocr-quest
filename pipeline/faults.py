@@ -50,6 +50,8 @@ KINDS = {
                           "hint": "This key cannot use that model (404 not found, or 403 because the model is not enabled/rolled out for it). The router steps up to the next model in the ladder."},
     "geo_block":      {"label": "GEO BLOCK",       "emoji": "🌍", "group": "auth",  "retryable": False,
                        "hint": "Google refused this exit IP (region / account-country restriction). Switch the tunnel to a supported-country exit — a different key won't help."},
+    "edge_block":     {"label": "ROUTE BLOCKED",   "emoji": "🚧", "group": "net",   "retryable": True,
+                       "hint": "Google's front end refused the request before the API checked the key (its HTML 403 page, not the API's JSON). It is your exit IP / proxy port, not the key — the key was never consulted. Point the proxy profile at a working exit and rerun."},
     "overload":       {"label": "GOOGLE BUSY",     "emoji": "🌩", "group": "srv",   "retryable": True,
                        "hint": "Google answered 5xx / DEADLINE_EXCEEDED — high demand on their side. Retrying a little later usually works."},
     "model_empty":    {"label": "EMPTY REPLY",     "emoji": "👻", "group": "model", "retryable": True,
@@ -62,9 +64,49 @@ KINDS = {
                        "hint": "Supabase refused the upload — check SUPABASE_SERVICE_KEY, the bucket name, or the tunnel on the way there."},
     "local_io":       {"label": "LOCAL FILE",      "emoji": "💾", "group": "local", "retryable": False,
                        "hint": "Could not read or move the source file — check the disk path and whether another program holds the file open."},
+    "empty_text":     {"label": "EMPTY TEXT",      "emoji": "🕳", "group": "model", "retryable": True,
+                       "hint": "The OCR returned no text for this page — a blank render, a window outside the printed area, or a model that read nothing. Staged as empty, never archived silently."},
+    "empty_page":     {"label": "EMPTY PAGE",      "emoji": "🕳", "group": "model", "retryable": True,
+                       "hint": "The page produced no usable text — it may be blank, or the page window fell outside the printed area."},
+    "no_render":      {"label": "NO RENDER",       "emoji": "🖼", "group": "local", "retryable": True,
+                       "hint": "The page could not be rendered into an image — the crop and bbox stages need that page picture."},
+    "pdf_broken":     {"label": "BAD PDF",         "emoji": "📄", "group": "local", "retryable": False,
+                       "hint": "The PDF cannot be opened — it is corrupt, truncated or password-protected. Export it again and upload a new file."},
+    "bad_file":       {"label": "BAD FILE",        "emoji": "📄", "group": "local", "retryable": False,
+                       "hint": "The file type is not supported — supply a PDF or an image."},
+    "no_source":      {"label": "NO SOURCE",       "emoji": "📂", "group": "local", "retryable": False,
+                       "hint": "This record names a source file that is not on disk — the staged page image or original was moved or deleted."},
+    "not_ready":      {"label": "NOT READY",       "emoji": "⏸", "group": "local", "retryable": False,
+                       "hint": "A row in this batch is still staged or edited — a batch imports only when every question is ready/skipped and every answer is matched."},
+    "bad_bbox":       {"label": "BAD BBOX",        "emoji": "📐", "group": "local", "retryable": False,
+                       "hint": "The bounding box is empty, reversed or outside the page — drag a real box over the picture before marking the row ready."},
+    "vocab_invalid":  {"label": "VOCAB",           "emoji": "🏷", "group": "local", "retryable": False,
+                       "hint": "A tag is not in the approved vocabulary — accept it as an alias (human decision) or pick the canonical tag."},
     "unknown":        {"label": "UNKNOWN FAULT",   "emoji": "❔", "group": "misc",  "retryable": True,
                        "hint": "No known signature matched — inspect the raw error attached to this event."},
 }
+
+# Signatures of Google's front-end (edge) refusal page. It answers with f1
+# latency, a robot.png 403 template or "Error 403 (Forbidden)!!1" — the API's
+# JSON errors never carry these, so their presence means no key was consulted.
+_EDGE_SIGNS = ("forbidden)!!1", "errors/robot.png", "does not have permission to get url",
+               "gstatic.com/external_content")
+
+# Signatures for the staging/import kinds, checked before the network ladder so
+# a local refusal is never reported as a tunnel problem.
+_STAGING_SIGNS = (
+    ("no_source", ("no source file", "has no source", "source file is missing",
+                   "missing source")),
+    ("not_ready", ("not ready", "is not ready", "batch not ready")),
+    ("bad_bbox", ("bad bbox", "invalid bbox", "bbox is empty", "degenerate box")),
+    ("vocab_invalid", ("not in the vocabulary", "unknown tag", "vocabulary")),
+    ("pdf_broken", ("pdfium", "password", "encrypted", "invalid pdf", "corrupt",
+                    "failed to open the pdf", "cannot open the pdf")),
+    ("bad_file", ("unsupported file type",)),
+    ("no_render", ("no page render", "no page image")),
+    ("empty_page", ("no text content", "produced no text", "empty text",
+                    "no text on page")),
+)
 
 _STATUS_RE = re.compile(r"http (\d{3})")
 
@@ -129,6 +171,12 @@ def _decide(blob, names):
             flt["retryable"] = retryable
         return flt
 
+    # --- staging/import refusals: a local cause must not read as network ----
+    if not gemini and not supa and not _STATUS_RE.search(blob):
+        for staging_kind, words in _STAGING_SIGNS:
+            if any(word in blob for word in words):
+                return kind(staging_kind)
+
     # --- our own model-side failure strings --------------------------------
     if "no text content" in blob:
         return kind("model_empty")
@@ -160,10 +208,18 @@ def _decide(blob, names):
                                "not available in your region", "region not supported",
                                "service is only available in")):
         return kind("geo_block")
+    # Google's EDGE refused the request before the API saw it. The answer is
+    # Google's own front-end page, not the API's {"error": …}: the request never
+    # reached the key check, so the exit IP / route is the fault and the key is
+    # unknown — naming it bad_key parks working keys for 15 min and hides the
+    # real cause (a tunnel whose exit node Google blocks).
+    if any(w in blob for w in _EDGE_SIGNS):
+        return kind("edge_block")
 
     # --- authentication -------------------------------------------------------
     if status in (401, 403) or "api_key_invalid" in blob or "api key not valid" in blob \
             or "unauthenticated" in blob:
+        # An API-JSON refusal names the key; an HTML page was the edge (above).
         if supa:
             return kind("storage_fail", "Supabase refused the key/bucket.", retryable=False)
         if status == 403 and gemini and ("permission_denied" in blob or "permission denied" in blob):

@@ -1,4 +1,4 @@
-﻿"""Offline tests for P5/P6/P7 behaviour: Pacific-midnight usage reset,
+"""Offline tests for P5/P6/P7 behaviour: Pacific-midnight usage reset,
 quota-exhausted skip-till-reset, per-call JSON history + period filter,
 exponential backoff, and DB period counts.
 
@@ -190,7 +190,7 @@ class PerCallHistoryTests(unittest.TestCase):
 
 
     def test_studio_rows_are_kept_even_through_the_9router_lane(self):
-        """The studio's default lane IS 9router, so its rows are studio usage,
+        """A call made through 9router is still that surface's usage,
         not routing noise — the Usage tab must show them (bug: they vanished)."""
         r = GeminiRouter()
         with open(self._calls_file(), "w", encoding="utf-8") as fh:

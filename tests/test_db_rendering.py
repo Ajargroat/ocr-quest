@@ -55,7 +55,7 @@ class MediaRouteTests(unittest.TestCase):
                                    supabase_key="service-key")
         self.calls = []
 
-        def fake_get(url, headers=None, timeout=None):
+        def fake_get(url, headers=None, timeout=None, proxies=None):
             self.calls.append(url)
             return _Resp()
 

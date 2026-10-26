@@ -1,4 +1,4 @@
-"""Schema-contract tests for the flat pipeline core (pipeline/studio/consolidate).
+"""Schema-contract tests for the flat core (docs/migrations/consolidate.sql).
 
 The app's database is the flat pipeline model: ``sources`` / ``questions`` /
 ``answers`` / ``revision_reports`` / ``revision_summary``. The lessons model
@@ -16,11 +16,13 @@ Run them either way:
 import json
 import os
 import re
+import sys
 import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SQL_PATH = os.path.join(ROOT, "pipeline", "studio", "consolidate.sql")
+sys.path.insert(0, ROOT)
+SQL_PATH = os.path.join(ROOT, "docs", "migrations", "consolidate.sql")
 
 CORE = ("sources", "questions", "answers")
 RETIRED = ("courses", "chapters", "lessons", "lesson_blocks", "media_assets",
@@ -121,7 +123,7 @@ class SchemaShapeTests(unittest.TestCase):
 class RetireRevisionTests(unittest.TestCase):
     """retire_revision.sql is the focused, idempotent revision-table drop."""
 
-    RETIRE_PATH = os.path.join(ROOT, "pipeline", "studio", "retire_revision.sql")
+    RETIRE_PATH = os.path.join(ROOT, "docs", "migrations", "retire_revision.sql")
 
     def setUp(self):
         self.sql = read_sql(self.RETIRE_PATH)
@@ -142,7 +144,7 @@ class RetireRevisionTests(unittest.TestCase):
             self.assertNotEqual(fh.read(3), b"\xef\xbb\xbf")
 
     def test_the_runner_owns_the_transaction(self):
-        with open(os.path.join(ROOT, "pipeline", "studio", "consolidate.py"),
+        with open(os.path.join(ROOT, "pipeline", "migrations", "consolidate.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
         body = src[src.index("def retire_revision"):src.index("def verify")]
@@ -153,7 +155,7 @@ class SafetyTests(unittest.TestCase):
     """The runner refuses to drop without a complete backup and clean checks."""
 
     def setUp(self):
-        from pipeline.studio import consolidate
+        from pipeline.migrations import consolidate
         self.mod = consolidate
 
     def _set(self, root, name, tables, sources_files=0):
@@ -219,7 +221,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_it_never_commits_inside_the_sql_step(self):
         """run_sql/retire_revision must not commit; main() owns the commit."""
-        with open(os.path.join(ROOT, "pipeline", "studio", "consolidate.py"),
+        with open(os.path.join(ROOT, "pipeline", "migrations", "consolidate.py"),
                   encoding="utf-8") as fh:
             src = fh.read()
         for start in ("def run_sql", "def retire_revision"):

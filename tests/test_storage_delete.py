@@ -51,5 +51,64 @@ class DeleteFileTests(unittest.TestCase):
                 storage.delete_file(self._cfg(), "x.jpg")
 
 
+class ProxiesForTests(unittest.TestCase):
+    """Bucket traffic must ride the active proxy profile.
+
+    The storage host is exit-blocked on this network, so a direct connection
+    never completes a TLS handshake and every crop renders as a broken image.
+    """
+
+    def _cfg(self, active, profiles):
+        return SimpleNamespace(supabase_url="http://sb", supabase_key="k",
+                               supabase_bucket="b", proxy_active=active,
+                               proxy_profiles=profiles)
+
+    PROFILES = (
+        {"name": "Direct", "host": "127.0.0.1", "port": "1",
+         "scheme": "http", "enabled": True},
+        {"name": "V2ray/pattM", "host": "127.0.0.1", "port": "10808",
+         "scheme": "http", "enabled": True},
+    )
+
+    def test_active_profile_becomes_both_proxies(self):
+        px = storage.proxies_for(self._cfg("V2ray/pattM", self.PROFILES))
+        self.assertEqual(px, {"http": "http://127.0.0.1:10808",
+                              "https": "http://127.0.0.1:10808"})
+
+    def test_direct_means_no_proxy(self):
+        self.assertIsNone(storage.proxies_for(self._cfg("", self.PROFILES)))
+
+    def test_unknown_or_missing_profile_falls_back_to_direct(self):
+        self.assertIsNone(storage.proxies_for(self._cfg("gone", self.PROFILES)))
+        self.assertIsNone(storage.proxies_for(
+            SimpleNamespace(supabase_url="http://sb", proxy_active="x")))
+
+    def test_credentials_are_url_quoted(self):
+        profiles = ({"name": "p", "host": "10.0.0.1", "port": "8080",
+                     "scheme": "http", "user": "a b", "password": "p@ss"},)
+        px = storage.proxies_for(self._cfg("p", profiles))
+        self.assertEqual(px["https"], "http://a%20b:p%40ss@10.0.0.1:8080")
+
+    def _patch(self, response):
+        return mock.patch.object(storage.requests, "delete",
+                                 return_value=response)
+
+    def test_delete_rides_the_active_lane(self):
+        cfg = self._cfg("V2ray/pattM", self.PROFILES)
+        with self._patch(_Resp(200)) as delete:
+            storage.delete_file(cfg, "x.jpg")
+        self.assertEqual(delete.call_args[1]["proxies"]["https"],
+                         "http://127.0.0.1:10808")
+
+    def test_list_rides_the_active_lane(self):
+        cfg = self._cfg("V2ray/pattM", self.PROFILES)
+        with mock.patch.object(storage.requests, "post",
+                               return_value=_Resp(200)) as post:
+            post.return_value.json = lambda: []
+            storage.list_objects(cfg, "crops/", 5, 0)
+        self.assertEqual(post.call_args[1]["proxies"]["https"],
+                         "http://127.0.0.1:10808")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,7 +70,7 @@ def parse_grade(value):
 def norm_scalar(v):
     """Normalized comparable form: numbers collapse 12/12.0/'۱۲' -> '12'.
 
-    Lives here rather than in a feature module because both the Studio's
+    Lives here rather than in a feature module because both the OCR lane's
     question-number matching and the answer-pairing code compare the same way.
     """
     if v is None:

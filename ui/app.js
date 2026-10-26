@@ -237,10 +237,16 @@ $('logClearBtn').onclick = () => {
    Derived entirely from the event stream the runner already emits:
    file statuses walk Scan → Upload → OCR → Save → Archive, stats
    carry totals, and run_started/finished bracket the whole ride. */
+/*                                                                               STAGE RAIL      the serial run's live readout                                                                              
+   Four stages, one per thing a run actually does since staging replaced the
+   live write: scan the tree, OCR the page, write the rows to the local
+   staging store, move the source to done/. The runner emits statuses
+   queued -> ocr -> saving -> done / failed / empty, so the mapping below is
+   the whole truth          "upload" and "save to Postgres" no longer happen here. */
 const RAIL = {
-  names: ['Scan','Upload','Gemini OCR','Save','Archive'],
-  statuses: ['queued','uploading','ocr','saving'],          // stage 0..3
-  stageOf: {queued:0, uploading:1, ocr:2, saving:3},
+  names: ['Scan','Gemini OCR','Stage','Archive'],
+  statuses: ['queued','ocr','saving'],              // stage 0..2
+  stageOf: {queued:0, ocr:1, saving:2, done:3},
   counts: null, last: null, cur: null, by_id: {},
   running: false, total: 0, processed: 0, errors: 0,
   wait: null,                            // {until,total,attempt,tries,where} · Q8
@@ -285,7 +291,7 @@ function stageFeed(ev){
         status: ev.status,
       };
       if (ev.status === 'failed') railFlash(RAIL.stageOf[prev] !== undefined ? RAIL.stageOf[prev] : 1, 'err', 1400);
-      if (ev.status === 'done') railFlash(4, 'passed', 900);
+      if (ev.status === 'done') railFlash(RAIL.names.length - 1, 'passed', 900);
       break;
     }
     case 'snapshot': {
@@ -312,21 +318,25 @@ function stageFeed(ev){
 function renderRail(){
   const doneN = RAIL.processed + RAIL.errors;
   const complete = !RAIL.running && RAIL.total > 0 && doneN >= RAIL.total;
-  // most advanced file currently parked in a working stage (the runner is sequential → usually one)
+  const last = RAIL.names.length - 1;                    // the Archive stage
+  // most advanced file currently parked in a working stage (the runner is sequential          usually one)
   let active = -1;
-  [1, 2, 3].forEach(i => { if (RAIL.counts[RAIL.statuses[i]] > 0) active = Math.max(active, i); });
+  RAIL.statuses.forEach((status, i) => {
+    if ((RAIL.counts[status] || 0) > 0) active = Math.max(active, i);
+  });
   if (active < 0){
     if (RAIL.running && RAIL.total === 0) active = 0;                                    // preflight + scan
-    else if (RAIL.running && RAIL.cur && RAIL.cur.status === 'done' && doneN < RAIL.total) active = 4; // archive gap between files
+    else if (RAIL.running && RAIL.cur && RAIL.cur.status === 'done' && doneN < RAIL.total) active = last; // archive gap between files
     else if (RAIL.running && RAIL.counts.queued > 0) active = 0;                          // everything still queued
   }
-  if (complete) active = 4;
+  if (complete) active = last;
 
   railStages.forEach((el, i) => {
     el.classList.toggle('active', i === active && !complete);
     el.classList.toggle('warm', complete ? true : (i === 0 ? RAIL.total > 0 && active !== 0 : active > i));
     const bubble = el.querySelector('.bubble');
-    const n = i < 4 ? RAIL.counts[RAIL.statuses[i]] : RAIL.processed;
+    // the archive stage has no live counter of its own          it counts finished files
+    const n = i < RAIL.statuses.length ? RAIL.counts[RAIL.statuses[i]] : RAIL.processed;
     bubble.textContent = n;
     el.classList.toggle('counting', n > 0);
   });
@@ -416,8 +426,13 @@ function handle(ev){
       LANES.states = {}; LANES.round = 0; lanesRender(); laneNowPaint(); break;
     case 'wait': waitCountdown(ev); break;
     case 'upload': upApplyEvent(ev); break;
-    case 'studio': studioFeed(ev); break;
     case 'usage': credUsageLive(ev); break;
+    /* a file just landed in the staging store: Inspect re-reads itself the
+       moment the row exists, the same way the usage tab follows its calls */
+    case 'staged':
+      if (window.InspectState) window.InspectState.dirty = true;
+      if (window.inspLiveDebounce) window.inspLiveDebounce();
+      break;
   }
 }
 
@@ -476,19 +491,20 @@ function laneRows(){
   return (CredState.rows || []).map((r, i) => ({r, i}))
     .filter(({r}) => r.keep !== null && r.keep !== undefined && !r.removed);
 }
-/* the one-by-one rail's five steps, shrunk to one icon per lane — the lane's
+/* the one-by-one rail's four steps, shrunk to one icon per lane          the lane's
    .hub icon IS the current stage (item 1.3), not a text chip. */
 const LANE_STEPS = [
-  ['scan', 'magnifying-glass'], ['upload', 'cloud-arrow-up'],
-  ['ocr', 'eye'], ['save', 'database'], ['archive', 'box-archive'],
+  ['scan', 'magnifying-glass'], ['ocr', 'eye'],
+  ['stage', 'layer-group'], ['archive', 'box-archive'],
 ];
 const LANE_HUB_ICON = LANE_STEPS.map(([_k, icon]) => icon);
-/* map the server's phase/state onto a stage index; -1 = nothing running */
+/* map the server's phase/state onto a stage index; -1 = nothing running.
+   Since staging replaced the live write the phases are ocr -> staging ->
+   archive: there is no upload step and no Postgres save step in a run. */
 function laneStepIndex(state, s){
-  if (s.phase === 'imported') return 4;
-  if (state === 'done' || s.phase === 'importing') return 3;
-  if (s.phase === 'uploading' || state === 'start') return 1;
-  if (state === 'route' || state === 'wait' || s.phase === 'ocr') return 2;
+  if (s.phase === 'staged' || state === 'done') return 3;
+  if (s.phase === 'staging') return 2;
+  if (state === 'route' || state === 'wait' || s.phase === 'ocr') return 1;
   return -1;
 }
 /* the hub glyph: key when idle/off, else the current stage's icon. A live run
@@ -638,13 +654,12 @@ function showView(target){
     t.classList.toggle('active', t.dataset.view === target));
   $('viewPipeline').classList.toggle('active', target === 'pipeline');
   $('viewReview').classList.toggle('active', target === 'review');
-  $('viewStudio').classList.toggle('active', target === 'studio');
+  $('viewInspect').classList.toggle('active', target === 'inspect');
   $('viewDatabase').classList.toggle('active', target === 'database');
   $('viewUsage').classList.toggle('active', target === 'usage');
-  $('viewPrompts').classList.toggle('active', target === 'prompts');
   $('viewCredentials').classList.toggle('active', target === 'credentials');
   /* the usage tab is LIVE data: every visit re-reads the call history, so a
-     studio run (or a pipeline run) that happened while another tab was open
+     run that happened while another tab was open
      is there when you look — a load-once tab showed stale numbers. */
   if (target === 'usage'){
     const first = !UsageState.loaded;
@@ -653,22 +668,21 @@ function showView(target){
     if (first) viewLoading('viewUsage', true);
     usageRefresh(first ? () => viewLoading('viewUsage', false) : null);
   }
-  if (target === 'prompts' && !PromptState.loaded){
-    viewLoading('viewPrompts', true);
-    promptsLoad().finally(() => viewLoading('viewPrompts', false));
-  }
   if (target === 'review' && !RState.loaded){
     RState.loaded = true;
     viewLoading('viewReview', true);
     loadReviewMeta().then(loadReviewRows).finally(() => viewLoading('viewReview', false));
   }
-  if (target === 'studio' && !StudioState.loaded){
-    StudioState.loaded = true;
-    viewLoading('viewStudio', true);
-    studioInit().then(() => {
-      const p = panelFromHash();
-      if (p) studioPanel(p, true);
-    }).finally(() => viewLoading('viewStudio', false));
+  /* Inspect is LIVE data too - the store is written by the running OCR run,
+     so a tab opened before the run must not show the pre-run rows forever.
+     First visit loads (with the spinner); later visits re-read silently. */
+  if (target === 'inspect'){
+    const first = !InspectState.loaded;
+    InspectState.loaded = true;
+    if (first) viewLoading('viewInspect', true);
+    inspectRefresh(!first).finally(() => {
+      if (first) viewLoading('viewInspect', false);
+    });
   }
   if (target === 'database' && !DbState.loaded){
     DbState.loaded = true;
@@ -690,20 +704,21 @@ document.querySelectorAll('#side .side-btn[data-view]').forEach(tab => {
   tab.onclick = () => showView(tab.dataset.view);
 });
 
-/* Deep links (#studio, #database, …) open that view on load and on hash change,
+/* Deep links (#inspect, #database, ...) open that view on load and on hash change,
    so a view can be shared/bookmarked and a headless screenshot can target one. */
 function viewFromHash(){
   const h = (location.hash || '').replace('#', '').split('/')[0];
-  return ['pipeline','review','studio','database','usage','prompts','credentials'].includes(h) ? h : null;
+  return ['pipeline','review','inspect','database','usage','credentials'].includes(h) ? h : null;
 }
-function panelFromHash(){
+/* #inspect/<stage> opens the Inspect view on that stage (sources|review|import). */
+function inspectStageFromHash(){
   const parts = (location.hash || '').replace('#', '').split('/');
-  return parts[0] === 'studio' && parts[1] ? parts[1] : null;
+  return parts[0] === 'inspect' && parts[1] ? parts[1] : null;
 }
 window.addEventListener('hashchange', () => {
   const v = viewFromHash(); if (v) showView(v);
-  if (v === 'studio' && window.StudioState && StudioState.loaded){
-    const p = panelFromHash(); if (p) studioPanel(p, true);
+  if (v === 'inspect' && window.inspectStage){
+    const stage = inspectStageFromHash(); if (stage) inspectStage(stage, true);
   }
 });
 
@@ -1637,81 +1652,9 @@ createDropdown('rvChapter', 'فصل', true);
 createDropdown('rvCorp', 'نشر', true);
 createDropdown('rvDifficulty', 'سطح', true);
 initFilterUI();
+/* the network-mesh canvas is retired (DESIGN.md: sparse, text-dominant imagery) */
 
-/* ════════════ network-mesh background ════════════ */
-(function meshBackground(){
-  const cvs = document.getElementById('meshBg');
-  if (!cvs) return;
-  const ctx = cvs.getContext('2d');
-  const DPR = Math.min(window.devicePixelRatio || 1, 2);
-  let W = 0, H = 0, nodes = [];
-  const LINK = 148;        // max distance for a connecting line ("enough space")
-  const SPEED = 0.22;      // gentle drift
-  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
-
-  function build(){
-    W = cvs.clientWidth; H = cvs.clientHeight;
-    cvs.width = Math.floor(W * DPR); cvs.height = Math.floor(H * DPR);
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-    const density = Math.round((W * H) / 26000);
-    const count = Math.max(38, Math.min(120, density));
-    nodes = Array.from({ length: count }, () => ({
-      x: Math.random() * W,
-      y: Math.random() * H,
-      vx: (Math.random() - 0.5) * SPEED,
-      vy: (Math.random() - 0.5) * SPEED
-    }));
-  }
-
-  function step(){
-    ctx.clearRect(0, 0, W, H);
-    for (const n of nodes){
-      if (!reduce){
-        n.x += n.vx; n.y += n.vy;
-        if (n.x < 0 || n.x > W) n.vx *= -1;
-        if (n.y < 0 || n.y > H) n.vy *= -1;
-      }
-    }
-    /* links */
-    for (let i = 0; i < nodes.length; i++){
-      for (let j = i + 1; j < nodes.length; j++){
-        const a = nodes[i], b = nodes[j];
-        const dx = a.x - b.x, dy = a.y - b.y;
-        const d2 = dx*dx + dy*dy;
-        if (d2 < LINK*LINK){
-          const d = Math.sqrt(d2);
-          const alpha = (1 - d / LINK) * 0.18;
-          const dark = document.documentElement.dataset.theme !== 'light';
-          ctx.strokeStyle = 'rgba(' + (dark ? '255,255,255' : '16,24,48') + ',' + alpha.toFixed(3) + ')';
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.moveTo(a.x, a.y);
-          ctx.lineTo(b.x, b.y);
-          ctx.stroke();
-        }
-      }
-    }
-    /* nodes */
-    const dark = document.documentElement.dataset.theme !== 'light';
-    ctx.fillStyle = 'rgba(' + (dark ? '255,255,255' : '16,24,48') + ',.5)';
-    for (const n of nodes){
-      ctx.beginPath();
-      ctx.arc(n.x, n.y, 1.3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    if (!reduce) requestAnimationFrame(step);
-  }
-
-  build();
-  step();
-  let rt = null;
-  window.addEventListener('resize', () => {
-    clearTimeout(rt);
-    rt = setTimeout(() => { build(); if (reduce) step(); }, 180);
-  });
-})();
-
-/* ═══════════ CREDENTIALS · Gemini key pool & routing ═══════════ */
+/*                                                                               CREDENTIALS      Gemini key pool & routing                                                                               */
 const CRED_KEEP = '__KEEP__';
 const CRED_CLEAR = '__CLEAR__';
 const CredState = { loaded:false, rows:[], ladder:[], modelEnabled:null, events:[], supaKeySet:false,
@@ -1903,7 +1846,7 @@ function credRenderDbConns(){
 /* ── per-model ON/OFF (round .sw, same theme as every switch here) ──
    Gemini: CredState.modelEnabled drives GEMINI_MODELS_ENABLED; null = all rungs on.
    9router: each provider's models_enabled array (null = all on), saved with the
-   provider via extraction_providers — the pipeline lane and studio both honour it. */
+   provider via extraction_providers - the OCR run honours it. */
 function modelToggleRow(m, on, section){
   const row = document.createElement('div');
   row.className = 'cred-key cred-model' + (on ? '' : ' s-removed');
@@ -3668,7 +3611,7 @@ function credUsageLive(ev){
   if (!ev || !ev.model) return;
   ACTIVE_MODEL.gemini = ev.model;
   ACTIVE_MODEL.router = ev.model;
-  /* a studio/pipeline call landed — the tab re-reads the history on its next
+  /* a pipeline call landed - the tab re-reads the history on its next
      visit, so a run made while another tab was open is never invisible */
   UsageState.dirty = true;
   if (!$('viewUsage').classList.contains('active')) return;
@@ -3678,9 +3621,6 @@ function credUsageLive(ev){
 /* ── 3 · usage tab: a plot + per-call table (criterion 6) ── */
 const UsageState = { period: '24h', group: 'model', ymode: 'calls',
                      data: null, busy: false, loaded: false };
-/* Prompts view state — declared here (before the deep-link boot) so
-   showView('prompts') can read it on a #prompts URL. */
-const PromptState = { loaded: false, rows: [], busy: false };
 
 async function usageRefresh(after){
   if (UsageState.busy) return;
@@ -3733,7 +3673,7 @@ function usageRender(data){
       <td class="num">${fmtSecs(r.ms)}</td>
     </tr>`).join('')
     : '<tr><td colspan="7" class="hint">No calls recorded in this period.</td></tr>';
-  /* per-surface tally (pipeline vs studio) — the answer to "did the studio
+  /* per-surface tally (pipeline vs importer) - the answer to "did the OCR
      run show up in the usage data?" without reading the table row by row */
   const splitBox = $('usageSplit');
   const bySource = (d.totals && d.totals.by_source) || {};
@@ -4050,10 +3990,10 @@ function bootNewSurfaces(){
 }
 bootNewSurfaces();
 
-/* Honour a #view deep link after every script (incl. studio.js) has loaded —
+/* Honour a #view deep link after every script (incl. inspect.js) has loaded -
    so a headless screenshot or a shared URL lands on the right tab. Deferred
-   to DOMContentLoaded because showView('studio') needs StudioState, which is
-   defined by studio.js loaded after this file. */
+   to DOMContentLoaded because showView('inspect') needs InspectState, which
+   is defined by inspect.js loaded after this file. */
 function bootDeepLink(){ const v = viewFromHash(); if (v) showView(v); }
 if (document.readyState === 'loading')
   document.addEventListener('DOMContentLoaded', bootDeepLink);
@@ -4094,103 +4034,7 @@ loadCredentials = async function(){
   if (ca) ca.onclick = () => add('revision');
 })();
 
-/* ── Prompts view: every LLM instruction, editable ──
-   The backend keeps a default per prompt id (pipeline/prompts.py) and an
-   override store beside .gemini-usage.json; an override applies to the very
-   next model call. LOCAL first: nothing here touches the DB. */
-
-async function promptsLoad(){
-  try{
-    const d = await (await fetch('/api/prompts')).json();
-    PromptState.rows = (d && d.prompts) || [];
-    PromptState.loaded = true;
-  }catch(e){ PromptState.rows = []; }
-  promptsRender();
-}
-
-function promptsRender(){
-  const box = $('promptList');
-  if (!box) return;
-  const rows = PromptState.rows || [];
-  const count = $('prCount');
-  if (count) count.textContent = rows.filter(r => r.overridden).length + ' / ' + rows.length + ' edited';
-  if (!rows.length){
-    box.innerHTML = '<div class="db-empty db-err">Prompts unreachable — is the server running?</div>';
-    return;
-  }
-  let group = '';
-  box.innerHTML = rows.map(r => {
-    let head = '';
-    if (r.group !== group){
-      group = r.group;
-      head = '<h3 class="prompt-group">' + credEsc(group) + '</h3>';
-    }
-    return head + '<article class="prompt-card" data-id="' + credEsc(r.id) + '">'
-      + '<header class="prompt-head">'
-      +   '<b>' + credEsc(r.label) + '</b>'
-      +   '<span class="status-chip ' + (r.overridden ? 'sc-pending' : 'sc-approved') + '">'
-      +     (r.overridden ? 'edited' : 'default') + '</span>'
-      +   '<span class="st-gap"></span>'
-      +   '<button class="ghost-btn neutral sm" data-prompt-save type="button">Save</button>'
-      +   '<button class="ghost-btn neutral sm" data-prompt-reset type="button">Reset</button>'
-      + '</header>'
-      + '<textarea class="prompt-text" rows="12" spellcheck="false" dir="ltr">'
-      +   credEsc(r.text) + '</textarea>'
-      + '</article>';
-  }).join('');
-  box.querySelectorAll('.prompt-card').forEach(card => {
-    const id = card.dataset.id;
-    const area = card.querySelector('.prompt-text');
-    const save = card.querySelector('[data-prompt-save]');
-    const reset = card.querySelector('[data-prompt-reset]');
-    if (save) save.onclick = () => promptSave(id, area.value);
-    if (reset) reset.onclick = () => promptReset(id);
-  });
-}
-
-async function promptSave(id, text){
-  try{
-    const res = await fetch('/api/prompts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id, text: text }) });
-    const d = await res.json();
-    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
-    PromptState.rows = d.prompts || PromptState.rows;
-    promptsRender();
-    toast('Prompt saved');
-  }catch(e){ toast('Prompt save failed — ' + e.message); }
-}
-
-async function promptReset(id){
-  try{
-    const res = await fetch('/api/prompts/reset', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: id }) });
-    const d = await res.json();
-    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
-    PromptState.rows = d.prompts || PromptState.rows;
-    promptsRender();
-    toast('Prompt reset to default');
-  }catch(e){ toast('Reset failed — ' + e.message); }
-}
-
-async function promptsResetAll(){
-  try{
-    const res = await fetch('/api/prompts/reset', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}) });
-    const d = await res.json();
-    if (!res.ok || d.ok === false) throw new Error(d.error || ('HTTP ' + res.status));
-    PromptState.rows = d.prompts || PromptState.rows;
-    promptsRender();
-    toast('Every prompt is back to its default');
-  }catch(e){ toast('Reset failed — ' + e.message); }
-}
-
-$('prReload').onclick = () => promptsLoad();
-$('prResetAll').onclick = () => promptsResetAll();
-
-/* ═══════════ ASSISTANT · the floating help chat ═══════════
+/*                                                                               ASSISTANT      the floating help chat                                                                              
    One bubble bottom-right opens a small chat panel. The endpoint/key/model are
    the assistant's OWN (.env ASSISTANT_*), never the OCR lanes. Replies stream
    in over /api/assistant/chat as our own SSE: "thinking" and "text" events,
@@ -4311,7 +4155,7 @@ function asstMermaid(scope){
   s.onload = () => {
     try{
       window.mermaid.initialize({ startOnLoad: false,
-        theme: document.documentElement.dataset.theme === 'light' ? 'default' : 'dark' });
+        theme: document.documentElement.dataset.theme === 'dark' ? 'dark' : 'default' });
     }catch(e){ /* older mermaid: render still works */ }
     if (AsstState.pendingMermaid) AsstState.pendingMermaid();
   };

@@ -34,11 +34,25 @@ throughput.
 - `pipeline/db.py`: database boundary for the flat `sources`,
   `questions`, `answers` core.
 - `pipeline/deferrals.py`: durable deferred writes.
-- `pipeline/recrop.py`, `pipeline/uploads.py`: legacy crop/source handling.
-- `pipeline/studio/`, `ui/studio.js`, and `/api/studio/*`: independent
-  seven-stage Studio pipeline, job workspace, inspect/crop and commit/import
-  workflow. It is currently part of the branch baseline; do not remove it
-  without the staged-import plan's explicit port-and-test sequence.
+- `pipeline/recrop.py`, `pipeline/uploads.py`: crop re-cut and the upload queue.
+- `pipeline/staging.py`: the local SQLite staging store (`staging/staging.db`)
+  - sources, questions, answers, batches, page images and crops. Every OCR run
+  writes here and nowhere else.
+- `pipeline/stage.py`: turns one rendered file's OCR text into staged rows
+  (identity, bbox, deterministic crop keys, math/ZWNJ repair).
+- `pipeline/matching.py`: the answer-to-question ladder and its canonical
+  institute/year comparison.
+- `pipeline/importer.py`: the ONLY module that writes live rows and bucket
+  objects - crop first, then the row as `approved`, then staging -> `imported`.
+- `pipeline/staging_api.py` + `ui/inspect.js`: the Inspect surface
+  (`/api/staging/*`) - review, bbox editing, re-cut, captions, table text,
+  vocabulary validation, human `ready`, and the import button.
+- `pipeline/migrations/`: the applied schema DDL and its runner (kept because
+  the live bank's shape must stay verifiable); `docs/migrations/` holds the
+  record copy.
+- Studio (`pipeline/studio/`, `ui/studio.js`, `/api/studio/*`) is RETIRED and
+  deleted. Its reusable parts were salvaged into the modules above; do not
+  reintroduce a second pipeline beside the staged workflow.
 - `ui/`: vanilla JavaScript/HTML/CSS; no build step.
 
 ## Database and consumer constraints
@@ -50,9 +64,11 @@ The old Supabase project still holds source-page objects referenced by
 `sources.storage_url`; do not treat it as disposable until source pages have
 been archived and verified.
 
-## Staging/import target
-OCR should write to local SQLite staging, not Postgres. Human inspection edits
-staged records and marks rows ready; only the import step writes live rows.
+## Staging/import contract (implemented)
+An OCR run writes to local SQLite staging, not Postgres - verified by tests that
+fail if the OCR path ever calls an upload or a live upsert. Human inspection
+edits staged records and marks rows ready; only the import step writes live
+rows.
 Inspected/edited rows enter as `approved`. Publish crops before rows that
 reference them. Re-crops replace deterministic object names. Figures remain
 pictures with their captions. Tables need human-verified pipe-table text (with

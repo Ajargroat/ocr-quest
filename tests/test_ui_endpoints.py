@@ -1,4 +1,4 @@
-﻿"""Offline tests for the UI-facing endpoints added by the 2026-10-06 task.
+"""Offline tests for the UI-facing endpoints added by the 2026-10-06 task.
 
 Covers the three dashboard surfaces that had no coverage yet:
   GET  /api/stats?period=…   — period stats (Q4/Q11, no schema change)
@@ -256,11 +256,19 @@ class PipelinePagesEndpoint(UIEndpointCase):
     used to be the only mode; the value is the OCR_PAGES_PER_CALL setting)."""
 
     def test_pages_per_call_round_trips_and_clamps(self):
+        # the endpoint re-reads .env into the module-level cfg, which would leak
+        # this test's temp file into every later test - restore it afterwards
+        saved = main.cfg
+        self.addCleanup(setattr, main, "cfg", saved)
         main.cfg = main.load_config()
+        before = main.cfg.ocr_pages_per_call
         client = self.client()
         res = client.get("/api/pipeline/settings")
         self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(res.json()["pages_per_call"], 1)
+        self.assertEqual(res.json()["pages_per_call"], before)
+        if before == 1:
+            # shift the stored value so the first POST below is a real change
+            client.post("/api/pipeline/settings", json={"pages_per_call": 2})
         self.assertEqual(res.json()["max_pages"], 8)
         res = client.post("/api/pipeline/settings", json={"pages_per_call": 4})
         self.assertEqual(res.status_code, 200, res.text)

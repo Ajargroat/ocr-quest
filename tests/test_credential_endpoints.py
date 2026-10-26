@@ -8,6 +8,7 @@ Run them either way:
     python tests/test_credential_endpoints.py
     pytest tests/test_credential_endpoints.py
 """
+import asyncio
 import json
 import os
 import shutil
@@ -545,6 +546,34 @@ class ProfileEndpointsTest(EndpointCase):
         self.assertEqual(res.status_code, 200, res.text)
         self.assertFalse(res.json()["ok"])
         self.assertEqual(res.json()["kind"], "tunnel_down")
+
+
+class StartupLaneTest(unittest.TestCase):
+    """A dashboard call before any run must already ride the saved lane.
+
+    The runner applies set_proxy(cfg) at the top of each run; the key check,
+    the test button and Studio reach Google without it. With a blocked exit IP
+    they failed as RECV DROPPED / a broken reply — a fault blamed on the key
+    while the lane was simply not applied."""
+
+    def test_lifespan_applies_the_saved_lane_at_startup(self):
+        applied = []
+        real = main.gemini_mod.set_proxy
+        main.gemini_mod.set_proxy = lambda c: applied.append(c)
+        self.addCleanup(lambda: setattr(main.gemini_mod, "set_proxy", real))
+        saved_active = pipeline_config.load_proxy_store()["active"]
+        # lifespan re-points hub at its running loop; put the shared hub back
+        # where it was so later tests emit onto a live loop.
+        old_loop = main.hub.loop
+        self.addCleanup(lambda: setattr(main.hub, "loop", old_loop))
+
+        async def run():
+            async with main.lifespan(main.app):
+                pass
+
+        asyncio.run(run())
+        self.assertTrue(applied, "startup never applied the saved proxy lane")
+        self.assertEqual(applied[0].proxy_active, saved_active)
 
 
 class CheckProviderEndpointTest(EndpointCase):

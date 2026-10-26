@@ -288,41 +288,8 @@ class Config:
     revision_provider_enabled: bool = True
     supabase_enabled: bool = True
     db_connections: tuple = ()
-    # Studio-local provider list + per-stage actives (independent of the
-    # pipeline tab's lists). "" actives: extract → Gemini pool, enrich → none.
-    # Studio proxy: a profile name from the shared store, "" → direct.
-    # Trailing + defaulted so older direct Config(...) constructions keep working.
-    studio_providers: tuple = ()
-    studio_extract_active: str = ""
-    studio_enrich_active: str = ""
-    studio_vision_active: str = ""
-    # Optional Gemini model for the vision stage ("" -> the router ladder).
-    studio_vision_model: str = ""
-    studio_proxy: str = ""
     gemini_enabled_models: tuple | None = None
-    # Stage-1 request windows (Q1/Q10): chars per text chunk, images per call.
-    # pages_per_call is the transport batch (OCR and locate); band_batch is the
-    # figure pass's bands per request.
-    studio_chunk_chars: int = 24000
-    studio_chunk_images: int = 3
-    studio_pages_per_call: int = 3
-    studio_band_batch: int = 6
-    # Re-read a low-confidence text page with the extract model (image + the
-    # PDF's own text) instead of trusting the text layer's scrambled order.
-    studio_organize: int = 1
-    # Vision pages are capped by pixels, not bytes: a sharp 3000 px page is
-    # smaller than the old q20 4968 px one and gives every model more to see.
-    studio_vision_long_edge: int = 3000
-    studio_vision_quality: int = 88
-    # Workstream B: the folder-tree root the DB's folder ids point at, and the
-    # bucket prefix standalone crops are uploaded under (Q8/Q11/Q3).
-    studio_source_root: str = ""
-    studio_crop_prefix: str = "crops"
-    # One pinned Gemini model per surface ("" -> walk the whole ladder). The
-    # picker offers "All" + the ladder models ENABLED in Credentials, so a
-    # single model can be exercised on its own instead of the round-robin.
     gemini_pin: str = ""
-    studio_gemini_pin: str = ""
     # How many consecutive page images of one paper the pipeline sends in a
     # single OCR call (1 = the classic one picture per call).
     ocr_pages_per_call: int = 1
@@ -368,43 +335,10 @@ def load_config() -> Config:
     ext = _resolve(ext_providers, ext_active)
     rev = _resolve(rev_providers, rev_active)
     _proxy_store = load_proxy_store()
-    # Studio-local providers: same single-kind (9router) coercion as the
-    # pipeline sections, but a separate list. Absent keys mean "" (Gemini
-    # pool for extract, none for enrich) — _active() would default to the
-    # first entry, which must not pre-select 9router before the user chooses.
-    studio_providers = _migrate_ninerouter(_json_list("STUDIO_PROVIDERS"))
-    _studio_labels = {p.get("label", "") for p in studio_providers}
-    studio_extract_active = (os.getenv("STUDIO_EXTRACT_ACTIVE") or "").strip()
-    if studio_extract_active not in _studio_labels:
-        studio_extract_active = ""
-    studio_enrich_active = (os.getenv("STUDIO_ENRICH_ACTIVE") or "").strip()
-    if studio_enrich_active not in _studio_labels:
-        studio_enrich_active = ""
-    studio_vision_active = (os.getenv("STUDIO_VISION_ACTIVE") or "").strip()
-    if studio_vision_active not in _studio_labels:
-        studio_vision_active = ""
-    studio_vision_model = (os.getenv("STUDIO_VISION_MODEL") or "").strip()
-    studio_proxy = (os.getenv("STUDIO_PROXY") or "").strip()
-    if studio_proxy and studio_proxy not in {p.get("name", "")
-                                            for p in _proxy_store["profiles"]}:
-        studio_proxy = ""
     input_root = os.getenv("INPUT_ROOT", DEFAULT_INPUT_ROOT)
-    source_root = (os.getenv("STUDIO_SOURCE_ROOT") or "").strip() \
-        or os.path.join(input_root, "studio")
-    crop_prefix = (os.getenv("STUDIO_CROP_PREFIX") or "crops").strip().strip("/")
-    pages_per_call = max(1, min(8, int(os.getenv("STUDIO_PAGES_PER_CALL", "3"))))
     # The pipeline's own pages-per-call: how many consecutive page images of
     # one paper go into a single OCR call (1 keeps the classic behaviour).
     ocr_pages_per_call = max(1, min(8, int(os.getenv("OCR_PAGES_PER_CALL", "1"))))
-    band_batch = max(1, min(12, int(os.getenv("STUDIO_BAND_BATCH", "6"))))
-    organize = 1 if os.getenv("STUDIO_ORGANIZE", "1").strip() not in (
-        "0", "false", "False", "no", "off", "") else 0
-    vision_edge = max(800, min(5000, int(os.getenv("STUDIO_VISION_LONG_EDGE",
-                                                   "3000"))))
-    vision_quality = max(50, min(95, int(os.getenv("STUDIO_VISION_QUALITY",
-                                                    "88"))))
-    chunk_images = max(1, min(12, int(os.getenv("STUDIO_CHUNK_IMAGES",
-                                                str(pages_per_call)))))
     ladder = _model_ladder()
     enabled_models = _enabled_models()
 
@@ -439,7 +373,6 @@ def load_config() -> Config:
         gemini_model_ladder=ladder,
         gemini_enabled_models=enabled_models,
         gemini_pin=_model_pin("GEMINI_MODEL_PIN"),
-        studio_gemini_pin=_model_pin("STUDIO_GEMINI_MODEL_PIN"),
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8080")),
         # Resolved views: consumers (runner, vision, revision/audit) keep
@@ -458,22 +391,7 @@ def load_config() -> Config:
         extraction_active=ext_active,
         revision_providers=rev_providers,
         revision_active=rev_active,
-        studio_providers=studio_providers,
-        studio_extract_active=studio_extract_active,
-        studio_enrich_active=studio_enrich_active,
-        studio_vision_active=studio_vision_active,
-        studio_vision_model=studio_vision_model,
-        studio_proxy=studio_proxy,
-        studio_chunk_chars=int(os.getenv("STUDIO_CHUNK_CHARS", "24000")),
-        studio_chunk_images=chunk_images,
-        studio_pages_per_call=pages_per_call,
         ocr_pages_per_call=ocr_pages_per_call,
-        studio_band_batch=band_batch,
-        studio_organize=organize,
-        studio_vision_long_edge=vision_edge,
-        studio_vision_quality=vision_quality,
-        studio_source_root=source_root,
-        studio_crop_prefix=crop_prefix or "crops",
         proxy_profiles=_proxy_store["profiles"],
         proxy_active=_proxy_store["active"],
         revision_batch_limit=int(os.getenv("REVISION_BATCH_LIMIT", "40")),

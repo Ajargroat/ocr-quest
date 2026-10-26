@@ -63,9 +63,11 @@ class PromptsStoreTests(StoreCase):
     def test_every_catalog_prompt_has_a_default_in_the_code(self):
         ids = [row["id"] for row in prompts.catalog()]
         self.assertIn("pipeline.questions", ids)
-        self.assertIn("studio.ocr", ids)
+        self.assertIn("pipeline.answers", ids)
         self.assertIn("assistant.system", ids)
         for row in prompts.catalog():
+            self.assertFalse(row["id"].startswith("studio."),
+                             "Studio is retired; its prompts are gone")
             self.assertTrue(row["default"].strip(), row["id"])
 
     def test_an_unknown_id_has_no_default(self):

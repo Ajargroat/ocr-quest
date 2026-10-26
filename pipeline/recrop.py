@@ -75,7 +75,7 @@ def clean_bbox(raw):
 
 
 def pixels(bbox, width, height):
-    """A 0-1000 yxxy box as page pixel edges (the Studio crop frame)."""
+    """A 0-1000 yxxy box as page pixel edges (the crop frame)."""
     ymin, xmin, ymax, xmax = bbox
     return (max(0, int(xmin / 1000.0 * width)),
             max(0, int(ymin / 1000.0 * height)),

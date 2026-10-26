@@ -3,11 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Konkour Studio</title>
+<title>OCR hub</title>
+<!-- NEVERHACK reference (DESIGN.md): Inter stands in for Roobert, the brief's
+     substitute face; Vazirmatn keeps Persian content, JetBrains Mono the data -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Vazirmatn:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.5.2/css/all.min.css">
-<link rel="stylesheet" href="static/styles.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+<link rel="stylesheet" href="static/styles.css?v=20261026f">
 
 <!-- MathJax configuration MUST come before the library loads -->
 <script>
@@ -21,10 +23,12 @@ window.MathJax = {
 };
 </script>
 <!-- CHTML, not SVG: the OCR puts Persian words inside \text{...} (isotope/molar-mass table headers, column labels, ...). SVG output draws every glyph with the maths font's own per-character metrics, so Arabic script loses its joining forms and reads as isolated, reversed letters; CHTML emits the run as real text and the browser shapes it. -->
+<script>/* the CPU locale decodes plain text as Windows-1256; pin utf-8
+   so Persian labels inside app.js/inspect.js survive the trip. */
+document.charset = "utf-8";</script>
 <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
 </head>
 <body>
-<canvas id="meshBg" class="mesh-bg" aria-hidden="true"></canvas>
 
 <!-- project identity at the top of the sidebar; the theme + connection pill
      live in a bottom footer. The sidebar no longer collapses (PREFERENCE §2). -->
@@ -36,14 +40,12 @@ window.MathJax = {
     <i class="fa fa-power-off" aria-hidden="true"></i><span>Pipeline</span></button>
   <button class="side-btn" data-view="review" title="QBank">
     <i class="fa fa-list-check" aria-hidden="true"></i><span>QBank</span></button>
-  <button class="side-btn" data-view="studio" title="Studio">
-    <i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><span>Studio</span></button>
+  <button class="side-btn" data-view="inspect" title="Inspect">
+    <i class="fa fa-magnifying-glass-chart" aria-hidden="true"></i><span>Inspect</span></button>
   <button class="side-btn" data-view="database" title="Database">
     <i class="fa fa-database" aria-hidden="true"></i><span>Database</span></button>
   <button class="side-btn" data-view="usage" title="Usage">
     <i class="fa fa-chart-line" aria-hidden="true"></i><span>Usage</span></button>
-  <button class="side-btn" data-view="prompts" title="Prompts">
-    <i class="fa fa-message" aria-hidden="true"></i><span>Prompts</span></button>
   <button class="side-btn" data-view="credentials" title="Credentials">
     <i class="fa fa-key" aria-hidden="true"></i><span>Credentials</span></button>
 </nav>
@@ -71,7 +73,10 @@ window.MathJax = {
     </div>
   </section>
 
-  <!-- stage rail · the live phase readout (same idiom as Revision) -->
+  <!-- stage rail          the live phase readout. Four stages, matching what a run
+       actually does: scan the tree, OCR the page, write the rows to the local
+       staging store, move the source to done/. Nothing here reaches Postgres
+       or the bucket                     the Inspect tab and its Import stage own that. -->
   <section class="stages" id="stages" dir="ltr">
     <div class="rail">
       <div class="stage" data-stage="scan" data-desc="Preflight checks &amp; folder scan">
@@ -79,19 +84,14 @@ window.MathJax = {
         <label>Scan</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="upload" data-desc="Uploading to Supabase Storage">
-        <div class="hub"><i class="fa fa-cloud-arrow-up" aria-hidden="true"></i><em class="bubble"></em></div>
-        <label>Upload</label>
-      </div>
-      <span class="wire"><i></i></span>
       <div class="stage" data-stage="ocr" data-desc="Gemini is reading the page">
         <div class="hub"><i class="fa fa-eye" aria-hidden="true"></i><em class="bubble"></em></div>
         <label>Gemini&nbsp;OCR</label>
       </div>
       <span class="wire"><i></i></span>
-      <div class="stage" data-stage="save" data-desc="Writing rows to Postgres">
-        <div class="hub"><i class="fa fa-database" aria-hidden="true"></i><em class="bubble"></em></div>
-        <label>Save</label>
+      <div class="stage" data-stage="stage" data-desc="Writing rows to the local staging store">
+        <div class="hub"><i class="fa fa-layer-group" aria-hidden="true"></i><em class="bubble"></em></div>
+        <label>Stage</label>
       </div>
       <span class="wire"><i></i></span>
       <div class="stage" data-stage="archive" data-desc="Archiving originals to done/">
@@ -275,191 +275,245 @@ window.MathJax = {
   <div class="cards" id="cards"></div>
 </section>
 
-<!-- ════════════ VIEW 3.5 · STUDIO (any-file OCR subsystem) ════════════ -->
-<section id="viewStudio" class="view">
-  <!-- stage rail · mirrors the pipeline/revision stepper -->
-  <section class="stages" id="stStages">
-    <div class="rail">
-      <div class="stage" data-stage="intake" data-desc="Store the source file">
-        <div class="hub"><i class="fa fa-file-arrow-up" aria-hidden="true"></i><em class="bubble" id="stStageIntake"></em></div>
-        <label>Intake</label>
+<!--                                                                                      VIEW 3.5      INSPECT (staged OCR results, before any import)                                                                                     
+     Nothing on this page has touched Postgres or the bucket yet: a run writes
+     the local staging store, a human corrects and marks rows ready here, and
+     only the Import tab writes the live database. -->
+<section id="viewInspect" class="view" dir="rtl">
+  <div class="toolbar" dir="ltr">
+    <div class="tb-actions">
+      <div class="seg" id="insRail" role="tablist" aria-label="Inspect stages">
+        <button class="rail-btn active" data-ins="sources" type="button">Sources</button>
+        <button class="rail-btn" data-ins="review" type="button">Review</button>
+        <button class="rail-btn" data-ins="import" type="button">Import</button>
       </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="probe" data-desc="Detect kind, pages, static fields">
-        <div class="hub"><i class="fa fa-magnifying-glass" aria-hidden="true"></i><em class="bubble" id="stStageProbe"></em></div>
-        <label>Probe</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="extract" data-desc="Layer-1 bulk: exact text layer or OCR">
-        <div class="hub"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i><em class="bubble" id="stStageExtract"></em></div>
-        <label>Extract</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="enrich" data-desc="Sort, repair, tag and health-check">
-        <div class="hub"><i class="fa fa-broom" aria-hidden="true"></i><em class="bubble" id="stStageEnrich"></em></div>
-        <label>Enrich</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="geometry" data-desc="Bbox per question + crop cache">
-        <div class="hub"><i class="fa fa-crop-simple" aria-hidden="true"></i><em class="bubble" id="stStageGeometry"></em></div>
-        <label>Crop</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="review" data-desc="Human crop + field review">
-        <div class="hub"><i class="fa fa-eye" aria-hidden="true"></i><em class="bubble" id="stStageReview"></em></div>
-        <label>Review</label>
-      </div>
-      <span class="wire"><i></i></span>
-      <div class="stage" data-stage="import" data-desc="Continuous import to a target">
-        <div class="hub"><i class="fa fa-database" aria-hidden="true"></i><em class="bubble" id="stStageImport"></em></div>
-        <label>Import</label>
-      </div>
-    </div>
-  </section>
-
-  <div class="stage-now st-live" id="stNow" data-state="idle">
-    <span class="beacon"></span><b id="stNowStage">IDLE</b><em id="stNowMsg"></em>
-    <span class="st-live-meta" id="stNowPage" hidden></span>
-    <span class="st-live-meta" id="stNowChunk" hidden></span>
-  </div>
-
-  <!-- stage tabs · one stage at a time, routable by #studio/<tab> -->
-  <div class="st-tabbar">
-    <div class="seg st-tabs" id="stTabs" role="tablist" aria-label="Studio stages">
-      <button class="rail-btn active" data-sttab="jobs" type="button" role="tab" title="Upload" aria-label="Upload"><i class="fa fa-file-arrow-up" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="profile" type="button" role="tab" title="Profile" aria-label="Profile"><i class="fa fa-id-card" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="bulk" type="button" role="tab" title="Extract" aria-label="Extract"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="crops" type="button" role="tab" title="Crops" aria-label="Crops"><i class="fa fa-crop-simple" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="inspect" type="button" role="tab" title="Inspect" aria-label="Inspect"><i class="fa fa-eye" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="tags" type="button" role="tab" title="Tags" aria-label="Tags"><i class="fa fa-tags" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="models" type="button" role="tab" title="Models" aria-label="Models"><i class="fa fa-sliders" aria-hidden="true"></i></button>
-      <button class="rail-btn" data-sttab="import" type="button" role="tab" title="Import" aria-label="Import"><i class="fa fa-database" aria-hidden="true"></i></button>
-    </div>
-    <span class="st-crumb" id="stCrumb"></span>
-    <button class="ghost-btn neutral sm" id="stRefresh" type="button" title="Reload">
-      <i class="fa fa-rotate" aria-hidden="true"></i><span>refresh</span>
-    </button>
-  </div>
-
-  <main class="st-tabpanes">
-    <section class="st-pane" data-sttab="jobs" id="stPaneJobs">
-      <div class="db-actions">
-        <label class="st-upload">
-          <i class="fa fa-file-arrow-up" aria-hidden="true"></i>
-          <span id="stUploadLabel">Upload</span>
-          <input type="file" id="stFile" accept=".pdf,.png,.jpg,.jpeg,.webp">
-        </label>
-      </div>
-      <div class="db-grid-wrap st-jobs-wrap" id="stJobs"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="profile" id="stPaneProfile" hidden>
-      <div class="st-profile" id="stProfileBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="bulk" id="stPaneBulk" hidden>
-      <div class="st-profile" id="stBulkBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="crops" id="stPaneCrops" hidden>
-      <div class="st-profile" id="stCropsBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="inspect" id="stPaneInspect" hidden>
-      <div class="st-profile" id="stInspectBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="tags" id="stPaneTags" hidden>
-      <div class="st-profile" id="stTagsBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="models" id="stPaneModels" hidden>
-      <div class="st-profile" id="stModelsBody"></div>
-    </section>
-
-    <section class="st-pane" data-sttab="import" id="stPaneImport" hidden>
-      <div class="st-profile" id="stImportBody"></div>
-    </section>
-  </main>
-
-  <!-- live log · the studio's own event stream, the pipeline's log surface -->
-  <section class="panel st-logpanel" id="stLogPanel">
-    <div class="panel-head">
-      <h2>Live log</h2>
-      <div class="head-tools">
-        <span class="hint" id="stLogCount"></span>
-        <span class="diag-count" id="stDiagCount" hidden></span>
-        <button class="ghost-btn neutral icon-only" id="stLogCopyBtn" type="button"
-                title="Copy the whole log to the clipboard">
-          <i class="fa fa-copy" aria-hidden="true"></i>
-        </button>
-        <button class="ghost-btn neutral icon-only" id="stLogClearBtn" type="button"
-                title="Wipe the log view — the server keeps its history">
-          <i class="fa fa-trash" aria-hidden="true"></i>
-        </button>
-        <button class="ghost-btn neutral icon-only" id="stLogToggle" type="button"
-                title="Show / hide the log">
-          <i class="fa fa-chevron-down" aria-hidden="true"></i>
-        </button>
-      </div>
-    </div>
-    <div class="log no-mathjax" id="stLog"></div>
-  </section>
-
-  <!-- crop picture · the bucket drawer, one row at a time -->
-  <aside class="bucket-drawer" id="stCropDrawer" hidden>
-    <div class="bucket-drawer-head">
-      <h3 id="stCropDrawerName">crop</h3>
-      <button class="ghost-btn neutral icon-only" id="stCropDrawerClose" type="button" title="Close">
-        <i class="fa fa-xmark" aria-hidden="true"></i>
+      <button class="ghost-btn neutral" id="insRefresh" type="button" title="Refresh">
+        <i class="fa fa-arrows-rotate" aria-hidden="true"></i><span>Refresh</span>
       </button>
+      <span class="hint" id="insState" role="status"></span>
     </div>
-    <div class="bucket-drawer-body">
-      <img id="stCropDrawerImg" alt="Crop preview">
-      <div class="st-crop-meta" id="stCropDrawerMeta"></div>
-    </div>
-  </aside>
+  </div>
 
-  <!-- one file's own tabs · opened by the artifact icons on its row:
-       profile · extract · crops · models (each file can run its own model) -->
-  <div class="db-modal" id="stJobModal" hidden>
-    <div class="db-modal-card st-job-card">
-      <div class="db-modal-head">
-        <h3 id="stJobModalTitle">File</h3>
-        <div class="seg st-job-tabs" id="stJobTabs" role="tablist" aria-label="File tabs">
-          <button class="rail-btn" data-stjob="profile" type="button" title="Profile" aria-label="Profile"><i class="fa fa-id-card" aria-hidden="true"></i></button>
-          <button class="rail-btn" data-stjob="extract" type="button" title="Extract" aria-label="Extract"><i class="fa fa-wand-magic-sparkles" aria-hidden="true"></i></button>
-          <button class="rail-btn" data-stjob="crops" type="button" title="Crops" aria-label="Crops"><i class="fa fa-crop-simple" aria-hidden="true"></i></button>
-          <button class="rail-btn" data-stjob="models" type="button" title="Models" aria-label="Models"><i class="fa fa-sliders" aria-hidden="true"></i></button>
+  <!-- stage 1      every staged source, with its status counters -->
+  <div class="ins-pane" data-ins="sources">
+    <div class="ins-counts" id="insCounts"></div>
+    <div class="db-grid-wrap ins-wrap">
+      <table class="db-grid" id="insSources">
+        <thead>
+          <tr>
+            <th>Source</th><th>Subject</th><th>Year</th><th>Corp</th>
+            <th>Pages</th><th>Questions</th><th>Answers</th><th>Status</th><th></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- stage 2      one source: its pages and the rows staged from them -->
+  <div class="ins-pane" data-ins="review" hidden>
+    <div class="ins-head">
+      <button class="icon-btn sm" id="insBack" type="button" title="All sources">
+        <i class="fa fa-arrow-right" aria-hidden="true"></i></button>
+      <span class="ins-path" id="insPath"></span>
+      <div class="ins-head-tools">
+        <div class="seg ins-filter" id="insFilter" role="tablist">
+          <button class="rail-btn active" data-filter="" type="button">All</button>
+          <button class="rail-btn" data-filter="staged" type="button">Staged</button>
+          <button class="rail-btn" data-filter="edited" type="button">Edited</button>
+          <button class="rail-btn" data-filter="ready" type="button">Ready</button>
+          <button class="rail-btn" data-filter="skipped" type="button">Skipped</button>
         </div>
-        <button class="ghost-btn neutral icon-only" id="stJobModalClose" type="button" title="Close">
-          <i class="fa fa-xmark" aria-hidden="true"></i>
+        <label class="sw" title="Show only rows that carry a box">
+          <input type="checkbox" id="insOnlyBox">
+          <span class="tr" aria-hidden="true"></span><em>Boxed</em>
+        </label>
+        <button class="ghost-btn neutral" id="insReadyAll" type="button"
+                title="Mark every still-staged row of this source ready">
+          <i class="fa fa-check" aria-hidden="true"></i><span>Mark ready</span>
         </button>
       </div>
-      <div class="db-modal-body st-job-body" id="stJobModalBody"></div>
-      <div class="db-modal-foot">
-        <span class="st-warn" id="stJobErr" role="alert"></span>
-        <button class="ghost-btn neutral" id="stJobSave" type="button">Save</button>
+    </div>
+    <div class="ins-pages" id="insPages"></div>
+    <div class="ins-list" id="insRecords"></div>
+  </div>
+
+  <!-- stage 3      the importer: ready rows only, crop first, resumable -->
+  <div class="ins-pane" data-ins="import" hidden>
+    <div class="ins-import">
+      <div class="ins-import-head">
+        <span class="hint" id="insImportState" role="status"></span>
+        <button class="ghost-btn neutral" id="insImportRun" type="button">
+          <i class="fa fa-upload" aria-hidden="true"></i><span>Import ready rows</span>
+        </button>
+      </div>
+      <div class="ins-import-body" id="insImportBody"></div>
+    </div>
+  </div>
+
+  <!--                                                                 the record window      picture on one side, editor on the other                                                                 -->
+  <div class="ins-edit" id="insEdit" hidden>
+    <div class="ins-edit-box" role="dialog" aria-modal="true" aria-labelledby="insRecId">
+      <header class="ins-edit-head">
+        <span class="ins-kicker" id="insRecKind"></span>
+        <span class="ins-rec-id" id="insRecId">        </span>
+        <span class="chip ins-chip" id="insRecStatus" hidden></span>
+        <span class="ins-box-flag" id="insBoxFlag" hidden>
+          <i class="fa fa-crop-simple" aria-hidden="true"></i><span>box</span>
+        </span>
+        <div class="ins-edit-tools">
+          <button class="ghost-btn neutral" id="insSave" type="button" title="Save this row">
+            <i class="fa fa-floppy-disk" aria-hidden="true"></i><span>Save</span></button>
+          <button class="ghost-btn neutral" id="insRecut" type="button" title="Re-cut the picture from this box">
+            <i class="fa fa-crop-simple" aria-hidden="true"></i><span>Re-cut</span></button>
+          <button class="ghost-btn neutral" id="insMarkReady" type="button" title="Mark this row ready">
+            <i class="fa fa-check" aria-hidden="true"></i><span>Ready</span></button>
+          <button class="ghost-btn neutral" id="insSkip" type="button" title="Skip this row">
+            <i class="fa fa-ban" aria-hidden="true"></i><span>Skip</span></button>
+          <button class="icon-btn sm" id="insEditClose" type="button" title="Close">
+            <i class="fa fa-xmark" aria-hidden="true"></i></button>
+        </div>
+      </header>
+
+      <div class="ins-edit-body">
+        <!--           the page and the box that becomes the picture -->
+        <aside class="ins-edit-pane">
+          <div class="ins-page-bar">
+            <button class="icon-btn sm" id="insPagePrev" type="button" title="Previous page">
+              <i class="fa fa-chevron-right" aria-hidden="true"></i></button>
+            <span class="ins-page-no" id="insPageNo">        </span>
+            <button class="icon-btn sm" id="insPageNext" type="button" title="Next page">
+              <i class="fa fa-chevron-left" aria-hidden="true"></i></button>
+            <span class="ins-page-tools">
+              <button class="icon-btn sm" id="insZoomOut" type="button" title="Smaller page">
+                <i class="fa fa-magnifying-glass-minus" aria-hidden="true"></i></button>
+              <button class="icon-btn sm" id="insZoomIn" type="button" title="Larger page">
+                <i class="fa fa-magnifying-glass-plus" aria-hidden="true"></i></button>
+              <button class="icon-btn sm" id="insZoomFit" type="button" title="Fit the pane">
+                <i class="fa fa-expand" aria-hidden="true"></i></button>
+            </span>
+            <label class="sw ins-box-sw" title="Draw the stored box over the page">
+              <input type="checkbox" id="insShowBox" checked>
+              <span class="tr" aria-hidden="true"></span><em>Box</em>
+            </label>
+          </div>
+          <div class="ins-page-wrap" id="insPageWrap">
+            <div class="ins-page-stage" id="insPageStage">
+              <img id="insPageImg" alt="" hidden draggable="false">
+              <div class="ins-bbox" id="insBbox" hidden>
+                <i class="ins-h n" data-h="n"></i><i class="ins-h s" data-h="s"></i>
+                <i class="ins-h w" data-h="w"></i><i class="ins-h e" data-h="e"></i>
+                <i class="ins-h nw" data-h="nw"></i><i class="ins-h ne" data-h="ne"></i>
+                <i class="ins-h sw" data-h="sw"></i><i class="ins-h se" data-h="se"></i>
+              </div>
+            </div>
+            <span class="ins-page-none" id="insPageNone">        </span>
+          </div>
+          <div class="ins-boxrow" id="insBboxBar" hidden>
+            <span class="ins-bbox-nums" dir="ltr">
+              <label>top<input type="number" id="insBboxYmin" min="0" max="1000" step="1"></label>
+              <label>left<input type="number" id="insBboxXmin" min="0" max="1000" step="1"></label>
+              <label>bottom<input type="number" id="insBboxYmax" min="0" max="1000" step="1"></label>
+              <label>right<input type="number" id="insBboxXmax" min="0" max="1000" step="1"></label>
+            </span>
+            <span class="ins-bbox-go">
+              <button class="icon-btn sm" id="insBboxClear" type="button" title="No box for this row">
+                <i class="fa fa-ban" aria-hidden="true"></i></button>
+              <button class="icon-btn sm" id="insBboxApply" type="button" title="Save the box">
+                <i class="fa fa-check" aria-hidden="true"></i></button>
+            </span>
+          </div>
+          <div class="ins-cut" id="insCropbar">
+            <img class="ins-cut-img" id="insCropImg" alt="" hidden>
+            <span class="ins-cut-none" id="insCropNone">        </span>
+          </div>
+        </aside>
+
+        <!--        the document: one surface for words, formulas and tables -->
+        <div class="ins-edit-doc">
+          <div class="ins-doc-bar">
+            <div class="ins-tools" dir="ltr">
+              <button class="ins-tool" type="button" data-cmd="bold" title="Bold">
+                <i class="fa fa-bold" aria-hidden="true"></i></button>
+              <button class="ins-tool" type="button" data-cmd="italic" title="Italic">
+                <i class="fa fa-italic" aria-hidden="true"></i></button>
+              <button class="ins-tool" type="button" data-cmd="insertUnorderedList" title="List">
+                <i class="fa fa-list-ul" aria-hidden="true"></i></button>
+              <span class="ins-tool-sep"></span>
+              <button class="ins-tool" type="button" data-ins-cmd="math" title="Formula">
+                <i class="fa fa-square-root-variable" aria-hidden="true"></i></button>
+              <button class="ins-tool" type="button" data-ins-cmd="table" title="Table">
+                <i class="fa fa-table" aria-hidden="true"></i></button>
+              <button class="ins-tool" type="button" data-ins-cmd="row" title="Row">
+                <i class="fa fa-plus" aria-hidden="true"></i>
+                <i class="fa fa-table-cells" aria-hidden="true"></i></button>
+              <button class="ins-tool" type="button" data-ins-cmd="col" title="Column">
+                <i class="fa fa-plus" aria-hidden="true"></i>
+                <i class="fa fa-table-columns" aria-hidden="true"></i></button>
+            </div>
+            <div class="ins-opt-add">
+              <span class="ins-kicker">Choices</span>
+              <button class="ghost-btn neutral" id="insOptAdd" type="button">
+                <i class="fa fa-plus" aria-hidden="true"></i><span>ADD</span></button>
+            </div>
+          </div>
+
+          <div class="ins-doc" id="insDoc">
+            <div class="ins-doc-main" id="insDocEditor" contenteditable="true"
+                 dir="auto" spellcheck="false"></div>
+            <div class="ins-doc-opts" id="insDocOpts" hidden></div>
+          </div>
+
+          <div class="ins-meta" id="insMeta">
+            <label class="ins-field">
+              <span>Corp</span>
+              <input type="text" id="insCorp" list="insVocabCorps" dir="auto">
+            </label>
+            <label class="ins-field">
+              <span>Year</span>
+              <input type="text" id="insYear" dir="auto">
+            </label>
+            <label class="ins-field">
+              <span>Subject</span>
+              <input type="text" id="insSubject" list="insVocabSubjects" dir="auto">
+            </label>
+            <label class="ins-field">
+              <span>Topic</span>
+              <input type="text" id="insTopic" dir="auto">
+            </label>
+            <label class="ins-field">
+              <span>Grade</span>
+              <input type="text" id="insGrade" dir="ltr">
+            </label>
+            <label class="ins-field">
+              <span>Difficulty</span>
+              <input type="text" id="insDifficulty" list="insVocabDifficulty" dir="auto">
+            </label>
+            <div class="ins-field ins-field-wide">
+              <span>Tags</span>
+              <div class="ins-tags" id="insTags"></div>
+            </div>
+            <div class="ins-field ins-field-wide" id="insLinkField" hidden>
+              <span>Linked question</span>
+              <select id="insLink"></select>
+            </div>
+          </div>
+          <div class="ins-vocab" id="insVocabWarn" hidden></div>
+          <datalist id="insVocabCorps"></datalist>
+          <datalist id="insVocabSubjects"></datalist>
+          <datalist id="insVocabDifficulty"></datalist>
+        </div>
       </div>
     </div>
   </div>
 
-  <!-- one question's editor · opens from the Inspect list (edit button or row double-click) -->
-  <div class="db-modal" id="stEditModal" hidden>
-    <div class="db-modal-card st-edit-card">
-      <div class="db-modal-head">
-        <h3 id="stEditTitle">Question</h3>
-        <button class="ghost-btn neutral icon-only" id="stEditClose" type="button" title="Close">
-          <i class="fa fa-xmark" aria-hidden="true"></i>
-        </button>
-      </div>
-      <div class="db-modal-body st-edit-body" id="stEditBody"></div>
-      <div class="db-modal-foot">
-        <span class="hint" id="stEditHint"></span>
-        <button class="ghost-btn neutral" id="stEditSave" type="button">Save draft</button>
-      </div>
-    </div>
-  </div>
+  <!-- the table/picture/answer blocks the editor inserts travel through here -->
+  <template id="insDocTableTpl">
+    <table class="ins-tbl"><tbody>
+      <tr><td><br></td><td><br></td><td><br></td></tr>
+      <tr><td><br></td><td><br></td><td><br></td></tr>
+    </tbody></table><p><br></p>
+  </template>
 </section>
 
 <!-- ════════════ VIEW 4 · CREDENTIALS (key pool + routing health) ════════════ -->
@@ -635,24 +689,7 @@ window.MathJax = {
   </div>
 </section>
 
-<!-- ════════════ VIEW 6 · PROMPTS (every LLM instruction, editable) ════════════ -->
-<section id="viewPrompts" class="view">
-  <div class="panel prompts-panel">
-    <div class="panel-head">
-      <h2>Prompts</h2>
-      <div class="head-tools">
-        <span class="hint" id="prCount"></span>
-        <button class="ghost-btn neutral sm" id="prReload" type="button" title="Reload the saved prompts">
-          <i class="fa fa-rotate" aria-hidden="true"></i><span>Reload</span>
-        </button>
-        <button class="ghost-btn neutral sm" id="prResetAll" type="button" title="Drop every override">Reset all</button>
-      </div>
-    </div>
-    <div class="prompt-list" id="promptList"></div>
-  </div>
-</section>
-
-<!-- ════════════ VIEW 7 · DATABASE (data console) ════════════ -->
+<!--                                                                                                                                                                                      VIEW 7          DATABASE (data console)                                                                                                                                                                                      -->
 <section id="viewDatabase" class="view">
   <div class="db-strip" id="dbStrip"></div>
 
@@ -958,7 +995,8 @@ window.MathJax = {
 
 <div class="toast-wrap no-mathjax" id="toasts"></div>
 
-<script src="static/app.js"></script>
-<script src="static/studio.js"></script>
+<script src="static/app.js?v=20261026f"></script>
+<script src="static/inspect_doc.js?v=20261026f"></script>
+<script src="static/inspect.js?v=20261026f"></script>
 </body>
 </html>

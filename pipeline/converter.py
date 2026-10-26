@@ -154,17 +154,6 @@ def _archive(pdf_path, ok):
     return dest
 
 
-def _studio_root(cfg):
-    """Absolute studio source tree — the studio owns its PDFs, not this sweep.
-
-    The studio tree lives inside INPUT_ROOT (a source folder needs an id in the
-    watched tree), so without this guard a studio upload would be rasterised,
-    archived to done/ and race the studio's own extract stage.
-    """
-    root = (getattr(cfg, "studio_source_root", "") or "").strip()
-    return os.path.normcase(os.path.abspath(root)) if root else ""
-
-
 def _under(path, root):
     try:
         return os.path.commonpath([os.path.normcase(os.path.abspath(path)), root]) == root
@@ -176,7 +165,6 @@ def _sweep_once(cfg):
     """One watch.sh-equivalent pass. Returns (converted, failed) counts."""
     root = cfg.input_root
     min_age = getattr(cfg, "min_age_seconds", 30)
-    studio = _studio_root(cfg)
     dpi = int(os.getenv("CONVERTER_DPI", "170"))
     quality = int(os.getenv("CONVERTER_RASTER_QUALITY", str(QUALITY_START)))
     converted, failed = 0, 0
@@ -185,8 +173,6 @@ def _sweep_once(cfg):
     for pdf in sorted(_iter_pdfs(root)):
         if _done.is_set():
             break
-        if studio and _under(pdf, studio):
-            continue
         if not _mature(pdf, min_age):
             continue
         directory = os.path.dirname(pdf)

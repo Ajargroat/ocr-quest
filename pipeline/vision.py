@@ -67,7 +67,7 @@ def call_ocr_openai(cfg, prompt, data_b64, mime_type,
     Mirrors gemini.call_gemini's retry contract (growing wait, classified
     faults) so the runner can treat both engines identically. Returns the
     parsed JSON object — or the verbatim reply text when ``raw_text`` is set
-    (the studio's OCR lane wants the raw reading, not a JSON wrapper).
+    (the OCR lane wants the raw reading, not a JSON wrapper).
     Raises faults.FaultError on failure.
 
     `on_route(label, masked, model, attempt)` fires before every retry

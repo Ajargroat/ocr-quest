@@ -38,12 +38,12 @@ The app has these surfaces:
   file to Supabase Storage, extracts questions/answers with the Gemini key pool
   (multi-key, multi-model ladder) or the built-in 9router provider, writes rows to
   Postgres, and archives the source to done/ or failed/.
-- OCR Studio: probe a PDF, chunk it, extract lessons/blocks, sort (enrich), locate
+- Inspect: review staged OCR rows, correct boxes, captions and table text,
   crops, review by hand (Inspect/Crops tabs), then import. Edits are LOCAL first
   (workspace/<job>/review.json); only Import touches the database.
 - QBank: review extracted questions/answers, fix pictures.
 - Database: data console (grid, SQL, backups, bucket browser).
-- Usage: per-call model usage history (pipeline + studio) as grouped bars.
+- Usage: per-call model usage history as grouped bars.
 - Prompts: the editable instructions sent to the models.
 - Credentials: Gemini pool + 9router, Supabase, Postgres; all secrets live in .env.
 

@@ -469,6 +469,34 @@ class RouterTest(unittest.TestCase):
         self.assertTrue(report["gateway"]["google_err"])
         self.assertEqual(report["keys"][0]["status"], "ok")    # keys still fine
 
+    def test_edge_block_is_never_a_dead_key(self):
+        """Google's edge refuses THE ROUTE before the key is looked at (the
+        live 2026-10-25 case: a proxy whose exit IP is blocked). The API's
+        JSON never comes back, so the key is unjudged — it must not read as
+        dead, and the pool must recover on its own once the tunnel is fixed."""
+        r = GeminiRouter()
+
+        def blocked(key):
+            raise faults.FaultError(faults.classify_text(
+                "Gemini HTTP 403: <!DOCTYPE html><title>Error 403 "
+                "(Forbidden)!!1</title> 403. Your client does not have "
+                "permission to get URL /v1beta/models from this server."), "x")
+
+        real = gemini_router.list_models
+        gemini_router.list_models = blocked
+        self.addCleanup(lambda: setattr(gemini_router, "list_models", real))
+        report = r.check_all(make_cfg())
+        for row in report["keys"]:
+            self.assertEqual(row["status"], "blocked")
+            self.assertEqual(row["last_fault"], "edge_block")
+            self.assertTrue(row.get("key_unjudged"))
+            self.assertEqual(row["fault"]["cause"], "region")
+        self.assertTrue(all(r._entry(k)["dead"] for k in
+                            ("k1111111111", "k2222222222")))
+        # a short park, not the 15 min a bad key gets
+        self.assertLessEqual(gemini_router.KEY_COOLDOWN["edge_block"], 300)
+        self.assertIn("edge_block", gemini_router.GLOBAL_KINDS)
+
     # ------------------------------------------------------------ usage bars
     def test_quota_failure_blocks_the_pair_without_filling_the_bar(self):
         r = GeminiRouter()
@@ -619,6 +647,20 @@ class GatewayProbeTest(unittest.TestCase):
                             '  ' * 40 + '<title>Error 403 (Forbidden)!!1</title>'))
         self.assertTrue(gemini.gateway_probe()["reachable"])
 
+    def test_edge_html_page_is_named_as_a_route_block(self):
+        """Reachable (it IS Google) but refused at the edge: the probe must
+        say so, so the preflight blames the tunnel instead of the keys."""
+        self._use(self.Resp(403, server_timing="gfet4t7; dur=0", body='\n'
+                            '  ' * 40 + '<title>Error 403 (Forbidden)!!1</title>'))
+        res = gemini.gateway_probe()
+        self.assertTrue(res["reachable"])
+        self.assertEqual(res["kind"], "edge_block")
+
+    def test_keyless_json_refusal_stays_a_plain_refusal(self):
+        # Google's JSON about the missing key proves the API path works.
+        self._use(self.Resp(403, json_body={"error": {"message": "no key"}}))
+        self.assertEqual(gemini.gateway_probe()["kind"], "refused")
+
     def test_google_www_body_reference_counts_as_reachable(self):
         self._use(self.Resp(403, body='\n' * 40 +
                             'url(//www.google.com/images/errors/robot.png)'))
@@ -652,6 +694,23 @@ class FaultClassificationTest(unittest.TestCase):
             get("kind"), "bad_key")
         self.assertEqual(faults.classify_text(
             "Gemini HTTP 429: RESOURCE_EXHAUSTED quota").get("kind"), "quota")
+
+    def test_google_edge_html_403_is_a_route_block_not_a_key(self):
+        """The request never reached the API, so nothing was learned about the
+        key. Before this, every key in the pool was parked 15 min as bad_key."""
+        flt = faults.classify_text(
+            'Gemini HTTP 403: <!DOCTYPE html><html lang=en><title>Error 403 '
+            '(Forbidden)!!1</title> 403. That’s an error. Your client does not '
+            'have permission to get URL /v1beta/models from this server.')
+        self.assertEqual(flt["kind"], "edge_block")
+        self.assertEqual(flt["label"], "ROUTE BLOCKED")
+        self.assertTrue(flt["retryable"])
+
+    def test_api_json_key_refusal_still_reads_as_bad_key(self):
+        flt = faults.classify_text(
+            'Gemini HTTP 403: {"error":{"code":403,"message":"API key not '
+            'valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}')
+        self.assertEqual(flt["kind"], "bad_key")
 
 
 class ConfigPoolTest(unittest.TestCase):

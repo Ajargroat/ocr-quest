@@ -11,12 +11,14 @@ import sys
 import tempfile
 import unittest
 from dataclasses import asdict
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pipeline import deferrals, faults, runner                          # noqa: E402
 from pipeline.runner import Hub, _major_db_halt, _process_item, blocked_remaining  # noqa: E402
 from pipeline.scanner import SourceItem                                     # noqa: E402
+from pipeline.staging import StagingStore                                   # noqa: E402
 
 
 def source_item(**overrides):
@@ -142,75 +144,73 @@ class CacheRoundTripTest(CacheCase):
 
 
 class ProcessItemTest(CacheCase):
+    """P3: one OCR file stages locally and writes NOTHING live.
+
+    Before P3 these tests pinned the opposite contract (the runner uploaded to
+    the bucket, upserted Postgres and parked failed writes). That path is
+    retired, so the pins now say: a staged file touches no db.* write and no
+    bucket, and an empty extraction is reported instead of hidden.
+    """
+
     def setUp(self):
         super().setUp()
         self.file_path = os.path.join(self.tmp, "q.jpg")
-        with open(self.file_path, "wb") as fh:
-            fh.write(b"fake image bytes")
-        self._upload = runner.upload_file
+        from PIL import Image
+        Image.new("RGB", (60, 80), (255, 255, 255)).save(self.file_path, "JPEG")
         self._router = runner.router
-        self.addCleanup(setattr, runner, "upload_file", self._upload)
         self.addCleanup(setattr, runner, "router", self._router)
-        runner.upload_file = lambda *a, **k: "http://storage/abc123"
         runner.router = FakeRouter()
+        self.store = StagingStore(os.path.join(self.tmp, "staging", "staging.db"),
+                                  root=os.path.join(self.tmp, "staging"))
+        self.addCleanup(self.store.close)
+        self.cfg = SimpleNamespace(ocr_pages_per_call=1, ocr_provider="gemini",
+                                   ocr_model="", staging_path=self.store.path)
 
-    def test_working_database_writes_everything_now(self):
+    def _item(self):
+        return source_item(file_path=self.file_path)
+
+    def test_a_clean_file_stages_and_archives_with_no_live_write(self):
         db = FakeDB()
-        hub = Hub()
-        outcome = _process_item(hub, None, db, source_item(file_path=self.file_path), 1, 1)
+        hubs = Hub()
+        outcome = _process_item(hubs, self.cfg, db, self._item(), 1, 1,
+                                store=self.store)
         self.assertEqual(outcome, "clean")
-        self.assertEqual(db.ops(), ["upsert_source", "upsert_questions"])
-        self.assertEqual(hub.stats["processed"], 1)
-        self.assertEqual(hub.stats["deferred"], 0)
+        # zero live writes: the fake DB saw no write-shaped call at all
+        self.assertEqual([op for op, _ in db.calls if op != "fetch_context_questions"],
+                         [])
+        self.assertEqual(hubs.stats["processed"], 1)
+        self.assertEqual(hubs.stats["deferred"], 0)
         self.assertFalse(os.path.exists(deferrals.CACHE_PATH))
-        self.assertEqual(hub.files["abc123"]["status"], "done")
-
-    def test_dead_question_save_parks_rows_and_archives_the_file(self):
-        db = FakeDB(dead={"upsert_questions"})
-        hub = Hub()
-        outcome = _process_item(hub, None, db, source_item(file_path=self.file_path), 1, 1)
-        self.assertEqual(outcome, "deferred")
-        # the Gemini work survives on disk...
-        entries = self.read_cache()
-        self.assertEqual([s["op"] for s in entries[0]["steps"]], ["upsert_questions"])
-        self.assertEqual(entries[0]["steps"][0]["rows"][0]["id"], "abc123-q1")
-        # ...the file is archived (re-OCRing would burn quota)...
+        self.assertEqual(hubs.files["abc123"]["status"], "done")
+        staged = self.store.get("question", "abc123-q1")
+        self.assertEqual(staged["status"], "staged")
         self.assertTrue(os.path.exists(os.path.join(self.tmp, "done", "q.jpg")))
         self.assertFalse(os.path.exists(self.file_path))
-        # ...and the dashboard shows the parked state
-        self.assertEqual(hub.files["abc123"]["status"], "cached")
-        self.assertEqual(hub.stats["deferred"], 1)
-        self.assertEqual(hub.stats["processed"], 1)
-        self.assertEqual(hub.stats["errors"], 0)
 
-    def test_parked_file_is_imported_by_the_end_of_run_flush(self):
-        db = FakeDB(dead={"upsert_questions"})
-        hub = Hub()
-        _process_item(hub, None, db, source_item(file_path=self.file_path), 1, 1)
-        # DB comes back for the end-of-run pass
-        good = FakeDB()
-        _flush_parked_logs = []
-        applied, still = deferrals.flush(good, log=lambda *a: _flush_parked_logs.append(a))
-        self.assertEqual((applied, still), (1, 0))
-        self.assertEqual(good.ops(), ["upsert_questions"])
+    def test_the_source_page_and_its_row_are_both_kept(self):
+        _process_item(Hub(), self.cfg, FakeDB(), self._item(), 1, 1, store=self.store)
+        self.assertTrue(os.path.exists(self.store.page_path("abc123", 1)))
+        self.assertEqual(self.store.get_source("abc123")["page_count"], 1)
 
-    def test_down_database_counts_as_store_failure(self):
-        runner.upload_file = lambda *a, **k: (_ for _ in ()).throw(
-            RuntimeError("Supabase upload failed: HTTP 503 busy"))
-        hub = Hub()
-        outcome = _process_item(hub, None, FakeDB(), source_item(file_path=self.file_path), 1, 1)
+    def test_an_empty_extraction_is_reported_and_still_archived(self):
+        runner.router = FakeRouter(parsed={"questions": []})
+        hubs = Hub()
+        outcome = _process_item(hubs, self.cfg, FakeDB(), self._item(), 1, 1,
+                                store=self.store)
+        self.assertEqual(outcome, "empty")
+        self.assertEqual(hubs.files["abc123"]["status"], "empty")
+        self.assertEqual(self.store.get_source("abc123")["status"], "empty")
+        self.assertTrue(os.path.exists(os.path.join(self.tmp, "done", "q.jpg")))
+
+    def test_a_staging_failure_is_a_store_fault_and_keeps_the_file(self):
+        self.store.close()          # every staging write now raises
+        hubs = Hub()
+        outcome = _process_item(hubs, self.cfg, FakeDB(), self._item(), 1, 1,
+                                store=self.store)
         self.assertEqual(outcome, "store_failed")
-        self.assertEqual(hub.stats["errors"], 1)
-        # failed files stay in place for the next run and nothing is parked
+        self.assertEqual(hubs.stats["errors"], 1)
         self.assertTrue(os.path.exists(self.file_path))
         self.assertFalse(os.path.exists(deferrals.CACHE_PATH))
-
-    def test_network_failure_is_not_a_database_signal(self):
-        runner.upload_file = lambda *a, **k: (_ for _ in ()).throw(
-            RuntimeError("cannot connect to proxy"))
-        hub = Hub()
-        outcome = _process_item(hub, None, FakeDB(), source_item(file_path=self.file_path), 1, 1)
-        self.assertEqual(outcome, "failed")
 
     def test_pool_exhausted_returns_blocked(self):
         """An exhausted flag on the router's fault means the whole run should
@@ -218,16 +218,16 @@ class ProcessItemTest(CacheCase):
         flt = faults.fault("quota", "all keys cooling down")
         flt["exhausted"] = True
         runner.router = FakeRouter(fault=faults.FaultError(flt, "no pair left"))
-        hub = Hub()
-        outcome = _process_item(hub, None, FakeDB(),
-                                source_item(file_path=self.file_path), 1, 1)
+        hubs = Hub()
+        outcome = _process_item(hubs, self.cfg, FakeDB(), self._item(), 1, 1,
+                                store=self.store)
         self.assertEqual(outcome, "blocked")
         self.assertTrue(os.path.exists(self.file_path))   # the file is not moved
         # the same fault WITHOUT the flag is an ordinary failure, not a stop
         runner.router = FakeRouter(
             fault=faults.FaultError(faults.fault("quota", "spent"), "spent"))
-        outcome = _process_item(hub, None, FakeDB(),
-                                source_item(file_path=self.file_path), 1, 1)
+        outcome = _process_item(hubs, self.cfg, FakeDB(), self._item(), 1, 1,
+                                store=self.store)
         self.assertEqual(outcome, "failed")
 
 

@@ -105,7 +105,7 @@ def media_from_diagram(diagram_url, diagram_bbox):
 def media_images_value(row):
     """The media_images JSON for one question row (the upsert side).
 
-    A studio-importer row already carries the array; an OCR row still carries
+    An importer row already carries the array; an OCR row still carries
     diagram_url/diagram_bbox, which is that same single entry.
     """
     media = row.get("media_images")
@@ -261,7 +261,7 @@ class Database:
           topic           = EXCLUDED.topic,
           type            = EXCLUDED.type
         """
-        # folder_id is NOT NULL: a row without a folder (the studio importer's
+        # folder_id is NOT NULL: a row without a folder (the importer's
         # sources carry no rel_path) keeps an empty id rather than failing.
         self._execute(sql, (
             item.source_id, folder_id(item.rel_path) or "", item.file_name,
@@ -424,7 +424,7 @@ class Database:
                 r.get("created_at"),
             ))
 
-        # ── QA Studio (review tab) ─────────────────────────────────────
+        # ── QA (review tab) ────────────────────────────────────────
     _REVIEW_SELECT = """
         SELECT q.id, q.source_id, q.question_number, q.prompt AS question_text,
                q.options, q.type, q.media_images, q.split, q.duplicate,
@@ -816,7 +816,7 @@ class Database:
         # endpoints). The method stays so the dormant pipeline/revision/ code
         # still imports; calling it is a programming error, not a DB fault.
         raise RuntimeError(
-            "revision_reports is retired (see pipeline/studio/"
+            "revision_reports is retired (see pipeline/"
             "retire_revision.sql); re-create the table to revive "
             "insert_report_rows")
 
@@ -914,7 +914,7 @@ class Database:
         if not entity_ids:
             return {}
         raise RuntimeError(
-            "revision_reports is retired (see pipeline/studio/"
+            "revision_reports is retired (see pipeline/"
             "retire_revision.sql); re-create the table to revive "
             "fetch_revision_reports")
 

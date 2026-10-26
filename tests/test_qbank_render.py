@@ -41,7 +41,7 @@ def _fence_bare(cases):
 
     The dashboard carries no JS test runner, so this executes the exact source
     the browser receives. Returns None when node is unavailable (same skip
-    policy as the syntax check in test_studio_ui)."""
+    policy as the markup syntax check)."""
     node = shutil.which("node")
     if not node:
         return None

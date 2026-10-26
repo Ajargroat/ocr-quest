@@ -1,26 +1,27 @@
-"""The orchestrator: replaces Loop Over Items + If + Loop On Success.
-Runs in a background thread and pushes live events to the dashboard."""
 import asyncio
 import base64
+import json
 import os
 import re
+import sqlite3
+import tempfile
 import threading
 import time
+import traceback
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from datetime import datetime
 
-from . import deferrals, faults, parallel
-from .answers import build_answer_prompt, finalize_answer_rows, prepare_answer_rows
+from . import deferrals, faults, parallel, stage
+from .answers import build_answer_prompt
 from .config import Config
 from .db import Database
-from .gemini import set_proxy
+from .gemini import proxy_proxies, set_proxy
 from .gemini_router import router, mask
-from .questions import (build_question_rows, pages_prompt, question_prompt,
-                        split_pages)
+from .questions import pages_prompt, question_prompt, split_pages
 from .scanner import scan
-from .storage import upload_file
+from .staging import DEFAULT_PATH as STAGING_DEFAULT_PATH, StagingStore
 from .vision import call_ocr_openai
 
 
@@ -66,125 +67,20 @@ def _call_ocr(cfg, prompt, data_b64, mime_type, on_problem=None, on_route=None,
         on_problem=on_problem, on_route=on_route, labels=labels)
     return parsed
 
+def _open_store(cfg):
+    """The staging store for this run (local SQLite; never the live DB)."""
+    path = getattr(cfg, "staging_path", None) or STAGING_DEFAULT_PATH
+    return StagingStore(path)
 
-# ── pages per call: several page images of one paper in a single OCR call ──
-# The converter splits a paper into <base>-1.jpg, <base>-2.jpg, ... . Those
-# files sort as -1, -10, -2 (lexicographic), so a run is collected by base
-# name and only then put back in reading order. A run never crosses a folder,
-# a type or a paper. This is a pure optimisation: the pages-per-call setting
-# decides how many travel together, and every page still gets its own source
-# row, its own DB rows and its own archive step.
-_PAGE_SUFFIX = re.compile(r"^(?P<base>.+)-(?P<page>\d+)$")
-
-
-def _page_of(item):
-    """(paper base name, page number) from a file name, or (None, None)."""
-    stem = os.path.splitext(item.file_name or "")[0]
-    match = _PAGE_SUFFIX.match(stem)
-    if not match:
-        return None, None
-    return match.group("base"), int(match.group("page"))
-
-
-def _page_key(item):
-    """The run a page belongs to — None for anything that is not a page image."""
-    base, _page = _page_of(item)
-    if base is None or not (item.mime_type or "").lower().startswith("image/"):
-        return None
-    return (os.path.dirname(item.file_path or "").lower(), item.type, base)
-
-
-def page_runs(items, per_call):
-    """Split the queue into runs of consecutive page images of one paper."""
-    if per_call <= 1:
-        return [[item] for item in items]
-    runs, current, key = [], [], None
-    for item in items:
-        item_key = _page_key(item)
-        if item_key is None:
-            if current:
-                runs.append(current)
-            current, key = [], None
-            runs.append([item])
-            continue
-        if current and (item_key != key or len(current) >= per_call):
-            runs.append(current)
-            current = []
-        if not current:
-            key = item_key
-        current.append(item)
-    if current:
-        runs.append(current)
-    return [sorted(run, key=lambda it: _page_of(it)[1]) for run in runs]
-
-
-def _page_ocr_prepass(hub, cfg, db, items, per_call, log):
-    """OCR each run of page images in one call -> {source_id: parsed}.
-
-    Errors are swallowed on purpose: a batch that fails only costs one wasted
-    call, and the files then take their normal one-picture path with the
-    usual fault reporting, blocking and retry behaviour.
-    """
-    runs = [run for run in page_runs(items, per_call) if len(run) > 1]
-    if not runs:
-        return {}
-    covered = sum(len(run) for run in runs)
-    log("info", f"Pages per call: {per_call} — {len(runs)} batch(es) for "
-                f"{covered} of {len(items)} file(s)")
-    prefetched = {}
-    for run in runs:
-        if hub.stop_flag.is_set():
-            break
-        pages = [_page_of(item)[1] for item in run]
-        blobs, labels = [], []
-        for item, page in zip(run, pages):
-            try:
-                with open(item.file_path, "rb") as fh:
-                    blobs.append(base64.b64encode(fh.read()).decode())
-            except OSError:
-                blobs = []
-                break
-            labels.append("PAGE %d:" % page)
-        if not blobs:
-            log("warn", f"  ↳ page batch {pages} skipped — a page file could "
-                        "not be read")
-            continue
-        is_question = run[0].type == "سوال"
-        try:
-            if is_question:
-                parsed = _call_ocr(cfg, pages_prompt(), blobs, run[0].mime_type,
-                                   labels=labels)
-                split = split_pages(parsed, pages)
-                field = "questions"
-            else:
-                candidates = db.fetch_context_questions(
-                    run[0].subject, run[0].topic, run[0].grade)
-                parsed = _call_ocr(
-                    cfg, build_answer_prompt(candidates, pages=len(run)),
-                    blobs, run[0].mime_type, labels=labels)
-                split = split_pages(parsed, pages, key="answers")
-                field = "answers"
-        except Exception as exc:               # noqa: BLE001 - never fatal
-            flt = getattr(exc, "fault", None) or faults.classify(exc)
-            log("warn", f"  ↳ page batch {pages} failed ({flt['label']}) — each "
-                        "page takes its own call instead", flt.get("kind"))
-            continue
-        found = 0
-        for item, page in zip(run, pages):
-            entry = split.get(page) or {field: []}
-            prefetched[item.source_id] = {"parsed": entry, "ocr_ready": True}
-            found += len(entry.get(field) or [])
-        log("info", f"  ↳ pages {pages[0]}-{pages[-1]} read in one call "
-                    f"({found} {field})")
-    return prefetched
 
 def missing_credentials(cfg):
     """Pre-flight gate — the env names a run's active providers need.
     A switched-off section reports its own flag, so the log names the toggle
     that turned the run down (Q1)."""
     missing = []
-    if not cfg.supabase_key:
-        missing.append("SUPABASE_SERVICE_KEY")
+    # No bucket credential is checked: since P3 a run only writes the local
+    # staging store, so SUPABASE_SERVICE_KEY is the importer business. A
+    # staging run must be possible with no live access at all.
     if (cfg.ocr_provider or "gemini").lower() == "gemini":
         if not cfg.gemini_pool_enabled:
             missing.append("GEMINI_POOL_ENABLED (Credentials · OCR engine)")
@@ -248,7 +144,13 @@ class Hub:
             self._apply(event)
             (self.rev_log if event.get("rev") else self.log).append(event)
         if self.loop is not None:
-            asyncio.run_coroutine_threadsafe(self._broadcast(event), self.loop)
+            try:
+                asyncio.run_coroutine_threadsafe(self._broadcast(event), self.loop)
+            except RuntimeError:
+                # A closed loop (a test's own asyncio.run, a torn-down worker)
+                # must not fail the endpoint that emitted the event: the event
+                # is already recorded in the log, the broadcast is best-effort.
+                pass
 
     async def _broadcast(self, event):
         for queue in list(self.clients):
@@ -326,12 +228,47 @@ def start_run(hub: Hub, cfg: Config, db: Database, mode: str = "serial",
     return True
 
 
+def _run_log_path(cfg):
+    """Where a run writes its own trace, so a dead process still leaves one.
+
+    The dashboard log lives in an in-memory deque and a WebSocket push, so a
+    crash, a hard kill or a Stop loses the whole run's history — which is
+    exactly the moment the history is needed. This file is appended as the run
+    goes, one JSON object per line, in the repo's logs/ directory.
+    """
+    base = os.path.join(getattr(cfg, "input_root", None) or ".", "..", "logs")
+    base = os.path.abspath(base)
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError:
+        base = tempfile.gettempdir()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(base, f"run-{stamp}.log")
+
+
 def _run(hub: Hub, cfg: Config, db: Database, options=None):
     options = options or {}
+    log_path = _run_log_path(cfg)
+
+    def write(level, message, err=None, **extra):
+        """Append one line to the run file. Never raises: logging is not worth
+        failing a run over, and a broken log must not hide the work."""
+        try:
+            row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "level": level,
+                   "message": message}
+            if err:
+                row["err"] = err
+            row.update(extra)
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:                      # noqa: BLE001 - see docstring
+            pass
+
     def log(level, message, err=None):
         event = {"type": "log", "level": level, "message": message}
         if err:
             event["err"] = err
+        write(level, message, err)
         hub.emit(event)
 
     def diag(flt, where, source=""):
@@ -341,6 +278,8 @@ def _run(hub: Hub, cfg: Config, db: Database, options=None):
 
     try:
         hub.emit({"type": "run_started"})
+        write("info", "run started", path=log_path)
+        log("info", f"Run log: {log_path}")
 
         # --- pre-flight checks -------------------------------------
         set_proxy(cfg)                # profile lane for Google-bound calls
@@ -348,15 +287,19 @@ def _run(hub: Hub, cfg: Config, db: Database, options=None):
         if missing:
             log("error", "Missing credentials in .env: " + ", ".join(missing), "bad_key")
             return
+        # The Postgres ping is informational now: a question file needs no
+        # live row at all, and an answer file reads the bank only as a bonus
+        # (stage.candidate_questions swallows a dead pooler). So a dead DB
+        # WARNS and the run stages anyway - only the importer cares.
         try:
             db.ping()
         except Exception as exc:
             flt = faults.classify(exc)
             flt["raw"] = str(exc)[:400]
             diag(flt, "preflight · Postgres ping")
-            log("error", f"Cannot reach Postgres — {flt['label']}: {flt['hint']}", flt["kind"])
+            log("warn", f"Postgres is unreachable ({flt['label']}) — staging "
+                        "continues; the importer will need it later.", flt["kind"])
             return
-
         # One free metadata call per key (no generation tokens) gives the
         # router a fresh map of dead keys / dead models, so the first real
         # request lands on a working pair instead of probing blind. Skipped
@@ -386,7 +329,19 @@ def _run(hub: Hub, cfg: Config, db: Database, options=None):
                     (r["fault"] or {}).get("kind") in
                     ("tunnel_down", "send_blocked", "recv_dropped", "overload")
                     for r in report["keys"] if r["fault"])
-                if net_only:
+                # Google's edge refused the route before any key was checked,
+                # so every key row looks identical: that is the tunnel / exit
+                # IP, never the pool.
+                edge_only = bool(report["keys"]) and all(
+                    (r["fault"] or {}).get("kind") in ("edge_block", "geo_block")
+                    for r in report["keys"] if r["fault"])
+                lane = proxy_proxies()
+                lane = lane["https"] if lane else "direct (no proxy lane)"
+                if edge_only:
+                    log("error", "Google refused this route before checking any key "
+                                 "(its own 403 page, not the API) — fix the tunnel, "
+                                 f"not the keys. Lane: {lane}.", "edge_block")
+                elif net_only:
                     log("error", "Cannot reach Google right now — restore the tunnel "
                                  "and rerun; no key was blamed for a network fault.",
                         "tunnel_down")
@@ -428,8 +383,13 @@ def _run(hub: Hub, cfg: Config, db: Database, options=None):
             _run_serial(hub, cfg, db, items, log)
     except Exception as exc:
         flt = getattr(exc, "fault", None) or faults.classify(exc)
+        write("error", f"run aborted: {exc}", flt.get("kind"),
+              traceback=traceback.format_exc()[-2000:])
         log("error", f"Run aborted — {flt['label']}: {exc}", flt["kind"])
     finally:
+        # A run that ends without this line died mid-flight (crash, kill,
+        # OOM) - which is precisely what the file exists to reveal.
+        write("info", "run finished", stats=dict(hub.stats))
         hub.emit({"type": "run_finished"})
 
 
@@ -443,10 +403,17 @@ def _run_serial(hub: Hub, cfg: Config, db: Database, items, log):
     stopped = False
     blocked = 0
     # Pages per call: OCR the page images of one paper together before the
-    # per-file loop, then hand each file its own slice of that one reply.
+    # per-file loop, then hand each file its own slice of that one reply. A
+    # paper that arrives as one image per file (the converter's usual output)
+    # is where the whole saving lives; a single file still batches inside
+    # itself through _ocr_pages.
     per_call = max(1, int(getattr(cfg, "ocr_pages_per_call", 1) or 1))
     prefetched = _page_ocr_prepass(hub, cfg, db, items, per_call, log) \
         if per_call > 1 else {}
+    # Staging: one local SQLite store for this run. Nothing this loop does
+    # touches Postgres or the bucket - the importer does that later, after a
+    # human has marked the rows ready in Inspect.
+    store = _open_store(cfg)
     for index, item in enumerate(items, 1):
         if hub.stop_flag.is_set():
             stopped = True
@@ -454,8 +421,9 @@ def _run_serial(hub: Hub, cfg: Config, db: Database, items, log):
                         f"{len(items)}; the remaining files stay for the next run.")
             break
         outcome = _process_item(hub, cfg, db, item, index, len(items),
-                                pre=prefetched.get(item.source_id))
-        if outcome == "clean":
+                                pre=prefetched.get(item.source_id),
+                                store=store)
+        if outcome in ("clean", "empty"):
             hub.db_fail_streak = 0
         elif outcome == "blocked":
             # Q4: every key×model pair is exhausted, so the rest of the
@@ -513,7 +481,7 @@ def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
     OCR prompt — the answer branch reads its DB context here, so the single
     Postgres connection is never touched off-thread.
 
-    Phase B (small thread pool): the slow part — Supabase upload + OCR with
+    Phase B (small thread pool): the slow part - one OCR call per page with
     the lane's PINNED key. No DB write happens here.
 
     `hub` (parallel runs) receives `lane` events WHILE the pool works — the
@@ -536,15 +504,16 @@ def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
             with open(item.file_path, "rb") as fh:
                 raw = fh.read()
             bundle["raw"] = raw
-            bundle["data_b64"] = base64.b64encode(raw).decode()
+            bundle["pages"] = stage.page_images(raw, item.mime_type)
             if item.type == "سوال":
-                bundle["prompt"] = question_prompt()
                 bundle["candidates"] = None
             else:
-                candidates = db.fetch_context_questions(
+                # The prompt itself is built per page-batch by _ocr_pages;
+                # only the answer branch's candidate bank is read here, on
+                # this thread, so the single DB connection is never touched
+                # off-thread.
+                bundle["candidates"] = db.fetch_context_questions(
                     item.subject, item.topic, item.grade)
-                bundle["candidates"] = candidates
-                bundle["prompt"] = build_answer_prompt(candidates)
         except Exception as exc:
             bundle["error"] = exc
         prepared.append(bundle)
@@ -561,18 +530,21 @@ def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
             lane("wait", bundle, phase=f"waiting {int(wait)}s",
                  until=time.time() + wait, total=wait)
 
-        lane("start", bundle, phase="uploading")  # the lane picked this file up
+        lane("start", bundle, phase="ocr")    # the lane picked this file up
         if bundle.get("error"):
             lane("failed", bundle, phase="failed",
                  reason=str(bundle["error"])[:160])
             return bundle
         try:
             item = bundle["item"]
-            bundle["storage_url"] = upload_file(
-                cfg, item.source_id, bundle["raw"], item.mime_type)
-            lane("start", bundle, phase="ocr")     # upload done — now OCR
-            bundle["parsed"] = _call_ocr(
-                cfg, bundle["prompt"], bundle["data_b64"], item.mime_type,
+            lane("start", bundle, phase="ocr")
+            # `_ocr_pages` owns the "Pages / call" batching, so a lane sends
+            # the SAME request shape as the one-by-one engine — including the
+            # per-page labels and the split back onto each page.
+            bundle["parsed"] = _ocr_pages(
+                cfg, item, bundle["pages"],
+                questions=(item.type == "سوال"),
+                candidates=bundle["candidates"],
                 on_problem=lane_problem,
                 on_route=lambda label, masked, model, attempt: lane(
                     "route", bundle, model=model, attempt=attempt,
@@ -582,7 +554,7 @@ def _produce_round(cfg, db, assignments, hub=None, on_bundle=None):
             bundle["error"] = exc
             lane("failed", bundle, phase="failed", reason=str(exc)[:160])
             return bundle
-        lane("done", bundle, phase="importing")
+        lane("done", bundle, phase="staging")
         return bundle
 
     with ThreadPoolExecutor(max_workers=max(1, len(prepared))) as pool:
@@ -615,6 +587,9 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
                 f"round over {len(items)} file(s); each file imports the moment "
                 "its lane finishes.")
 
+    # Staging is where a lane's result lands; a lane never writes it (the
+    # import step below does, on this thread, in completion order).
+    store = _open_store(cfg)
     limit = deferrals.max_consecutive_failures()
     stopped = False
     blocked = 0
@@ -646,20 +621,20 @@ def _run_parallel(hub: Hub, cfg: Config, db: Database, items, options, log):
                 if stopped:
                     return                      # breaker tripped — drop the rest
                 index = bundle["index0"] + 1
-                pre = {"storage_url": bundle.get("storage_url"),
-                       "parsed": bundle.get("parsed"),
+                pre = {"parsed": bundle.get("parsed"),
                        "candidates": bundle.get("candidates"),
+                       "pages": bundle.get("pages"),
                        "error": bundle.get("error")}
                 outcome = _process_item(hub, cfg, db, bundle["item"], index,
-                                        len(items), pre=pre)
-                ok = outcome in ("clean", "deferred")   # both reach done/
-                extra = {"phase": "imported" if ok else "not imported"}
+                                        len(items), pre=pre, store=store)
+                ok = outcome in ("clean", "empty")      # both reach done/
+                extra = {"phase": "staged" if ok else "not staged"}
                 if not ok and bundle.get("error"):
                     extra["reason"] = str(bundle["error"])[:160]
                 _lane_event(hub, cfg, bundle, "done" if ok else "failed",
                             **extra)
                 imported += 1
-                if outcome == "clean":
+                if outcome in ("clean", "empty"):
                     hub.db_fail_streak = 0
                 elif outcome == "blocked":
                     # This lane's pinned key is out of usable models — the
@@ -732,15 +707,20 @@ def _flush_parked(hub: Hub, db: Database, log):
 
 
 def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
-                  pre=None):
+                  pre=None, store=None):
     """Runs one file end to end and returns an outcome for the circuit
-    breaker: 'clean', 'deferred' (parked writes), 'store_failed', 'failed'
-    or 'blocked' (every Gemini key/model pair exhausted — stop the run).
+    breaker: 'clean', 'empty', 'failed' or 'blocked' (every Gemini key/model
+    pair exhausted — stop the run).
+
+    Since P3 this function WRITES NOTHING live: no bucket upload, no Postgres
+    row. The OCR reply becomes local staging rows (``pipeline.stage``), an
+    ``empty`` extraction is reported as such instead of silently archived, and
+    the source file moves to ``done/`` because the staged result — not a DB
+    transaction — is now the durable artifact.
 
     `pre` (parallel mode only) carries the slow steps a lane already did —
-    {"storage_url", "parsed", "candidates", "error"} — so this call performs
-    only the ordered DB import + archive on the run thread. None (the serial
-    path) reads, uploads and OCRs here exactly as before."""
+    {"parsed", "candidates", "pages", "error"}; None means the serial path,
+    which reads, renders and OCRs here."""
     provider = (getattr(cfg, "ocr_provider", "gemini") if cfg else None) or "gemini"
     ocr_label = "Gemini" if provider.lower() == "gemini" \
         else (getattr(cfg, "ocr_model", "") or "OCR model")
@@ -778,18 +758,15 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
             stats = dict(hub.stats)
         hub.emit({"type": "stats", "stats": stats})
 
-    # Steps that failed their retries and were parked for the end-of-run import.
-    parked_steps = []
-
     class _Stopped(Exception):
         pass
 
     def check_stop(where=""):
-        """Stop between upload→OCR→save→archive phases (criterion 10).
+        """Stop between read→render→OCR→stage→archive phases (criterion 10).
 
-        A run stuck inside the blocking gemini-ocr call still cannot abort
-        mid-socket (U2) — but every phase boundary now honours the button,
-        and retry sleeps wake early via _sleep_or_stop.
+        A run stuck inside the blocking OCR call still cannot abort
+        mid-socket (U2) — but every phase boundary honours the button, and
+        retry sleeps wake early via _sleep_or_stop.
         """
         if hub.stop_flag.is_set():
             log("warn", f"Stop requested — halting during {where or 'processing'}; "
@@ -797,157 +774,90 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
             file_event("queued", "Stop requested")
             raise _Stopped()
 
-    def try_db(op_step, apply_now, where):
-        """One Postgres write with growing retries; parks it in the cache and
-        returns False when it cannot be applied right now."""
-        if parked_steps:
-            # The DB already refused this file — don't stall on more timeouts.
-            parked_steps.append(op_step)
-            log("warn", f"  ↳ {where} parked without retry — this file already "
-                        "has a parked write")
-            return False
-        retries, base = deferrals.save_retries(), deferrals.retry_wait()
-        last = None
-        for attempt in range(1, retries + 1):
-            try:
-                apply_now()
-            except Exception as exc:
-                last = getattr(exc, "fault", None) or faults.classify(exc)
-                last["raw"] = last.get("raw") or str(exc)[:400]
-                if attempt < retries:
-                    wait = faults.backoff_wait(attempt, base)
-                    on_problem(last, attempt, retries, wait, where=where)
-                    if not _sleep_or_stop(hub, wait):
-                        return False
-            else:
-                return True
-        last = last or faults.fault("unknown")
-        log("warn", f"  ↳ {last['emoji']} {last['label']} · {where} parked in the "
-                    f"write-cache after {retries} attempts — it will be imported "
-                    "at the end of the run", last["kind"])
-        hub.emit({"type": "error", "kind": last["kind"], "label": last["label"],
-                  "emoji": last["emoji"], "hint": last["hint"],
-                  "where": f"{where} · parked to write-cache · file {index}/{total}",
-                  "file": item.rel_path, "raw": str(last.get("raw", ""))[:400]})
-        parked_steps.append(op_step)
-        return False
-
     branch = "Question" if item.type == "سوال" else "Answer"
     phase = "reading local file"
     try:
         log("info", f"[{index}/{total}] {branch}: {item.rel_path}")
 
-        if pre is not None:
-            # Parallel lane already read the file + uploaded it + OCR'd it; the
-            # pages-per-call prepass already OCR'd it (ocr_ready) but the file
-            # still needs its own upload here.
-            storage_url = pre.get("storage_url")
-            parsed = pre.get("parsed")
-            candidates = pre.get("candidates")
-            if storage_url is None and pre.get("ocr_ready"):
-                with open(item.file_path, "rb") as fh:
-                    raw = fh.read()
-                phase = "Supabase upload"
-                file_event("uploading", "Uploading to Supabase Storage")
-                storage_url = upload_file(cfg, item.source_id, raw,
-                                          item.mime_type, on_problem=on_problem)
-                check_stop("Supabase upload")
-            elif storage_url is None:          # the lane's upload failed
-                raise pre.get("error") or faults.FaultError(
-                    faults.fault("unknown"), "parallel lane produced no upload")
-        else:
+        parsed = pre.get("parsed") if pre is not None else None
+        candidates = pre.get("candidates") if pre is not None else None
+        pages_data = pre.get("pages") if pre is not None else None
+        if pre is not None and parsed is None:
+            raise pre.get("error") or faults.FaultError(
+                faults.fault("unknown"), "parallel lane produced no OCR")
+
+        # 1) Render the pages locally — one image per PDF page, so a bbox is
+        # always measured in the frame of the page it came from.
+        if pages_data is None:
             with open(item.file_path, "rb") as fh:
                 raw = fh.read()
-            data_b64 = base64.b64encode(raw).decode()
+            phase = "page render"
+            file_event("preparing", "Rendering pages locally")
+            pages_data = stage.page_images(raw, item.mime_type,
+                                           cfg.ocr_pages_per_call or None)
+            check_stop("page render")
 
-            # 1) Upload to Supabase storage (object name = source_id).
-            phase = "Supabase upload"
-            file_event("uploading", "Uploading to Supabase Storage")
-            storage_url = upload_file(cfg, item.source_id, raw, item.mime_type,
-                                      on_problem=on_problem)
-            check_stop("Supabase upload")
-
-        # 2) Upsert the sources row.
-        phase = "source upsert"
-        file_event("saving", "Storing source row")
-        if try_db({"op": "upsert_source", "item": asdict(item), "storage_url": storage_url},
-                  lambda: db.upsert_source(item, storage_url), "source upsert"):
-            log("info", f"  ↳ source {item.source_id[:12]}… stored")
-
-        if item.type == "سوال":
-            # ---------- QUESTION BRANCH ----------
+        if parsed is None:
+            # 2) OCR. Page runs already read the file in one call (prefetch);
+            # one image per page keeps each call small and each bbox true.
             phase = "OCR"
-            file_event("ocr", f"{ocr_label} is extracting questions")
-            check_stop("source upsert")
-            if pre is not None:
-                if parsed is None:             # the lane's OCR failed
-                    raise pre.get("error") or faults.FaultError(
-                        faults.fault("unknown"), "parallel lane produced no OCR")
+            file_event("ocr", f"{ocr_label} is extracting {branch.lower()}s")
+            if item.type == "سوال":
+                parsed = _ocr_pages(cfg, item, pages_data, questions=True,
+                                    on_problem=on_problem, on_route=on_route)
             else:
-                parsed = _call_ocr(cfg, question_prompt(), data_b64, item.mime_type,
-                                   on_problem=on_problem, on_route=on_route)
-            check_stop("gemini-ocr")
-            rows = build_question_rows(item, parsed, storage_url)
-            if rows:
-                phase = "Postgres save"
-                file_event("saving", f"Inserting {len(rows)} question(s)")
-                if try_db({"op": "upsert_questions", "rows": rows},
-                          lambda: db.upsert_questions(rows), "question save"):
-                    bump("questions", len(rows))
-                    log("success", f"  ↳ saved {len(rows)} question(s)")
-            else:
-                log("warn", f"  ↳ Gemini found no questions in {item.file_name}")
+                phase = "candidate read"
+                file_event("ocr", "Reading the question bank")
+                candidates = stage.candidate_questions(
+                    store, db, item.subject, item.topic, item.grade)
+                phase = "OCR"
+                parsed = _ocr_pages(cfg, item, pages_data, questions=False,
+                                    candidates=candidates,
+                                    on_problem=on_problem, on_route=on_route)
+            check_stop("OCR")
+
+        # 3) Stage locally. This is the only write this file performs.
+        phase = "staging"
+        file_event("saving", "Staging the result locally")
+        staged = stage.stage_file(store, item, parsed, pages_data=pages_data,
+                                  candidates=candidates, db=db)
+        check_stop("staging")
+
+        if staged.question_ids and item.type == "سوال":
+            bump("questions", len(staged.question_ids))
+        if staged.answer_ids:
+            bump("answers", len(staged.answer_ids))
+        # Inspect is a LIVE surface: each file that lands announces its new
+        # row counts, so the tab updates the moment the store does instead of
+        # only on the next visit. Same hub, same push path as `stats`.
+        hub.emit({"type": "staged", "id": item.source_id,
+                  "questions": len(staged.question_ids),
+                  "answers": len(staged.answer_ids),
+                  "crops": staged.crop_files, "pages": staged.pages,
+                  "empty": bool(staged.empty_records)})
+        if staged.empty_records:
+            names = ", ".join(sorted({kind for kind, _ in staged.empty_records}))
+            log("warn", f"  ↳ nothing was read from {item.file_name} "
+                        f"(staged as empty: {names}) — it needs a look in Inspect",
+                "empty_text")
         else:
-            # ---------- ANSWER BRANCH ----------
-            phase = "DB context read"
-            file_event("ocr", "Fetching related questions from DB")
-            if pre is None or candidates is None:
-                # the pages-per-call prepass carries the OCR but not the bank
-                candidates = db.fetch_context_questions(item.subject, item.topic,
-                                                        item.grade)
-                if pre is None:
-                    prompt = build_answer_prompt(candidates)
+            log("success", f"  ↳ staged {len(staged.question_ids)} question(s), "
+                           f"{len(staged.answer_ids)} answer(s) · "
+                           f"{staged.crop_files} crop(s) · {staged.pages} page(s)")
 
-            phase = "OCR"
-            file_event("ocr", f"{ocr_label} is extracting answers")
-            check_stop("DB context read")
-            if pre is not None:
-                if parsed is None:             # the lane's OCR failed
-                    raise pre.get("error") or faults.FaultError(
-                        faults.fault("unknown"), "parallel lane produced no OCR")
-            else:
-                parsed = _call_ocr(cfg, prompt, data_b64, item.mime_type,
-                                   on_problem=on_problem, on_route=on_route)
-            check_stop("gemini-ocr")
-
-            prepared = prepare_answer_rows(parsed)
-            rows = finalize_answer_rows(item, prepared, candidates)
-            if rows:
-                phase = "Postgres save"
-                file_event("saving", f"Inserting {len(rows)} answer(s)")
-                if try_db({"op": "upsert_answers", "rows": rows},
-                          lambda: db.upsert_answers(rows), "answer save"):
-                    bump("answers", len(rows))
-                    log("success", f"  ↳ saved {len(rows)} answer(s)")
-            else:
-                log("warn", f"  ↳ Gemini found no answers in {item.file_name}")
-
-        # 3) Move the original file into 'done' (Loop On Success). A file with
-        # parked writes is archived too: the Gemini result is safe on disk in
-        # the cache, so re-running OCR for it would only burn quota.
+        # 4) Archive the source. Staging is the durable artifact now, so even
+        # an empty extraction is archived — re-running OCR would only burn
+        # quota, and the empty row is what the human needs to see.
         phase = "archiving to done/"
-        check_stop("Postgres save")
         _move_to_done(item.file_path)
-        if parked_steps:
-            deferrals.park(parked_steps, item=item)
-            bump("deferred")
-            bump("processed")
-            file_event("cached", f"{len(parked_steps)} write(s) parked — "
-                                 "import at end of run")
-            return "deferred"
-        file_event("done", "Completed")
+        if staged.empty_records:
+            # The final word stays "empty": a later "done" would hide the
+            # one row a human has to look at.
+            file_event("empty", "Staged as empty - awaiting review in Inspect")
+        else:
+            file_event("done", "Staged - awaiting review in Inspect")
         bump("processed")
-        return "clean"
+        return "empty" if staged.empty_records else "clean"
 
     except _Stopped:
         # A manual stop is not an error: the file stays for the next run.
@@ -966,10 +876,268 @@ def _process_item(hub: Hub, cfg: Config, db: Database, item, index, total,
             # The router has no key×model pair left — every later file would
             # fail the same way, so tell the loop to stop (Q4).
             return "blocked"
-        # A store-group fault (DB or Supabase) feeds the circuit breaker too.
-        return "store_failed" if flt.get("group") == "store" else "failed"
+        # A store-group fault feeds the breaker too. Since P3 the "store" is
+        # the LOCAL staging disk: an unreadable image, an unwritable staging
+        # store or a closed store is the new "database is down" - stop the run
+        # rather than burn OCR calls on results that cannot be kept.
+        if flt.get("group") == "store" or isinstance(
+                exc, (OSError, sqlite3.Error, ValueError)):
+            return "store_failed"
+        return "failed"
+
+# ── pages per call, ACROSS FILES ───────────────────────────────────────────
+# The converter splits one paper into <base>-1.jpg, <base>-2.jpg, ... so a
+# folder of 84 scans is 84 FILES of ONE paper. "Pages / call" has to group
+# those files, or it can never do anything: a file that holds a single image
+# cannot batch inside itself. A run never crosses a folder, a type or a paper,
+# and the files sort as -1, -10, -2, so a run is collected by base name and
+# only then put back in reading order. Every page still gets its own source
+# row, its own staged rows and its own archive move.
+_PAGE_SUFFIX = re.compile(r"^(?P<base>.+)-(?P<page>\d+)$")
 
 
+def _page_of(item):
+    """(paper base name, page number) from a file name, or (None, None)."""
+    stem = os.path.splitext(item.file_name or "")[0]
+    match = _PAGE_SUFFIX.match(stem)
+    if not match:
+        return None, None
+    return match.group("base"), int(match.group("page"))
+
+
+def _page_key(item):
+    """The run a page belongs to — None for anything that is not a page image."""
+    base, _page = _page_of(item)
+    if base is None or not (item.mime_type or "").lower().startswith("image/"):
+        return None
+    return (os.path.dirname(item.file_path or "").lower(), item.type, base)
+
+
+def page_runs(items, per_call):
+    """Split the queue into runs of CONSECUTIVE page images of one paper.
+
+    Contiguity matters: a run is put back in reading order, so grouping page 20
+    with page 2 would hand the model an out-of-sequence pair. A page number
+    that does not continue the current run starts a new one."""
+    if per_call <= 1:
+        return [[item] for item in items]
+    runs, current, key, last_page = [], [], None, None
+    for item in items:
+        item_key = _page_key(item)
+        if item_key is None:
+            if current:
+                runs.append(current)
+            current, key, last_page = [], None, None
+            runs.append([item])
+            continue
+        page = _page_of(item)[1]
+        if current and (item_key != key or len(current) >= per_call
+                        or page != last_page + 1):
+            runs.append(current)
+            current = []
+        if not current:
+            key = item_key
+        current.append(item)
+        last_page = page
+    if current:
+        runs.append(current)
+    return [sorted(run, key=lambda it: _page_of(it)[1]) for run in runs]
+
+
+def _page_ocr_prepass(hub, cfg, db, items, per_call, log):
+    """OCR each run of page images in ONE call -> {source_id: pre}.
+
+    Each file is handed back its own slice of the reply as a `pre` dict —
+    ``{"parsed": {questions|answers: [...], "page": n}, "candidates": ...}`` —
+    which `_process_item` already accepts from the parallel lanes. The file's
+    own pages are still rendered and staged normally, so bbox frames stay
+    true.
+
+    Errors are swallowed on purpose: a batch that fails only costs one wasted
+    call, and its files then take the normal one-picture path with the usual
+    fault reporting, blocking and retry behaviour."""
+    runs = [run for run in page_runs(items, per_call) if len(run) > 1]
+    if not runs:
+        return {}
+    covered = sum(len(run) for run in runs)
+    log("info", f"Pages per call: {per_call} — {len(runs)} batch(es) for "
+                f"{covered} of {len(items)} file(s)")
+    prefetched = {}
+    for run in runs:
+        if hub is not None and hub.stop_flag.is_set():
+            break
+        pages = [_page_of(item)[1] for item in run]
+        blobs, labels, inline = [], [], []
+        for item in run:
+            try:
+                with open(item.file_path, "rb") as fh:
+                    raw = fh.read()
+            except OSError:
+                blobs = []
+                break
+            inline.append((item, raw))
+            labels.append("PAGE %d:" % (_page_of(item)[1]))
+            blobs.append(base64.b64encode(raw).decode())
+        if blobs:
+            # The page index is the LABEL's business; the files come from
+            # `inline`, which keeps each item beside its own bytes.
+            pages = [_page_of(item)[1] for item in run]
+        if not blobs:
+            log("warn", f"  ↳ page batch {pages} skipped — a page file could "
+                        "not be read")
+            continue
+        is_question = run[0].type == "سوال"
+        field = "questions" if is_question else "answers"
+        candidates = None
+        try:
+            if is_question:
+                parsed = _call_ocr(cfg, pages_prompt(), blobs,
+                                   run[0].mime_type, labels=labels)
+            else:
+                candidates = db.fetch_context_questions(
+                    run[0].subject, run[0].topic, run[0].grade)
+                parsed = _call_ocr(
+                    cfg, build_answer_prompt(candidates, pages=len(run)),
+                    blobs, run[0].mime_type, labels=labels)
+            split = split_pages(parsed, pages, key=field)
+            # A model that ignores the page schema hands back rows we cannot
+            # attribute: every page reads empty. Staging that would file page
+            # 4's rows on page 3's source and archive page 4 with nothing —
+            # wrong data that looks like success. The batch is dropped here
+            # instead, so each file of the run takes its own call (below) and
+            # every row lands on the page it was printed on.
+            empty = [p for p in pages if not (split.get(p) or {}).get(field)]
+            if len(empty) == len(pages):
+                log("warn", f"  ↳ page batch {pages} could not be attributed "
+                            "to its pages — reading each page on its own "
+                            "instead", "bad_page_label")
+                continue
+            if len(empty) * 2 > len(pages):
+                # A real page can be blank, so a stray blank page is fine; a
+                # majority blank means the reply is not trustworthy, and the
+                # per-file calls below are the safe answer there too.
+                log("warn", f"  ↳ page batch {pages} left page(s) {empty} "
+                            "blank — reading each page on its own instead",
+                    "bad_page_label")
+                continue
+        except Exception as exc:               # noqa: BLE001 - never fatal
+            flt = getattr(exc, "fault", None) or faults.classify(exc)
+            log("warn", f"  ↳ page batch {pages} failed ({flt['label']}) — each "
+                        "page takes its own call instead", flt.get("kind"))
+            continue
+        found = 0
+        landed = 0
+        for item, page in zip(run, pages):
+            # The FILE's own image is the frame: staging mirrors it as page 1
+            # of that source, whatever page of the paper it is. So the rows
+            # are handed over without the paper page number — the index is
+            # the log line's business, not the staged frame's.
+            entry = dict(split.get(page) or {field: []})
+            prefetched[item.source_id] = {"parsed": entry,
+                                          "candidates": candidates}
+            if entry.get(field):
+                landed += 1
+            found += len(entry.get(field) or [])
+        log("info", f"  ↳ pages {pages[0]}-{pages[-1]} read in one call "
+                    f"({found} {field} on {landed} of {len(pages)} page(s))")
+    return prefetched
+
+
+def _page_batches(pages_data, pages_per_call):
+    """Split ``[(page_no, jpeg)]`` into consecutive OCR-call windows.
+
+    ``pages_per_call`` is the toolbar's "Pages / call" (`OCR_PAGES_PER_CALL`):
+    N=1 is one picture per request; N=2..8 puts that many page images of ONE
+    paper into a single request. Windows never straddle a gap in page numbers,
+    so a batch always describes a contiguous run of pages."""
+    size = max(1, int(pages_per_call or 1))
+    window = []
+    for page_no, data in pages_data:
+        if window and (len(window) >= size
+                       or page_no != window[-1][0] + 1):
+            yield window
+            window = []
+        window.append((page_no, data))
+    if window:
+        yield window
+
+
+def _ocr_pages(cfg, item, pages_data, *, questions, candidates=None,
+               on_problem=None, on_route=None, key_pin=None):
+    """OCR the rendered pages of one file in "Pages / call" batches.
+
+    A batch of N>1 pages rides ONE request: the page images are sent with a
+    ``PAGE n:`` label before each, under the pages prompt, which asks for the
+    reply grouped per page. ``questions.split_pages`` then puts every entry
+    back on the page it was printed on, so each row keeps a ``page`` and every
+    ``diagram_bbox`` stays in the frame of its own page.
+
+    A single-page batch keeps the classic one-picture prompt and shape."""
+    merged, key = {}, "questions" if questions else "answers"
+    merged[key] = []
+    pages_per_call = max(1, int(getattr(cfg, "ocr_pages_per_call", 1) or 1))
+    batches = list(_page_batches(pages_data, pages_per_call))
+
+    def absorb(parsed, pages):
+        """Fold one parsed reply into `merged`, attributing it to its pages."""
+        if not isinstance(parsed, dict):
+            return
+        if len(pages) == 1:
+            # One page in the request. The page prompt asks such a call to
+            # answer under the same "pages" container as a batch, so read the
+            # reply both ways: the classic flat shape and the page dict.
+            block = parsed
+            if not isinstance(parsed.get(key), list):
+                for page_block in split_pages(parsed, pages, key=key).values():
+                    if isinstance(page_block.get(key), list):
+                        block = page_block
+                        break
+            by_page = {pages[0]: block}
+        else:
+            by_page = split_pages(parsed, pages, key=key)
+            # A small model sometimes answers a whole batch flat instead of
+            # grouping it under "pages". split_pages cannot attribute those
+            # rows, so it returns every page empty and the batch would be
+            # lost. Keeping the reply beats dropping it: the rows carry no
+            # reliable page, so their bbox stays untrustworthy and they land
+            # on the batch's first page for a human in Inspect to place.
+            if all(not (by_page.get(p) or {}).get(key) for p in pages):
+                flat = parsed.get(key)
+                if isinstance(flat, list) and any(
+                        isinstance(e, dict) for e in flat):
+                    by_page = {pages[0]: parsed}
+        for page_no in pages:
+            block = by_page.get(page_no) or {}
+            entries = block.get(key)
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        entry.setdefault("page", page_no)
+                        merged[key].append(entry)
+            for field, value in block.items():
+                if field != key and value not in (None, "", []):
+                    merged[field] = value
+
+    for batch in batches:
+        page_nos = [page_no for page_no, _ in batch]
+        if len(batch) == 1:
+            prompt = question_prompt() if questions else build_answer_prompt(
+                candidates)
+            blobs = stage.b64(batch[0][1])
+            labels = None
+        else:
+            prompt = (pages_prompt() if questions
+                      else build_answer_prompt(candidates, pages=len(batch)))
+            blobs = [stage.b64(data) for _page_no, data in batch]
+            labels = [f"PAGE {page_no}:" for page_no in page_nos]
+        parsed = _call_ocr(cfg, prompt, blobs, "image/jpeg",
+                           on_problem=on_problem, on_route=on_route,
+                           labels=labels, key_pin=key_pin)
+        absorb(parsed, page_nos)
+
+    merged["pages_read"] = len(pages_data)
+    merged["ocr_calls"] = len(batches)
+    return merged
 def blocked_remaining(total, index):
     """Files the run did not process when it stopped at `index` (1-based):
     the failing file itself plus the rest of the queue."""

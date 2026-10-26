@@ -18,10 +18,11 @@ from . import faults
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LIST_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
-# The plain HTTP(S)/SOCKS tunnel for Google-bound calls only. Set by the
-# runner / server when the pipeline tab saves a proxy profile; kept here
-# (not in the router) so OCR, health checks and gateway probes ride the
-# same lane. Local providers and Supabase/Postgres never see it.
+# The plain HTTP(S)/SOCKS tunnel for outbound calls. Set by the runner /
+# server when the pipeline tab saves a proxy profile; kept here (not in the
+# router) so OCR, health checks and gateway probes ride the same lane.
+# Supabase storage rides it too (pipeline/storage.proxies_for) because the
+# storage host is exit-blocked here; Postgres and local providers never do.
 _proxy_url = {"url": ""}
 
 
@@ -217,6 +218,7 @@ def gateway_probe(timeout=(8, 12)):
         body = resp.json()
         google = isinstance(body, dict) and ("error" in body or "models" in body)
     except ValueError:
+        body = None
         google = False
     if not google:
         # A keyless GET is refused by Google's own HTML error template too
@@ -240,8 +242,12 @@ def gateway_probe(timeout=(8, 12)):
     if resp.status_code >= 500:
         return {"reachable": True, "google_err": True, "kind": "overload",
                 "detail": f"Google itself answered HTTP {resp.status_code}"}
-    return {"reachable": True, "google_err": False,
-            "kind": "ok" if resp.status_code < 400 else "refused",
+    kind = "ok" if resp.status_code < 400 else "refused"
+    if resp.status_code in (400, 403) and body is None:
+        # Its own HTML page instead of the API's JSON about the missing key:
+        # the edge refused the route, before any key could be looked at.
+        kind = "edge_block"
+    return {"reachable": True, "google_err": False, "kind": kind,
             "detail": f"googleapis.com answered HTTP {resp.status_code}"}
 
 

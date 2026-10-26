@@ -1,4 +1,4 @@
-﻿"""Key × model routing for Gemini, built to spend the fewest possible calls.
+"""Key × model routing for Gemini, built to spend the fewest possible calls.
 
 The production problem
 ----------------------
@@ -54,7 +54,8 @@ from .gemini import call_gemini, gateway_probe, list_models
 
 # A key Google said is dead/finished is worth re-testing only rarely —
 # quota resets are daily and revocations are permanent.
-KEY_COOLDOWN = {"bad_key": 900, "quota": 3600, "geo_block": 300}
+KEY_COOLDOWN = {"bad_key": 900, "quota": 3600, "geo_block": 300,
+                "edge_block": 120}
 # 429s are per-minute windows; a short cooldown clears them.
 RATE_LIMIT_COOLDOWN = 75
 # Model not available for this key: retried on the next day boundary, or
@@ -65,7 +66,7 @@ MODEL_COOLDOWN = 6 * 3600
 # GEMINI_MODEL_DAY_LIMIT in .env tunes the shared cap.
 DAY_LIMIT_DEFAULT = 20
 # Models whose own RPD differs from the shared cap. flash-lite is the cheap
-# 500/day rung the studio tests against; GEMINI_MODEL_DAY_LIMITS
+# 500/day rung the historical tests used; GEMINI_MODEL_DAY_LIMITS
 # ("model:limit,model:limit") overrides this table without a code change.
 MODEL_DAY_LIMITS = {"gemini-3.5-flash-lite": 500}
 
@@ -163,7 +164,7 @@ MODEL_LEVEL_ROTATIONS = {"quota", "model_unavailable", "geo_block"}
 # Faults that mean "the whole path is the problem" → abort, rotating only
 # multiplies the timeout we already waited.
 GLOBAL_KINDS = {"tunnel_down", "send_blocked", "recv_dropped", "overload",
-                "db_down", "storage_fail", "local_io"}
+                "db_down", "storage_fail", "local_io", "edge_block"}
 # Quality hiccups: worth one more model in the same call, but not cached.
 MODEL_RETRY_KINDS = {"model_empty", "model_garbage"}
 
@@ -172,6 +173,7 @@ MODEL_RETRY_KINDS = {"model_empty", "model_garbage"}
 FAULT_CAUSE = {
     "tunnel_down": "tunnel", "send_blocked": "tunnel", "recv_dropped": "tunnel",
     "overload": "google", "bad_key": "auth", "geo_block": "region",
+    "edge_block": "region",
     "quota": "quota", "rate_limit": "rate",
     "model_unavailable": "model", "model_empty": "model",
     "model_garbage": "model", "db_down": "storage", "storage_fail": "storage",
@@ -436,9 +438,9 @@ class GeminiRouter:
                     "ms": round(float(ms or 0.0), 1),
                     "ok": bool(ok),
                     # Which surface made the call: "pipeline" (OCR runs),
-                    # "studio" (any studio stage), "9router" (custom lane).
-                    # The Usage tab shows it, so studio calls are readable
-                    # as studio calls instead of anonymous pool rows.
+                    # "inspect" (the staged OCR lane), "9router" (custom lane).
+                    # The Usage tab shows it, so staged calls are readable
+                    # as staged calls instead of anonymous pool rows.
                     "source": source or "pipeline",
                 })
                 del rows[:-CALLS_CAP]
@@ -462,9 +464,9 @@ class GeminiRouter:
             rows = [r for r in rows if r.get("ts", 0) >= cutoff]
         # 9router is the PIPELINE's routing helper, not a model-usage series —
         # keep those rows out of BOTH the chart and the table (item 4.2). A
-        # STUDIO call through its own 9router provider is real studio usage
-        # (that is the studio's default lane), so dropping by key_name alone is
-        # what made the Usage tab look empty after a studio run.
+        # call through its own 9router provider is real OCR usage (that is the
+        # OCR default lane), so dropping by key_name alone is what made the
+        # Usage tab look empty after an OCR run.
         rows = [r for r in rows
                 if not ((r.get("key_name") or "") == "9router"
                         and (r.get("source") or "pipeline") == "pipeline")]
@@ -474,7 +476,7 @@ class GeminiRouter:
                   "tokens_out": sum(r.get("tokens_out", 0) for r in rows),
                   "ms": round(sum(r.get("ms", 0.0) for r in rows), 1),
                   # Per-surface split: the pipeline's own calls next to the
-                  # studio's, so "did the studio run show up?" is answerable
+                  # OCR run, so "did the OCR run show up?" is answerable
                   # at a glance instead of by eye over the table.
                   "by_source": {}}
         for row in rows:
@@ -610,8 +612,10 @@ class GeminiRouter:
                 st["dead"] = True
                 st["unavailable_until"] = now + RATE_LIMIT_COOLDOWN
                 st["penalty_until"] = now + PENALTY_WINDOW
-            elif kind in ("bad_key", "quota", "geo_block"):
+            elif kind in ("bad_key", "quota", "geo_block", "edge_block"):
                 st["dead"] = True
+                # A route block is not the key's verdict: a short park only, so
+                # a restored tunnel makes the pool usable again without a restart.
                 st["unavailable_until"] = now + KEY_COOLDOWN.get(kind, 900)
                 st["penalty_until"] = now + PENALTY_WINDOW
 
@@ -975,7 +979,7 @@ class GeminiRouter:
         except faults.FaultError as exc:
             flt = exc.fault
             kind = flt["kind"]
-            if kind in ROTATE_KINDS or kind == "geo_block":
+            if kind in ROTATE_KINDS or kind == "edge_block":
                 self._mark(key, kind, now=now)
             else:
                 # A blip on the path says nothing about the key — never put
@@ -990,8 +994,11 @@ class GeminiRouter:
                 row["ok_model"] = st.get("ok_model", "")
             if kind in ("bad_key", "quota"):
                 row["status"] = "dead"
-            elif kind == "geo_block":
+            elif kind in ("geo_block", "edge_block"):
+                # The route was refused before the key was looked at: the key
+                # itself is unjudged, so its row must not read as dead.
                 row["status"] = "blocked"
+                row["key_unjudged"] = True
             else:
                 row["status"] = "unreachable"
             row["fault"] = self._fault_brief(flt)

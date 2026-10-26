@@ -1,4 +1,4 @@
-"""Offline tests for the parallel OCR engine (no network, no database).
+﻿"""Offline tests for the parallel OCR engine (no network, no database).
 
 Covers the round-based, key-pinned dispatch (Q1=A), the global file-order
 import (Q2=B), the per-file "blocked" fallback (Q3=B), and the router's
@@ -233,7 +233,8 @@ class LaneEventTests(unittest.TestCase):
         events = []
         hub = SimpleNamespace(emit=events.append)
         item = self._item(tmp)
-        with mock.patch.object(runner, "upload_file", lambda *a, **k: "url"), \
+        with mock.patch.object(runner.stage, "page_images",
+                               lambda *a, **k: [(1, b"jpeg")]), \
              mock.patch.object(runner, "_call_ocr", fake_ocr):
             bundles = runner._produce_round(self._cfg(), None,
                                             [(0, item, self.KEY)], hub=hub)
@@ -241,7 +242,7 @@ class LaneEventTests(unittest.TestCase):
 
     def test_produce_round_emits_lane_start_route_and_done(self):
         def fake_ocr(cfg, prompt, data_b64, mime_type, on_problem=None,
-                     on_route=None, key_pin=None):
+                     on_route=None, key_pin=None, labels=None):
             if on_route:
                 on_route("label", "masked", "gemini-3.5-flash", 1)
             return {"q": 1}
@@ -253,7 +254,7 @@ class LaneEventTests(unittest.TestCase):
         self.assertEqual([e["state"] for e in events],
                          ["start", "start", "route", "done"])
         self.assertEqual([e["phase"] for e in events],
-                         ["uploading", "ocr", "ocr", "importing"])
+                         ["ocr", "ocr", "ocr", "staging"])
         self.assertEqual(events[0]["key"], 0)                 # pool index
         self.assertEqual(events[0]["index"], 1)
         self.assertEqual(events[2]["model"], "gemini-3.5-flash")
@@ -273,7 +274,7 @@ class LaneEventTests(unittest.TestCase):
 
     def test_lane_events_carry_no_raw_key(self):
         def fake_ocr(cfg, prompt, data_b64, mime_type, on_problem=None,
-                     on_route=None, key_pin=None):
+                     on_route=None, key_pin=None, labels=None):
             if on_route:
                 on_route("l", "m", "gemini-3.5-flash", 1)
             return {"q": 1}
@@ -287,7 +288,7 @@ class LaneEventTests(unittest.TestCase):
         phase, and the callback tolerates the 4-arg call shape used by
         storage/vision (no `where` positional)."""
         def fake_ocr(cfg, prompt, data_b64, mime_type, on_problem=None,
-                     on_route=None, key_pin=None):
+                     on_route=None, key_pin=None, labels=None):
             if on_problem:
                 on_problem("gemini-3.5-flash", 2, 3, 12)     # 4 args
             return {"q": 1}
@@ -302,7 +303,7 @@ class LaneEventTests(unittest.TestCase):
         """C4 (item 1.4): the wait lane event carries `until`/`total` so the
         dashboard can draw an exact countdown ring."""
         def fake_ocr(cfg, prompt, data_b64, mime_type, on_problem=None,
-                     on_route=None, key_pin=None):
+                     on_route=None, key_pin=None, labels=None):
             if on_problem:
                 on_problem("gemini-3.5-flash", 2, 3, 12)
             return {"q": 1}
@@ -413,7 +414,7 @@ class ImportTerminalLaneTests(unittest.TestCase):
         lanes = [e for e in events if e.get("type") == "lane"]
         self.assertEqual(len(lanes), 5)                       # one per bundle
         self.assertTrue(all(e["state"] == "done" for e in lanes))
-        self.assertTrue(all(e["phase"] == "imported" for e in lanes))
+        self.assertTrue(all(e["phase"] == "staged" for e in lanes))
         rounds = [e for e in events if e.get("type") == "round"]
         self.assertEqual([e["no"] for e in rounds], [1, 2, 3])  # mechanics intact
 
@@ -422,7 +423,7 @@ class ImportTerminalLaneTests(unittest.TestCase):
         lanes = [e for e in events if e.get("type") == "lane"]
         self.assertTrue(lanes)
         self.assertTrue(all(e["state"] == "failed" for e in lanes))
-        self.assertTrue(all(e["phase"] == "not imported" for e in lanes))
+        self.assertTrue(all(e["phase"] == "not staged" for e in lanes))
 
 
 class PerLaneImportTests(unittest.TestCase):
@@ -444,7 +445,7 @@ class PerLaneImportTests(unittest.TestCase):
             trace.append("produce_returned")   # only AFTER both lanes imported
             return bundles
 
-        def fake_process(hub, cfg, db, item, index, total, pre=None):
+        def fake_process(hub, cfg, db, item, index, total, pre=None, store=None):
             trace.append("import_%d" % index)
             return "clean"
 

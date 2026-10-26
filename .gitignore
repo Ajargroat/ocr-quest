@@ -33,6 +33,13 @@ konkour-ocr/
 # Plain files on purpose (the studio's inspectable bulk), local working data.
 workspace/
 
+# Local staged-import store (SQLite) + the page/crop assets it references —
+# local working data, regenerable from the folder tree, never committed
+staging/
+
+# Run logs written by tools/ocr.ps1 — machine-local, never committed
+logs/
+
 # scratch log kept open by the detached test server
 tools/_srv.log
 

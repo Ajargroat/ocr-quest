@@ -3,7 +3,7 @@
 No database and no network: every test stubs the ``_execute`` seam, so they pin
 the SQL text and the bound parameters a real run would send. The schema is the
 five-table core (sources/questions/answers/revision_reports/revision_summary);
-pipeline/studio/consolidate.sql states it (pinned by tests/test_consolidate.py).
+pipeline/migrations/consolidate.sql states it (pinned by tests/test_consolidate.py).
 
 Run them either way:
     python tests/test_db_model.py
