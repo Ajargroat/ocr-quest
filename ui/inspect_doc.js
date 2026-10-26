@@ -34,10 +34,134 @@ const InspDoc = (() => {
   /* a pipe-table cell may carry math; the same inline pass renders it */
   const cellHtml = text => (text ? inlineHtml(text) : '<br>');
 
+  /* The OCR drops the `$` around a formula as often as it keeps it: a choice
+     arrives as bare `\frac{1}{۳}`. A command ("\frac") or a script ("q_3")
+     marks the start of maths; the run grows over its Latin/digits/operators
+     and brace groups until prose (Persian letters) starts again — the same
+     rule the dashboard's renderer applies (ui/app.js: fenceBareTex). */
+  const fenceBareTex = s => {
+    if (!s) return s;
+    /* delimited maths is already a chip: leave it for inlineHtml */
+    const mine = /\$\$[\s\S]*?\$\$|\$[^$\n]*\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]/g;
+    const parts = [];
+    let last = 0, m;
+    while ((m = mine.exec(s))){
+      parts.push({text: s.slice(last, m.index), fenced: false},
+                 {text: m[0], fenced: true});
+      last = m.index + m[0].length;
+    }
+    parts.push({text: s.slice(last), fenced: false});
+
+    const persian = /[\u0600-\u06FF\u0750-\u077F]/;
+    const word = /[A-Za-z0-9\u06F0-\u06F9\u0660-\u0669]/;
+    const punct = '+-*/().,;:=[]~%\'!?_^';
+    const growLeft = (text, end) => {
+      let pos = end;
+      for (;;){
+        let j = pos;
+        while (j > 0 && (text[j - 1] === ' ' || text[j - 1] === '\t')) j--;
+        if (j === 0) break;
+        const ch = text[j - 1];
+        if (ch === '}'){
+          let depth = 0, k = j - 1;
+          for (; k >= 0; k--){
+            if (text[k] === '}') depth++;
+            else if (text[k] === '{'){ depth--; if (!depth) break; }
+          }
+          if (k < 0) break;
+          let start = k;
+          const cmd = text.slice(0, k).match(/\\[A-Za-z]+$/);
+          if (cmd) start = k - cmd[0].length;
+          pos = start;
+          continue;
+        }
+        if (ch === '\\'){
+          const cmd = text.slice(0, j).match(/\\[A-Za-z]+$/);
+          if (!cmd) break;
+          pos = j - cmd[0].length;
+          continue;
+        }
+        if (word.test(ch)){
+          let k = j;
+          while (k > 0 && word.test(text[k - 1])) k--;
+          pos = k;
+          continue;
+        }
+        if (punct.indexOf(ch) !== -1){
+          const prev = text[j - 2];
+          if ((ch === '.' || ch === ',' || ch === ';' || ch === ':')
+              && prev && persian.test(prev)) break;
+          pos = j - 1;
+          continue;
+        }
+        break;
+      }
+      return pos;
+    };
+    const growRight = (text, start) => {
+      let pos = start;
+      for (;;){
+        let j = pos;
+        while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++;
+        if (j >= text.length) break;
+        const ch = text[j];
+        if (ch === '{'){
+          let depth = 0, k = j;
+          for (; k < text.length; k++){
+            if (text[k] === '{') depth++;
+            else if (text[k] === '}'){ depth--; if (!depth) break; }
+          }
+          if (k >= text.length) break;
+          pos = k + 1;
+          continue;
+        }
+        if (ch === '\\'){
+          const cmd = text.slice(j).match(/^\\[A-Za-z]+/);
+          if (!cmd) break;
+          pos = j + cmd[0].length;
+          continue;
+        }
+        if (word.test(ch)){
+          let k = j;
+          while (k < text.length && word.test(text[k])) k++;
+          pos = k;
+          continue;
+        }
+        if (punct.indexOf(ch) !== -1){
+          const next = text[j + 1];
+          if ((ch === '.' || ch === ',' || ch === ';' || ch === ':')
+              && next && persian.test(next)) break;
+          pos = j + 1;
+          continue;
+        }
+        break;
+      }
+      return pos;
+    };
+    const plain = text => {
+      if (text.indexOf('\\') === -1 && text.indexOf('_') === -1
+          && text.indexOf('^') === -1) return text;
+      const strong = /\\[A-Za-z]+|[_^]\{(?:[^{}]|\{[^{}]*\})*\}|[_^][A-Za-z0-9]/g;
+      let out = '', cursor = 0, hit;
+      while ((hit = strong.exec(text))){
+        if (hit.index < cursor) continue;
+        let start = growLeft(text, hit.index);
+        const end = growRight(text, hit.index + hit[0].length);
+        if (start < cursor) start = cursor;
+        if (end <= start) continue;
+        out += text.slice(cursor, start) + '$' + text.slice(start, end) + '$';
+        cursor = end;
+        strong.lastIndex = end;
+      }
+      return out + text.slice(cursor);
+    };
+    return parts.map(p => p.fenced ? p.text : plain(p.text)).join('');
+  };
+
   /* `$$...$$`, `$...$` and `\(..\)` -> chips, everything else -> escaped text
      with its newlines kept. */
   function inlineHtml(text){
-    const src = String(text == null ? '' : text);
+    const src = fenceBareTex(String(text == null ? '' : text));
     const math = /\$\$([\s\S]*?)\$\$|\$([^$\n]+?)\$|\\\(([\s\S]*?)\\\)/g;
     let out = '', last = 0, m;
     while ((m = math.exec(src))){
@@ -50,6 +174,16 @@ const InspDoc = (() => {
     }
     return out + esc(src.slice(last)).replace(/\n/g, '<br>');
   }
+
+  /* the same chip from inside the editor (a typed `$..$` becomes one) */
+  const chipSpan = (tex, display) => {
+    const span = document.createElement('span');
+    span.className = 'ins-math' + (display ? ' display' : '');
+    span.setAttribute('contenteditable', 'false');
+    span.setAttribute('data-tex', tex);
+    span.textContent = display ? `\\[${tex}\\]` : `\\(${tex}\\)`;
+    return span;
+  };
 
   function tableHtml(rows){
     const body = rows.map(cells =>
@@ -140,10 +274,57 @@ const InspDoc = (() => {
       .trim();
   }
 
-  /* ── the live editor ───────────────────────────────────────────── */
+  /* ── the live editor state ─────────────────────────────────────── */
   let editor = null;
   let typesetTimer = null;
   let onInput = null;
+  /* choice cells currently rendered in the page, so a tidy pass covers them */
+  let choiceCells = [];
+
+  /* ── choices ────────────────────────────────────────────────────
+     A choice is prose plus formulas, so its text reads exactly like the stem:
+     the same Markdown -> chip pass, typed into a contenteditable cell that
+     writes its Markdown back on every edit. One input event per row. */
+  function choiceHtml(MD){
+    const md = String(MD == null ? '' : MD);
+    if (!md.trim()) return '<p><br></p>';
+    return toHtml(md).split('<br>').map(line => `<p>${line || '<br>'}</p>`).join('');
+  }
+
+  function choiceText(cell){
+    if (!cell) return '';
+    return toText(cell)
+      .split('\n').map(line => line.trim()).filter(Boolean).join(' ');
+  }
+
+  function choiceInit(cell, onEdit){
+    if (cell && choiceCells.indexOf(cell) === -1) choiceCells.push(cell);
+    cell.addEventListener('input', () => {
+      markDirty();
+      if (typeof onEdit === 'function') onEdit(choiceText(cell));
+      scheduleTypeset(cell);
+    });
+    cell.addEventListener('paste', event => {
+      const data = event.clipboardData || window.clipboardData;
+      if (!data) return;
+      event.preventDefault();
+      const html = data.getData('text/html');
+      let md = data.getData('text/plain') || '';
+      if (html){
+        const box = document.createElement('div');
+        box.innerHTML = html;
+        md = toText(box) || md;
+      }
+      document.execCommand('insertHTML', false,
+        choiceHtml(md).replace(/^<p[^>]*>|<\/p>$/g, ''));
+      markDirty();
+      if (typeof onEdit === 'function') onEdit(choiceText(cell));
+      scheduleTypeset(cell);
+    });
+  }
+
+  /* ── the live editor ───────────────────────────────────────────── */
+  /* (a chip keeps its LaTeX in `data-tex`; refreshChip below re-<wbr>wraps it) */
 
   const selectionIn = () => {
     const sel = window.getSelection();
@@ -153,21 +334,72 @@ const InspDoc = (() => {
   };
 
   /* MathJax once the page settles: a chip re-typesets the moment its LaTeX
-     changes, and a burst of typing must not queue one pass per keystroke. */
-  function scheduleTypeset(){
+     changes, and a burst of typing must not queue one pass per keystroke.
+
+     Two passes, because MathJax's own startup sweep SKIPS anything inside a
+     `contenteditable` region (it treats it as text being typed), and so does a
+     second incantation on a container it already mapped. So:
+       1. at once: give every chip a fresh `math/tex` script MathJax has not
+          seen (`\\(tex\\)` / `\\[tex\\]`), and
+       2. ask for a typeset on that chip element itself — a fresh node is not
+          skipped — retrying until the CDN library is up. */
+  function scheduleTypeset(target){
     clearTimeout(typesetTimer);
     typesetTimer = setTimeout(() => {
-      if (!editor) return;
-      /* re-wrap a chip whose content was replaced: typing inside a chip is
-         turned back into a chip on the next pass */
-      editor.querySelectorAll('.ins-math[data-tex]').forEach(chip => {
-        const tex = chip.getAttribute('data-tex') || '';
-        const want = chip.classList.contains('display')
-          ? `\\[${tex}\\]` : `\\(${tex}\\)`;
-        if (chip.textContent !== want) chip.textContent = want;
+      const scopes = target ? [target] : [editor].concat(choiceCells);
+      scopes.forEach(scope => {
+        if (!scope || !scope.querySelectorAll) return;
+        scope.querySelectorAll('.ins-math[data-tex]').forEach(chip => {
+          refreshChip(chip);
+          typesetChip(chip);
+        });
       });
-      if (window.typesetMath) typesetMath(editor);
-    }, 260);
+    }, 120);
+  }
+
+  const chipScript = chip =>
+    chip.querySelector('script[type^="math/tex"]');
+
+  /* MathJax's output can outlive a plain `textContent` write (it also keeps an
+     `mjx-assistive-mml` sibling), so a redraw empties the chip explicitly. */
+  function clearChip(chip){
+    while (chip.firstChild) chip.removeChild(chip.firstChild);
+    chip._drawnTex = null;
+  }
+
+  /* A chip is `data-tex` + a TeX body in the delimiters MathJax reads. Whichever
+     state it is in, the body must match `data-tex`, and `_drawnTex` records what
+     MathJax actually drew:
+       - not drawn yet -> body is `\(tex\)` (or `\[tex\]` when display);
+       - drawn and unchanged -> left alone;
+       - drawn but `data-tex` moved on -> emptied so the new source goes in. */
+  function refreshChip(chip){
+    const tex = chip.getAttribute('data-tex') || '';
+    const display = chip.classList.contains('display');
+    const want = display ? `\\[${tex}\\]` : `\\(${tex}\\)`;
+    if (!!chip.querySelector('mjx-container')){
+      if (chip._drawnTex === tex) return;
+      clearChip(chip);
+    }
+    if (chip.textContent === want && chipScript(chip)) return;
+    if (chip.querySelector('mjx-container')) clearChip(chip);
+    chip.textContent = want;
+  }
+
+  /* one chip at a time, and only until it is typeset */
+  function typesetChip(chip, tries){
+    if (!chip || chip.isConnected === false) return;
+    if (chip.querySelector('mjx-container')) return;
+    const tex = chip.getAttribute('data-tex') || '';
+    if (!tex.trim()) return;
+    const n = tries || 0;
+    if (window.MathJax && window.MathJax.typesetPromise){
+      window.MathJax.typesetPromise([chip]).then(
+        () => { if (chip) chip._drawnTex = tex; },
+        () => {});
+      return;
+    }
+    if (n < 40) setTimeout(() => typesetChip(chip, n + 1), 150);
   }
 
   function markDirty(){
@@ -210,12 +442,7 @@ const InspDoc = (() => {
   }
 
   function makeMath(tex, display){
-    const chip = document.createElement('span');
-    chip.className = 'ins-math' + (display ? ' display' : '');
-    chip.setAttribute('contenteditable', 'false');
-    chip.setAttribute('data-tex', tex);
-    chip.textContent = display ? `\\[${tex}\\]` : `\\(${tex}\\)`;
-    return chip;
+    return chipSpan(tex, display);
   }
 
   /* Insert a formula. With a selection, the selection becomes the formula's
@@ -330,16 +557,25 @@ const InspDoc = (() => {
   }
 
   /* `\frac` typed by hand comes out as `x\frac{a}{b}`: the run is fenced,
-     exactly the rule the dashboard's own renderer applies. */
+     exactly the rule the dashboard's own renderer applies. Covers the page
+     and every choice cell. */
   function tidyTex(){
+    const lists = [editor].concat(choiceCells);
+    tidyIn(lists);
+  }
+
+  function tidyIn(scope){
     const run = /\\[A-Za-z]+(?:\s*\{[^{}]*\})*/g;
-    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
     const targets = [];
-    while (walker.nextNode()){
-      const node = walker.currentNode;
-      if (node.parentElement && node.parentElement.closest('.ins-math')) continue;
-      if (/\\[A-Za-z]+/.test(node.nodeValue)) targets.push(node);
-    }
+    scope.forEach(root => {
+      if (!root) return;
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()){
+        const node = walker.currentNode;
+        if (node.parentElement && node.parentElement.closest('.ins-math')) continue;
+        if (/\\[A-Za-z]+/.test(node.nodeValue)) targets.push(node);
+      }
+    });
     targets.forEach(node => {
       const frag = document.createDocumentFragment();
       let last = 0;
@@ -356,7 +592,7 @@ const InspDoc = (() => {
       frag.appendChild(document.createTextNode(text.slice(last)));
       node.parentNode.replaceChild(frag, node);
     });
-    if (targets.length) scheduleTypeset();
+    if (targets.length) scope.forEach(root => { if (root) scheduleTypeset(root); });
   }
 
   function init(options){
@@ -436,6 +672,7 @@ const InspDoc = (() => {
 
   return {
     toHtml, toText, init, run, setText, focus, editMath, scheduleTypeset, tidyTex,
+    choiceHtml, choiceText, choiceInit,
   };
 })();
 window.InspDoc = InspDoc;

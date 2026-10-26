@@ -8,6 +8,8 @@ Run: python tests/test_inspect_flow.py
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -61,6 +63,92 @@ class MarkupTests(unittest.TestCase):
         # both meta fields the user named, beside the tag editor
         for part in ('id="insCorp"', 'id="insYear"'):
             self.assertIn(part, view, part)
+
+    def test_a_choice_is_typeset_like_the_stem(self):
+        """An option's text is prose plus formulas, so it is rendered through
+        the document's own Markdown -> chip pass, never a raw LaTeX <input>."""
+        js = _read("inspect.js")
+        doc = _read("inspect_doc.js")
+        self.assertIn('class="ins-opt-text" contenteditable="true"', js)
+        self.assertNotIn('class="ins-opt-text" value=', js)
+        self.assertIn("InspDoc.choiceHtml(", js)
+        self.assertIn("InspDoc.choiceInit(", js)
+        for name in ("choiceHtml", "choiceText", "choiceInit"):
+            self.assertIn(name, doc)
+
+
+NODE = shutil.which("node")
+
+
+@unittest.skipUnless(NODE, "node is not on PATH")
+class ChipTypesetTests(unittest.TestCase):
+    """A stored formula must reach MathJax, not stay visible as LaTeX.
+
+    q72 stores its choices as bare `\\frac{1}{۳}` (no `$`), and MathJax skips
+    nodes inside a `contenteditable` region — the two reasons a chip used to
+    read as raw LaTeX. This runs `ui/inspect_doc.js` in Node with a stub DOM
+    and a stub MathJax that records what it was asked to typeset."""
+
+    def _run(self, script):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = os.path.join(tmp, "probe.js")
+            with open(probe, "w", encoding="utf-8") as fh:
+                fh.write(script)
+            out = subprocess.run([NODE, probe, os.path.join(ROOT, "ui", "inspect_doc.js")],
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", timeout=120)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            return out.stdout
+
+    def test_bare_tex_choice_becomes_a_typeset_chip(self):
+        # q72's own stored choice: bare LaTeX, no `$` delimiters
+        out = self._run(r"""
+const fs = require('fs'), vm = require('vm');
+// argv[0] is node, argv[1] this probe, argv[2] the script under test
+const SRC = process.argv[2];
+const asked = [];
+function el(tag){
+  const n = { nodeType: 1, tagName: tag.toUpperCase(), childNodes: [], _a: {},
+              className: '', drawn: false,
+              classList: { contains: c => false, add(){}, toggle(){} },
+              setAttribute(k, v){ n._a[k] = String(v); },
+              getAttribute(k){ return k in n._a ? n._a[k] : null; },
+              appendChild(c){ n.childNodes.push(c); return c; },
+              querySelector(sel){ return n.querySelectorAll(sel)[0] || null; },
+              querySelectorAll(sel){
+                return sel.indexOf('mjx-container') !== -1 && n.drawn
+                  ? [el('mjx-container')] : [];
+              },
+              addEventListener(){},
+              get textContent(){ return n.childNodes.length
+                ? n.childNodes.map(c => c.textContent).join('') : n._t; },
+              set textContent(v){ n.childNodes = []; n._t = v; } };
+  return n;
+}
+const SOURCE = fs.readFileSync(SRC, 'utf8');
+const ctx = {
+  window: { MathJax: { typesetPromise(els){
+    els.forEach(e => { asked.push(e.getAttribute('data-tex')); e.drawn = true; });
+    return Promise.resolve(); } } },
+  document: { createElement: el, createTextNode: t => ({ nodeType: 3, nodeValue: t }) },
+  Node: { TEXT_NODE: 3, ELEMENT_NODE: 1 },
+  NodeFilter: { SHOW_TEXT: 4 }, setTimeout, clearTimeout, console,
+};
+ctx.window.window = ctx.window;
+vm.createContext(ctx);
+vm.runInContext(SOURCE, ctx);
+const D = ctx.window.InspDoc;
+const root = el('div');
+const chip = el('span');
+chip.className = 'ins-math';
+chip.setAttribute('data-tex', '\\frac{1}{۳}');
+chip.textContent = '\\(\\frac{1}{۳}\\)';
+root.querySelectorAll = sel => sel.indexOf('.ins-math') !== -1 ? [chip] : [];
+D.scheduleTypeset(root);
+setTimeout(() => console.log(JSON.stringify(asked)), 400);
+""")
+        self.assertIn(r"\frac{1}{۳}", out,
+                      "the choice's formula was never handed to MathJax")
 
 
 class RoundTripTests(unittest.TestCase):

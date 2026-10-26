@@ -339,7 +339,7 @@ function insOpenRecord(kind, id){
       b.dataset.kind === kind && b.dataset.id === id));
   const active = document.querySelector('#insRecords .ins-row.active');
   if (active && active.scrollIntoView) active.scrollIntoView({block: 'nearest'});
-  if (window.typesetMath) typesetMath(ins('insEdit'));
+  if (window.InspDoc) InspDoc.scheduleTypeset();
 }
 
 function insPaintStatus(record){
@@ -445,7 +445,9 @@ function insAddTag(value){
 /* ── choices ─────────────────────────────────────────────────────
    The choices are their own rows INSIDE the document page, never part of the
    question text: an OCR reply that glued them to the stem, or that answered
-   with label-only stubs, is repaired here by adding/removing/editing rows. */
+   with label-only stubs, is repaired here by adding/removing/editing rows.
+   A choice's text is typeset like the stem — formulas become chips, not raw
+   LaTeX in an <input>. */
 function insRenderOptions(options){
   const list = ins('insDocOpts');
   const rows = Array.isArray(options) ? options : [];
@@ -454,8 +456,8 @@ function insRenderOptions(options){
     <div class="ins-opt" data-index="${index}">
       <input class="ins-opt-label" value="${insEscape(option.label ?? (index + 1))}"
              dir="ltr" aria-label="Label" spellcheck="false">
-      <input class="ins-opt-text" value="${insEscape(option.text ?? '')}"
-             dir="auto" aria-label="Choice text">
+      <div class="ins-opt-text" contenteditable="true" dir="auto"
+           aria-label="Choice text" spellcheck="false">${InspDoc.choiceHtml(option.text ?? '')}</div>
       <button class="icon-btn sm ins-opt-del" type="button" title="Remove this choice">
         <i class="fa fa-trash" aria-hidden="true"></i></button>
     </div>`).join('');
@@ -463,8 +465,13 @@ function insRenderOptions(options){
     const index = Number(row.dataset.index);
     const label = row.querySelector('.ins-opt-label');
     const text = row.querySelector('.ins-opt-text');
-    label.addEventListener('input', () => insOptionChanged(index, 'label', row));
-    text.addEventListener('input', () => insOptionChanged(index, 'text', row));
+    label.addEventListener('input', () => insOptionChanged(index, row));
+    InspDoc.choiceInit(text, value => {
+      const opts = insOptions();
+      if (!opts[index]) return;
+      opts[index].text = value;
+      InspectState.dirty = true;
+    });
     /* Enter in the last choice adds the next one — the table-row reflex */
     text.addEventListener('keydown', event => {
       if (event.key !== 'Enter') return;
@@ -473,8 +480,13 @@ function insRenderOptions(options){
       if (row === all[all.length - 1]) insAddOption();
       else all[index + 1].querySelector('.ins-opt-text').focus();
     });
+    text.addEventListener('dblclick', event => {
+      const chip = event.target.closest('.ins-math');
+      if (chip) InspDoc.editMath(chip);
+    });
     row.querySelector('.ins-opt-del').onclick = () => insRemoveOption(index);
   });
+  if (rows.length && window.InspDoc) InspDoc.scheduleTypeset(list);
 }
 
 function insOptions(){
@@ -484,14 +496,13 @@ function insOptions(){
   return record.options;
 }
 
-function insOptionChanged(index, key, row){
+/* the label is a plain <input>; the choice text writes itself (InspDoc) */
+function insOptionChanged(index, row){
   const options = insOptions();
   if (!options[index]) return;
-  options[index][key] = row.querySelector('.ins-opt-' + key).value;
+  options[index].label = row.querySelector('.ins-opt-label').value;
   InspectState.dirty = true;
-}
-
-function insRemoveOption(index){
+}function insRemoveOption(index){
   const options = insOptions();
   if (!options[index]) return;
   options.splice(index, 1);
